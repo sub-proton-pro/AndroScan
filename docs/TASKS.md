@@ -29,111 +29,63 @@ Do not start multiple unrelated tasks at once unless explicitly instructed.
 ## Active Task
 
 ### Task ID
-[Replace with task identifier]
+phase-3-vertical-slice
 
 ### Title
-[Replace with active task title]
+Phase 3: First vertical slice (exported components)
 
 ### Objective
-Describe the exact outcome expected from this task.
-
-Example:
-Implement the first vulnerability check module using the shared check interface and normalized finding model, with unit tests and basic integration coverage.
+Implement real extraction (manifest, exported components, permissions, deep links), real prompts and skills catalog, multi-turn LLM with real Ollama (or mock in tests), and report/run artifacts. One real APK should produce a dossier and hypotheses with valid evidence_refs.
 
 ### Why this task matters
-Explain why this task is the current priority.
-
-Example:
-This task validates whether the platform architecture can support a real feature without collapsing into special-case code.
+Phase 2 skeleton is complete. This task delivers the first end-to-end security analysis: APK → dossier → LLM → report with evidence-backed findings.
 
 ### In scope
-List what is included.
-
-Example:
-- add one vulnerability module
-- integrate it through the shared orchestration path
-- normalize results into shared finding model
-- add tests
-- update relevant docs
+- Real manifest parsing and dossier build from APK (e.g. androguard or equivalent).
+- Real prompt templates (global context, skills catalog) per DESIGN_DOC.
+- Real Ollama client (HTTP) in LLM layer; keep mock for tests.
+- At least one real skill (e.g. get_decompiled_class) or keep stub for MVP.
+- evidence_ref validation against dossier.
+- Write report.json and optionally observations.json, scan_meta.json, scan.log under run folder.
+- Integration test: fixture APK + mock LLM → report with expected structure and valid evidence_refs.
 
 ### Out of scope
-List what is explicitly not included.
-
-Example:
-- additional vulnerability modules
-- full UI implementation
-- PDF renderer
-- unrelated refactors
-- speculative future abstractions beyond what this feature needs
+- Phase 4 (CI, full hardening).
+- Additional vulnerability modules.
+- Full observations.json schema if not needed for MVP.
 
 ### Affected layers/modules
-List expected areas touched.
-
-Example:
-- vulnerability checks layer
-- application/domain layer
-- orchestration layer
+- extraction (real implementation)
+- llm (real client, real prompts)
+- internal/workflow, internal/report
+- modules/exported_components (wire into workflow)
 - tests
-- docs
 
 ### Expected deliverables
-- implementation code
-- tests
-- doc updates
-- completion summary
+- Real extraction and dossier from APK.
+- Real prompts and LLM client; multi-turn with skills.
+- Report and run artifacts in run folder.
+- Integration test with fixture APK.
+- Update STATE.md and TASKS.md when done.
 
 ### Completion conditions
-The task is complete only if:
-- required functionality is implemented
-- architecture boundaries are preserved
-- tests are added and pass
-- docs are updated if behavior or structure changed
-- known limitations are explicitly called out
+- One real APK → dossier → (multi-turn) LLM → report with hypotheses and valid evidence_refs.
+- Tests pass including new integration test.
+- STATE.md reflects Phase 3 completion.
 
 ### Risks / edge cases / concerns
-List anything important to watch.
-
-Example:
-- avoid coupling the feature directly to presentation code
-- avoid embedding module-specific logic inside orchestration
-- ensure malformed input handling is tested
-- preserve normalized result contract
+- Manifest parsing must handle malformed APKs; validate and fail cleanly.
+- Keep tests runnable without live Ollama (mock).
 
 ---
 
 ## Priority Queue
 
-Use this section for ordered, ready-to-pick tasks.
-
 ### P1
-1. [Task title]
-   - goal:
-   - dependencies:
-   - done when:
-
-2. [Task title]
-   - goal:
-   - dependencies:
-   - done when:
-
-### P2
-1. [Task title]
-   - goal:
-   - dependencies:
-   - done when:
-
-2. [Task title]
-   - goal:
-   - dependencies:
-   - done when:
-
-### P3
-1. [Task title]
-   - goal:
-   - dependencies:
-   - done when:
-
-Remove placeholders and replace with real queue items.
+1. **Phase 4: Harden and extend** (after Phase 3)
+   - goal: evidence_ref validation, error handling, config; pytest suite; CI runs tests.
+   - dependencies: Phase 3 complete.
+   - done when: Tests pass locally and in CI; STATE.md and TASKS.md updated.
 
 ---
 
@@ -174,16 +126,15 @@ Examples:
 
 ## Completed Tasks
 
-Move completed items here with date and short outcome.
+### 2026-03-13 Phase 2: Build skeleton
+- outcome: Repo layout, pyproject.toml, CLI (androscan.py with --apk, --task multi-valued, --output), config, dossier model, extraction stub, LLM stub (client, prompt builder, parser), run folder creation, stub skills, workflow with multi-turn loop, report.json writing. 14 tests (import, config, extraction, LLM, CLI parsing, workflow integration).
+- notes: Sub-tasks 1–7 (project setup, config, dossier+extraction stub, LLM stub, workflow+run folder, CLI wiring, minimal tests) completed. All stubs; Phase 3 will add real extraction and real LLM.
+- follow-up: Phase 3 (first vertical slice).
 
-Format:
-
-### [date] [Task title]
-- outcome:
-- notes:
-- follow-up:
-
-Example:
+### 2026-03-12 Phase 1: Finalize architecture
+- outcome: DESIGN_DOC.md is the single source of truth for MVP (architecture, repo structure, dossier schema, LLM I/O schema, prompts/skills, roadmap, risks, first vertical slice).
+- notes: Phase 2 (skeleton) completed 2026-03-13.
+- follow-up: Phase 3 (first vertical slice).
 
 ### 2026-03-12 Added agent protocol and starter docs
 - outcome: onboarding and task-loading docs added
