@@ -8,12 +8,19 @@ Usage:
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from androscan.extraction import extract_dossier
 from androscan.internal import app_id_from_dossier
 from androscan.internal.run_folder import create_run_folder
 from androscan.internal.workflow import run_workflow
+
+EXPLOITABILITY_LABELS = {5: "critical", 4: "high", 3: "medium", 2: "low", 1: "minimal"}
+
+
+def _exploitability_label(score: int) -> str:
+    return EXPLOITABILITY_LABELS.get(score, str(score))
 
 
 def main() -> int:
@@ -41,15 +48,35 @@ def main() -> int:
     tasks = args.tasks if args.tasks else ["exported_components"]
 
     if not Path(apk_path).exists() and apk_path != "/dummy.apk":
-        # Allow /dummy.apk for stub testing
         print(f"Error: APK path does not exist: {apk_path}", file=sys.stderr)
         return 1
+
+    # ---------- Run started ----------
+    started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tasks_str = ", ".join(tasks)
+    print("---------- Run started ----------")
+    print(f"  Started:  {started}")
+    print(f"  APK:      {apk_path}")
+    print(f"  Tasks:    {tasks_str}")
+    print()
 
     try:
         dossier = extract_dossier(apk_path)
     except Exception as e:
         print(f"Error: extraction failed: {e}", file=sys.stderr)
         return 1
+
+    # ---------- Extraction ----------
+    n_act = len(dossier.exported_activities)
+    n_svc = len(dossier.exported_services)
+    n_rec = len(dossier.exported_receivers)
+    n_prv = len(dossier.exported_providers)
+    n_perm = len(dossier.permissions)
+    n_deep = len(dossier.deep_links)
+    print("---------- Extraction ----------")
+    print(f"  Package:  {dossier.apk_info.package}")
+    print(f"  Dossier:  {n_act} activities, {n_svc} services, {n_rec} receivers, {n_prv} providers, {n_perm} permissions, {n_deep} deep links")
+    print()
 
     app_id = app_id_from_dossier(dossier)
 
@@ -60,34 +87,59 @@ def main() -> int:
     else:
         run_folder = create_run_folder(app_id)
 
+    # ---------- Analysis ----------
+    print("---------- Analysis ----------")
+    print(f"  Running:  {tasks_str}")
+    print()
+
     try:
         run_workflow(apk_path, tasks, run_folder)
     except Exception as e:
         print(f"Error: workflow failed: {e}", file=sys.stderr)
         return 1
 
-    # Descriptive run summary
     report_path = run_folder / "report.json"
-    n_findings = None
+    report_data = None
     if report_path.exists():
         try:
-            data = json.loads(report_path.read_text(encoding="utf-8"))
-            n_findings = len(data.get("hypotheses") or [])
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
 
+    # ---------- Run log ----------
     package = dossier.apk_info.package
-    tasks_str = ", ".join(tasks)
-    print("AndroScan — run complete\n")
-    print(f"  APK:     {apk_path}")
-    print(f"  App:     {app_id} ({package})")
-    print(f"  Tasks:   {tasks_str}")
-    print(f"  Output:  {run_folder}")
-    if n_findings is not None:
-        word = "hypothesis" if n_findings == 1 else "hypotheses"
-        print(f"  Report:  report.json ({n_findings} {word})")
+    print("---------- Run log ----------")
+    print(f"  APK:      {apk_path}")
+    print(f"  App:      {app_id} ({package})")
+    print(f"  Tasks:    {tasks_str}")
+    print(f"  Output:   {run_folder}")
+    print(f"  Report:   {report_path}")
+    print()
+
+    # ---------- Run summary (findings) ----------
+    print("---------- Run summary ----------")
+    if report_data and report_data.get("hypotheses"):
+        hypotheses = report_data["hypotheses"]
+        n = len(hypotheses)
+        by_exp = {}
+        for h in hypotheses:
+            exp = h.get("exploitability", 1)
+            by_exp[exp] = by_exp.get(exp, 0) + 1
+        parts = [f"{by_exp[exp]} {_exploitability_label(exp)}" for exp in sorted(by_exp.keys(), reverse=True)]
+        print(f"  Findings:  {n} hypothesis" + ("es" if n != 1 else "") + f" ({', '.join(parts)} exploitability)")
+        print()
+        for i, h in enumerate(hypotheses, 1):
+            title = h.get("title") or "(no title)"
+            comp = h.get("component_name") or "—"
+            exp = h.get("exploitability", 0)
+            conf = h.get("confidence", 0)
+            print(f"  {i}. [{h.get('id', '—')}] {title}")
+            print(f"     Component: {comp}  (exploitability: {exp}, confidence: {conf})")
+            print()
+        print(f"  Full report:  {report_path}")
     else:
-        print("  Report:  report.json")
+        print("  Findings:  0 hypotheses")
+        print(f"  Full report:  {report_path}")
     return 0
 
 
