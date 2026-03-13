@@ -388,6 +388,25 @@ Use the following structure for new entries:
   - `docs/ARCHITECTURE.md` (Skills layer)
   - `docs/DESIGN_DOC.md` (Section 7, skills)
 
+### DEC-014: Ollama client uses /api/chat (not /api/generate)
+- status: Active
+- date: 2026-03
+- owners: (project)
+- context:
+  On some Ollama versions (e.g. 0.17.2), POST /api/generate returns 404 while GET /api/tags and POST /api/chat work. Callers need a single `complete(prompt, config)` that returns the model’s text.
+- decision:
+  The Ollama client calls **POST /api/chat** with body `{ "model", "messages": [{"role": "user", "content": prompt}], "stream": false }` and parses the reply from `message.content`. The public API remains `complete(prompt, config=...)` returning a string.
+- rationale:
+  /api/chat is the stable chat completion endpoint; using it avoids 404 on setups where /api/generate is unavailable.
+- alternatives considered:
+  - Keep /api/generate and document minimum Ollama version (rejected: breaks current user setup)
+  - Try /api/generate then fallback to /api/chat (adds complexity; chat is sufficient)
+- tradeoffs / consequences:
+  - Request/response shape differs from /api/generate (prompt → messages; response → message.content). Tests mock the chat response shape.
+- follow-up: None.
+- related docs:
+  - `androscan/llm/client.py`
+
 ---
 
 ## Superseded / deprecated decisions

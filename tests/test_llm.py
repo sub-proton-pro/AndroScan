@@ -43,16 +43,18 @@ def test_parse_response_invalid_json():
 
 
 def test_complete_calls_ollama_and_returns_response():
-    """complete() POSTs to Ollama /api/generate and returns response text. No live Ollama."""
+    """complete() POSTs to Ollama /api/chat and returns response text. No live Ollama."""
     mock_resp = MagicMock()
     mock_resp.raise_for_status = MagicMock()
-    mock_resp.json.return_value = {"response": '{"hypotheses": []}'}
+    mock_resp.json.return_value = {"message": {"role": "assistant", "content": '{"hypotheses": []}'}}
     with patch("androscan.llm.client.requests.post", return_value=mock_resp) as post_mock:
         out = complete("test prompt", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=60, ollama_model="llama2"))
     assert out == '{"hypotheses": []}'
     mock_resp.raise_for_status.assert_called_once()
-    call_kw = post_mock.call_args.kwargs
-    assert call_kw["json"]["prompt"] == "test prompt"
+    call_args = post_mock.call_args
+    assert call_args[0][0].endswith("/api/chat")
+    call_kw = call_args.kwargs
+    assert call_kw["json"]["messages"] == [{"role": "user", "content": "test prompt"}]
     assert call_kw["json"]["stream"] is False
 
 
