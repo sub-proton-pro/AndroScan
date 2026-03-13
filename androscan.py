@@ -18,6 +18,18 @@ from androscan.internal.workflow import run_workflow
 
 EXPLOITABILITY_LABELS = {5: "critical", 4: "high", 3: "medium", 2: "low", 1: "minimal"}
 
+SECTION_RULE = "────────────────────────────────────────────────────────────"
+
+
+def _section(title: str) -> None:
+    print(SECTION_RULE)
+    print(f"[*] {title}")
+    print(SECTION_RULE)
+
+
+def _subsection(title: str) -> None:
+    print(f"---------- {title} ----------")
+
 
 def _exploitability_label(score: int) -> str:
     return EXPLOITABILITY_LABELS.get(score, str(score))
@@ -51,10 +63,9 @@ def main() -> int:
         print(f"Error: APK path does not exist: {apk_path}", file=sys.stderr)
         return 1
 
-    # ---------- Run started ----------
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     tasks_str = ", ".join(tasks)
-    print("---------- Run started ----------")
+    _section("Run started")
     print(f"  Started:  {started}")
     print(f"  APK:      {apk_path}")
     print(f"  Tasks:    {tasks_str}")
@@ -66,14 +77,13 @@ def main() -> int:
         print(f"Error: extraction failed: {e}", file=sys.stderr)
         return 1
 
-    # ---------- Extraction ----------
     n_act = len(dossier.exported_activities)
     n_svc = len(dossier.exported_services)
     n_rec = len(dossier.exported_receivers)
     n_prv = len(dossier.exported_providers)
     n_perm = len(dossier.permissions)
     n_deep = len(dossier.deep_links)
-    print("---------- Extraction ----------")
+    _section("Extraction")
     print(f"  Package:  {dossier.apk_info.package}")
     print(f"  Dossier:  {n_act} activities, {n_svc} services, {n_rec} receivers, {n_prv} providers, {n_perm} permissions, {n_deep} deep links")
     print()
@@ -87,8 +97,7 @@ def main() -> int:
     else:
         run_folder = create_run_folder(app_id)
 
-    # ---------- Analysis ----------
-    print("---------- Analysis ----------")
+    _section("Analysis")
     print(f"  Running:  {tasks_str}")
     print()
 
@@ -106,18 +115,9 @@ def main() -> int:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # ---------- Run log ----------
     package = dossier.apk_info.package
-    print("---------- Run log ----------")
-    print(f"  APK:      {apk_path}")
-    print(f"  App:      {app_id} ({package})")
-    print(f"  Tasks:    {tasks_str}")
-    print(f"  Output:   {run_folder}")
-    print(f"  Report:   {report_path}")
-    print()
 
-    # ---------- Run summary (findings) ----------
-    print("---------- Run summary ----------")
+    _section("Run summary")
     if report_data and report_data.get("hypotheses"):
         hypotheses = report_data["hypotheses"]
         n = len(hypotheses)
@@ -140,6 +140,14 @@ def main() -> int:
     else:
         print("  Findings:  0 hypotheses")
         print(f"  Full report:  {report_path}")
+
+    _section("Appendix")
+    _subsection("Run log")
+    print(f"  APK:      {apk_path}")
+    print(f"  App:      {app_id} ({package})")
+    print(f"  Tasks:    {tasks_str}")
+    print(f"  Output:   {run_folder}")
+    print(f"  Report:   {report_path}")
     return 0
 
 
