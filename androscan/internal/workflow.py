@@ -2,33 +2,34 @@
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from androscan.config import load_config
+from androscan.config import Config, load_config
 from androscan.extraction import extract_dossier
 from androscan.internal.dossier import app_id_from_dossier
 from androscan.internal.skills import run_skills
 from androscan.llm import complete, build_prompt, parse_response
 from androscan.llm.parser import LLMResponse, Hypothesis
 
-MAX_TURNS = 3
 
-
-def run_workflow(apk_path: str, tasks: list[str], run_folder: Path) -> None:
+def run_workflow(apk_path: str, tasks: list[str], run_folder: Path, config: Optional[Config] = None) -> None:
     """Run the analysis workflow: extract dossier, multi-turn LLM, write report.
 
     - tasks: list of task names (e.g. ["exported_components"]); stub uses first only.
     - run_folder: path to apps/<app_id>/<run_ts>/ where artifacts are written.
+    - config: optional Config; if None, load_config() is called.
     """
     _ = tasks  # Stub: ignore which tasks; Phase 3 will dispatch per task.
-    config = load_config()
+    if config is None:
+        config = load_config()
     dossier = extract_dossier(apk_path)
     dossier_dict = dossier.to_dict()
     prior_skill_results: list[str] = []
     hypotheses: list[Hypothesis] = []
     turn = 0
+    max_turns = config.max_turns
 
-    while turn < MAX_TURNS:
+    while turn < max_turns:
         turn += 1
         prompt = build_prompt(dossier_dict, prior_skill_results if prior_skill_results else None)
         raw = complete(prompt, config=config)

@@ -122,8 +122,10 @@ AndroScan/
         report.json             # (and/or report.txt)
   docs/
   tests/
+  global_config.yaml           # Optional runtime config (YAML); overridden by env. Use --config to pass path.
 ```
 
+- **Configuration:** App constants in `androscan/constants.py`. Runtime settings from `global_config.yaml` (optional; merge: defaults → YAML → env). CLI `--config <file>` to pass config path. See `docs/DECISIONS.md` DEC-012.
 - **app_id:** Default = sanitized package name (e.g. `com_example_myapp`). Replace `.` with `_`; truncate if too long (e.g. max 80–128 chars).
 - **Run folder name:** Human-readable timestamp, e.g. `DD-mon-YY_HH-MM-SS` (e.g. `13-mar-26_01-30-52`).
 - **Report and run artifacts:** All written under `apps/<app_id>/<run_timestamp>/`; no global report directory.

@@ -2,7 +2,7 @@
 """AndroScan CLI: LLM-native Android pentesting tool.
 
 Usage:
-  python androscan.py --apk <path> --task <name> [--task <name> ...] [--output <dir>]
+  python androscan.py --apk <path> [--task <name> ...] [--output <dir>] [--config <file>]
 """
 
 import argparse
@@ -10,21 +10,21 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
+from androscan import constants
+from androscan.config import load_config
 from androscan.extraction import extract_dossier
 from androscan.internal import app_id_from_dossier
 from androscan.internal.run_folder import create_run_folder
 from androscan.internal.workflow import run_workflow
 
-EXPLOITABILITY_LABELS = {5: "critical", 4: "high", 3: "medium", 2: "low", 1: "minimal"}
 
-SECTION_RULE = "────────────────────────────────────────────────────────────"
-
-
-def _section(title: str) -> None:
-    print(SECTION_RULE)
+def _section(title: str, rule: Optional[str] = None) -> None:
+    r = rule or constants.SECTION_RULE
+    print(r)
     print(f"[*] {title}")
-    print(SECTION_RULE)
+    print(r)
 
 
 def _subsection(title: str) -> None:
@@ -32,7 +32,7 @@ def _subsection(title: str) -> None:
 
 
 def _exploitability_label(score: int) -> str:
-    return EXPLOITABILITY_LABELS.get(score, str(score))
+    return constants.EXPLOITABILITY_LABELS.get(score, str(score))
 
 
 def main() -> int:
@@ -54,8 +54,15 @@ def main() -> int:
         metavar="DIR",
         help="Override run folder root (default: apps)",
     )
+    parser.add_argument(
+        "--config",
+        default=None,
+        metavar="FILE",
+        help="Path to global_config.yaml (default: cwd or config/global_config.yaml)",
+    )
     args = parser.parse_args()
 
+    config = load_config(args.config)
     apk_path = args.apk
     tasks = args.tasks if args.tasks else ["exported_components"]
 
@@ -65,7 +72,7 @@ def main() -> int:
 
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     tasks_str = ", ".join(tasks)
-    _section("Run started")
+    _section("Run started", config.section_rule)
     print(f"  Started:  {started}")
     print(f"  APK:      {apk_path}")
     print(f"  Tasks:    {tasks_str}")
@@ -83,7 +90,7 @@ def main() -> int:
     n_prv = len(dossier.exported_providers)
     n_perm = len(dossier.permissions)
     n_deep = len(dossier.deep_links)
-    _section("Extraction")
+    _section("Extraction", config.section_rule)
     print(f"  Package:  {dossier.apk_info.package}")
     print(f"  Dossier:  {n_act} activities, {n_svc} services, {n_rec} receivers, {n_prv} providers, {n_perm} permissions, {n_deep} deep links")
     print()
@@ -95,14 +102,14 @@ def main() -> int:
         run_folder = Path(args.output) / app_id / run_timestamp()
         run_folder.mkdir(parents=True, exist_ok=True)
     else:
-        run_folder = create_run_folder(app_id)
+        run_folder = create_run_folder(app_id, config)
 
-    _section("Analysis")
+    _section("Analysis", config.section_rule)
     print(f"  Running:  {tasks_str}")
     print()
 
     try:
-        run_workflow(apk_path, tasks, run_folder)
+        run_workflow(apk_path, tasks, run_folder, config)
     except Exception as e:
         print(f"Error: workflow failed: {e}", file=sys.stderr)
         return 1
@@ -117,7 +124,7 @@ def main() -> int:
 
     package = dossier.apk_info.package
 
-    _section("Run summary")
+    _section("Run summary", config.section_rule)
     if report_data and report_data.get("hypotheses"):
         hypotheses = report_data["hypotheses"]
         n = len(hypotheses)
@@ -141,7 +148,7 @@ def main() -> int:
         print("  Findings:  0 hypotheses")
         print(f"  Full report:  {report_path}")
 
-    _section("Appendix")
+    _section("Appendix", config.section_rule)
     _subsection("Run log")
     print(f"  APK:      {apk_path}")
     print(f"  App:      {app_id} ({package})")

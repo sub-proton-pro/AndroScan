@@ -345,6 +345,27 @@ Use the following structure for new entries:
   - `docs/DESIGN_DOC.md` (Phase 3, extraction)
   - `docs/TASKS.md` (Phase 3 implementation plan)
 
+### DEC-012: Central constants file and global_config.yaml
+- status: Active
+- date: 2026-03
+- owners: (project)
+- context:
+  App-wide constants (e.g. APP_ID_MAX_LEN, MAX_TURNS, exploitability labels, CLI section rule) were scattered. Config was env-only; settings that affect many parts of the app needed a file-based option.
+- decision:
+  Use a central **constants** file (`androscan/constants.py`) for fixed values and labels. Use **global_config.yaml** (optional, repo root or `--config` path) for runtime settings; merge order: defaults → YAML → env. CLI accepts **--config** to pass config file path.
+- rationale:
+  Single place for constants improves consistency; YAML allows tuning without code changes; env overrides keep deployment flexible.
+- alternatives considered:
+  - Env-only config (retained as override layer)
+  - Constants only, no YAML (less flexible for “30%+ of app” tuning)
+- tradeoffs / consequences:
+  - PyYAML added as dependency. Config dataclass extended with more fields (ollama_model, max_turns, apktool_cmd, jadx_cmd, section_rule_*, etc.).
+- follow-up:
+  Phase 3 extraction and decompilation will use config.apktool_cmd, config.jadx_cmd.
+- related docs:
+  - `docs/STATE.md`
+  - `androscan/constants.py`, `global_config.yaml`
+
 ---
 
 ## Superseded / deprecated decisions

@@ -1,0 +1,20 @@
+# AndroScan global config. Optional; env vars override these values.
+# Pass path via --config or place at repo root / config/global_config.yaml
+
+ollama:
+  base_url: "http://localhost:11434"
+  timeout_sec: 120
+  model: "llama2"
+
+paths:
+  run_folder_root: "apps"
+  apktool_cmd: "apktool"
+  jadx_cmd: "jadx"
+
+workflow:
+  max_turns: 3
+  max_hypotheses_per_report: 10
+
+output:
+  section_rule_char: "─"
+  section_rule_length: 60

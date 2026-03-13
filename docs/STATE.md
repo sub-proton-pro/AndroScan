@@ -18,15 +18,17 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 
 ### Implemented
 - Repository layout per DESIGN_DOC: `androscan/`, `androscan/config/`, `androscan/internal/`, `androscan/internal/report/`, `androscan/extraction/`, `androscan/llm/`, `androscan/modules/`, `androscan/modules/exported_components/`, `tests/`.
-- Python project: `pyproject.toml` with dependencies (requests), dev deps (pytest).
-- CLI: `androscan.py` at repo root with `--apk`, `--task` (multi-valued), `--output`.
-- Config: `androscan.config.load_config()` with `ollama_base_url`, `ollama_timeout_sec`, `run_folder_root` (env: ANDROSCAN_OLLAMA_URL, etc.).
+- Python project: `pyproject.toml` with dependencies (requests, PyYAML), dev deps (pytest).
+- CLI: `androscan.py` at repo root with `--apk`, `--task` (multi-valued), `--output`, `--config` (path to global_config.yaml).
+- Constants: `androscan.constants` — APP_ID_MAX_LEN, MAX_TURNS_DEFAULT, EXPLOITABILITY_LABELS, SECTION_RULE, tool cmd defaults.
+- Config: `androscan.config.load_config(config_path?)` — merge order: defaults → `global_config.yaml` (if present) → env. Config includes ollama_*, run_folder_root, max_turns, apktool_cmd, jadx_cmd, section_rule_*, etc. Env: ANDROSCAN_OLLAMA_URL, ANDROSCAN_OLLAMA_TIMEOUT, ANDROSCAN_RUN_FOLDER.
+- `global_config.yaml` at repo root (optional): YAML for ollama, paths, workflow, output; settings affect CLI, workflow, run folder, and future extraction/decompilation.
 - Dossier model: `androscan.internal.dossier` (ApkInfo, Dossier, exported components, deep_links); `app_id_from_dossier()` (sanitized package, truncate).
 - Extraction stub: `androscan.extraction.extract_dossier(apk_path)` returns hardcoded minimal dossier; no manifest parsing.
 - LLM stub: `androscan.llm.complete()` returns fixed JSON (no live Ollama); `build_prompt()`, `parse_response()` for skill_requests/hypotheses.
 - Run folder: `androscan.internal.run_folder.create_run_folder(app_id)` creates `apps/<app_id>/<run_ts>/` with human-readable timestamp.
 - Stub skills: registry with `get_decompiled_class` returning placeholder text.
-- Workflow: `run_workflow(apk_path, tasks, run_folder)` — extraction → prompt → LLM (multi-turn up to 3) → write `report.json`.
+- Workflow: `run_workflow(apk_path, tasks, run_folder, config?)` — extraction → prompt → LLM (multi-turn from config.max_turns) → write `report.json`.
 - Tests: 14 tests (import, config, extraction, dossier/app_id, LLM prompt/parser, CLI parsing, workflow integration with mock).
 
 ### Partially implemented
@@ -48,7 +50,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 - `pip install -e ".[dev]"` and `pytest` from repo root succeed (14 tests pass).
 - `python androscan.py --apk /dummy.apk --task exported_components` creates `apps/com_example_app/<run_ts>/report.json` with stub hypotheses.
 - `--task` can be repeated (e.g. `--task a --task b`).
-- Config loads from env; default config has expected attributes.
+- Config loads from defaults, optional global_config.yaml (or --config path), and env overrides; default config has expected attributes.
 - Extraction stub returns dossier with expected shape; `app_id_from_dossier` yields `com_example_app` for stub.
 - LLM parser parses valid JSON with skill_requests and hypotheses; invalid JSON returns empty response without crash.
 - Workflow integration test with mock LLM (skill_requests then hypotheses) runs two turns and writes report.

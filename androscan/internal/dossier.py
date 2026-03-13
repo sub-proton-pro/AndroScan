@@ -6,8 +6,7 @@ Schema matches DESIGN_DOC Section 5. Used as input to LLM and for app_id derivat
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-# Max length for app_id (sanitized package); truncate if longer.
-APP_ID_MAX_LEN = 128
+from androscan import constants
 
 
 @dataclass
@@ -152,6 +151,6 @@ def app_id_from_dossier(dossier: Dossier) -> str:
     raw = dossier.apk_info.package.replace(".", "_")
     # Sanitize: remove any character that is unsafe in paths
     safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in raw)
-    if len(safe) > APP_ID_MAX_LEN:
-        return safe[:APP_ID_MAX_LEN]
+    if len(safe) > constants.APP_ID_MAX_LEN:
+        return safe[:constants.APP_ID_MAX_LEN]
     return safe or "unknown"
