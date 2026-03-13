@@ -338,7 +338,7 @@ Skills use a two-tier model: **pipeline** (orchestration only: extract_manifest,
 |------|------------|
 | LLM hallucination (wrong evidence_refs or irrelevant findings) | Strict output schema; validate every evidence_ref against dossier; drop invalid entries; cap number of hypotheses in prompt. |
 | Dossier too large (context limit) | Not a primary risk with a large-context local LLM; only relevant if using a small-context model (then truncate/summarize or chunk). |
-| Ollama unavailable or slow | Timeouts and retries in LLM layer; clear CLI error; optional `--dry-run` that stops after dossier and prints it. |
+| Ollama unavailable or slow | Timeouts and retries in LLM layer; clear CLI error; optional `--dry-run` that stops after dossier and prints it. **AC (Ollama):** (1) Before analysis, CLI checks Ollama reachability (e.g. GET /api/tags); if unreachable, print clear error (orange) and tip (grey) with setup link, then exit. (2) On 404 or other HTTP error from Ollama, raise a user-friendly message (e.g. "Ollama API endpoint not found… Ensure Ollama is running…") not raw HTTP text. (3) Connection and timeout errors already raise clear messages with setup tip. |
 | Manifest parsing fragile (malformed APKs) | Validate early (zip, AndroidManifest.xml); use a well-tested parser; fail with clear message; no raw bytes to LLM. |
 | Scope creep (MobSF-style feature list) | Strict MVP: exported components + deep links + permissions; prompt and schema enforce fewer, evidence-backed findings. |
 | Uncontrolled variation in extraction | Deterministic parsing for canonical structure (ordering, schema). Where inference is used in extraction/enrichment, version it, cache it, or provide a deterministic-only mode so runs are reproducible when needed. |

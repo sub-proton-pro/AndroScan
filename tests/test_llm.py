@@ -68,3 +68,36 @@ def test_complete_raises_on_timeout():
     with patch("androscan.llm.client.requests.post", side_effect=requests.Timeout):
         with pytest.raises(RuntimeError, match="timed out"):
             complete("test", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x"))
+
+
+def test_complete_raises_friendly_message_on_404():
+    """complete() raises RuntimeError with user-friendly message on 404, not raw HTTP."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    http_err = requests.HTTPError("404 Not Found")
+    http_err.response = mock_resp
+    mock_resp.raise_for_status.side_effect = http_err
+    with patch("androscan.llm.client.requests.post", return_value=mock_resp):
+        with pytest.raises(RuntimeError) as exc_info:
+            complete("test", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x"))
+    msg = str(exc_info.value)
+    assert "endpoint not found" in msg.lower() or "not found" in msg.lower()
+    assert "ollama.com" in msg or "Ensure Ollama" in msg
+
+
+def test_is_ollama_available_true_when_200():
+    """is_ollama_available returns True when GET /api/tags returns 200."""
+    from androscan.llm.client import is_ollama_available
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    with patch("androscan.llm.client.requests.get", return_value=mock_resp):
+        assert is_ollama_available("http://localhost:11434") is True
+
+
+def test_is_ollama_available_false_on_connection_error():
+    """is_ollama_available returns False on connection error."""
+    from androscan.llm.client import is_ollama_available
+
+    with patch("androscan.llm.client.requests.get", side_effect=requests.ConnectionError):
+        assert is_ollama_available("http://localhost:11434") is False

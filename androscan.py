@@ -20,6 +20,8 @@ from androscan.extraction import extract_dossier
 from androscan.internal import app_id_from_dossier
 from androscan.internal.run_folder import create_run_folder
 from androscan.internal.workflow import run_workflow
+from androscan.llm import is_ollama_available
+from androscan.llm.client import OLLAMA_SETUP_TIP
 
 
 def _section(title: str, rule: Optional[str] = None) -> None:
@@ -110,6 +112,12 @@ def main() -> int:
         run_folder.mkdir(parents=True, exist_ok=True)
     else:
         run_folder = create_run_folder(app_id, config)
+
+    base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
+    if not is_ollama_available(base_url):
+        print(orange("Ollama not reachable at " + base_url + "."), file=sys.stderr)
+        print(grey(OLLAMA_SETUP_TIP), file=sys.stderr)
+        return 1
 
     _section("Analysis", config.section_rule)
     print(f"  Running:  {tasks_str}")

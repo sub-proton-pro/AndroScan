@@ -6,6 +6,18 @@ import requests
 
 from androscan.config import Config, load_config
 
+OLLAMA_SETUP_TIP = "Ensure Ollama is running (e.g. ollama serve). See https://ollama.com"
+
+
+def is_ollama_available(base_url: str, timeout: int = 5) -> bool:
+    """Return True if Ollama is reachable at base_url (GET /api/tags). Use short timeout for pre-flight."""
+    url = (base_url or "").strip().rstrip("/") or "http://localhost:11434"
+    try:
+        resp = requests.get(f"{url}/api/tags", timeout=timeout)
+        return resp.status_code == 200
+    except (requests.ConnectionError, requests.Timeout):
+        return False
+
 
 def complete(
     prompt: str,
@@ -36,8 +48,15 @@ def complete(
         data = resp.json()
         return (data.get("response") or "").strip()
     except requests.ConnectionError:
-        raise RuntimeError(f"Cannot connect to Ollama at {base_url}. Is it running?") from None
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {base_url}. Is it running? {OLLAMA_SETUP_TIP}"
+        ) from None
     except requests.Timeout:
-        raise RuntimeError(f"Ollama request timed out after {timeout}s") from None
+        raise RuntimeError(f"Ollama request timed out after {timeout}s. {OLLAMA_SETUP_TIP}") from None
     except requests.HTTPError as e:
-        raise RuntimeError(f"Ollama API error: {e}") from e
+        if e.response is not None and e.response.status_code == 404:
+            raise RuntimeError(
+                f"Ollama API endpoint not found at {base_url}. "
+                f"Ensure Ollama is running and the URL is correct (e.g. http://localhost:11434). {OLLAMA_SETUP_TIP}"
+            ) from None
+        raise RuntimeError(f"Ollama API error: {e}. {OLLAMA_SETUP_TIP}") from e
