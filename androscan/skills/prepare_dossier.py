@@ -1,5 +1,6 @@
-"""Pipeline skill: build component dossier from manifest data. Stub uses hardcoded dossier; Phase 3 from real manifest."""
+"""Pipeline skill: build component dossier from manifest data. Uses real parsed manifest or stub."""
 
+from androscan.extraction.manifest_parser import build_dossier_dict_from_parsed
 from androscan.internal.dossier import (
     ApkInfo,
     Dossier,
@@ -18,11 +19,19 @@ SKILL_META = SkillMeta(
 
 
 def execute(params: dict, context: SkillContext) -> SkillResult:
-    """Build dossier from manifest. Stub: ignore manifest and return hardcoded dossier dict."""
-    _ = params
+    """Build dossier from manifest. If manifest is stub or missing, return hardcoded dossier dict."""
     _ = context
-    dossier = _stub_dossier()
-    dossier_dict = dossier.to_dict()
+    manifest = params.get("manifest") or {}
+    if manifest.get("stub") or not manifest.get("package"):
+        dossier = _stub_dossier()
+        dossier_dict = dossier.to_dict()
+        return SkillResult(success=True, data=dossier_dict, text="Dossier prepared (stub).")
+
+    dossier_dict = build_dossier_dict_from_parsed(manifest)
+    if not dossier_dict:
+        dossier = _stub_dossier()
+        dossier_dict = dossier.to_dict()
+        return SkillResult(success=True, data=dossier_dict, text="Dossier prepared (stub).")
     return SkillResult(success=True, data=dossier_dict, text="Dossier prepared.")
 
 

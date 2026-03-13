@@ -7,12 +7,14 @@ Usage:
 
 import argparse
 import json
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from androscan import constants
+from androscan.cli_term import grey, orange
 from androscan.config import load_config
 from androscan.extraction import extract_dossier
 from androscan.internal import app_id_from_dossier
@@ -68,6 +70,11 @@ def main() -> int:
 
     if not Path(apk_path).exists() and apk_path != "/dummy.apk":
         print(f"Error: APK path does not exist: {apk_path}", file=sys.stderr)
+        return 1
+
+    if not shutil.which(config.apktool_cmd):
+        print(orange("apktool not found."), file=sys.stderr)
+        print(grey("Install: https://apktool.org/docs/install"), file=sys.stderr)
         return 1
 
     started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
