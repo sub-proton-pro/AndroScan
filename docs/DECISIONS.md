@@ -322,6 +322,29 @@ Use the following structure for new entries:
   - `docs/ARCHITECTURE.md`
   - `docs/CONVENTIONS.md`
 
+### DEC-011: Use apktool for manifest extraction, jadx for decompilation skills
+- status: Active
+- date: 2026-03
+- owners: (project)
+- context:
+  Phase 3 requires real APK/manifest parsing to build the component dossier, and later decompilation for skills like get_decompiled_class. Androguard was considered but avoided due to maintenance and licensing concerns.
+- decision:
+  Use **apktool** for manifest extraction (decode APK, parse decoded AndroidManifest.xml). Use **jadx** later for decompilation skills (e.g. get_decompiled_class).
+- rationale:
+  apktool is well maintained, Apache 2.0, and yields plain XML manifest for straightforward parsing. jadx is the standard for DEX-to-Java decompilation and will be used when implementing decompilation skills.
+- alternatives considered:
+  - Androguard (avoided: maintenance and licensing)
+  - aapt/aapt2 for manifest only (lighter but text parsing; apktool gives clean XML)
+  - In-house AXML parser (more work; apktool is sufficient)
+- tradeoffs / consequences:
+  - Extraction layer depends on apktool being on PATH (or configurable).
+  - Decompilation skills will depend on jadx when implemented.
+- follow-up:
+  Implement Phase 3 Task 1 with apktool; implement get_decompiled_class (or equivalent) with jadx when adding real decompilation skills.
+- related docs:
+  - `docs/DESIGN_DOC.md` (Phase 3, extraction)
+  - `docs/TASKS.md` (Phase 3 implementation plan)
+
 ---
 
 ## Superseded / deprecated decisions

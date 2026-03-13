@@ -41,10 +41,10 @@ Implement real extraction (manifest, exported components, permissions, deep link
 Phase 2 skeleton is complete. This task delivers the first end-to-end security analysis: APK → dossier → LLM → report with evidence-backed findings.
 
 ### In scope
-- Real manifest parsing and dossier build from APK (e.g. androguard or equivalent).
+- Real manifest parsing and dossier build from APK using **apktool** (decode APK, parse AndroidManifest.xml).
 - Real prompt templates (global context, skills catalog) per DESIGN_DOC.
 - Real Ollama client (HTTP) in LLM layer; keep mock for tests.
-- At least one real skill (e.g. get_decompiled_class) or keep stub for MVP.
+- At least one real skill (e.g. get_decompiled_class via **jadx**) or keep stub for MVP.
 - evidence_ref validation against dossier.
 - Write report.json and optionally observations.json, scan_meta.json, scan.log under run folder.
 - Integration test: fixture APK + mock LLM → report with expected structure and valid evidence_refs.
@@ -76,6 +76,30 @@ Phase 2 skeleton is complete. This task delivers the first end-to-end security a
 ### Risks / edge cases / concerns
 - Manifest parsing must handle malformed APKs; validate and fail cleanly.
 - Keep tests runnable without live Ollama (mock).
+
+### Phase 3 implementation plan (order of work)
+
+Execute in this order; each step is a logical sub-task that can be verified before moving on.
+
+1. **Real extraction**
+   - Add real APK/manifest parsing using **apktool** (decode APK, parse decoded AndroidManifest.xml); build dossier from manifest (exported activities, services, receivers, providers, permissions, deep links). Replace extraction stub.
+   - Add integration test with a fixture APK: assert dossier shape and at least one exported component or permission.
+
+2. **Real Ollama client**
+   - Implement HTTP client that calls Ollama API (config.ollama_base_url); keep existing `complete()` interface so workflow is unchanged.
+   - Tests continue to use a mock (patch or inject) so CI does not require live Ollama.
+
+3. **Real prompts and skills catalog**
+   - Implement prompt templates per DESIGN_DOC: global context (role, task), skills catalog (name, description, params, when to use), and per-turn user prompt with dossier and optional prior skill results.
+   - Optionally implement at least one real skill (e.g. `get_decompiled_class` via decompiler) or keep stub for MVP; ensure multi-turn loop can request and consume skill results.
+
+4. **evidence_ref validation**
+   - In workflow or report path: for each hypothesis, validate every `evidence_ref` against the dossier (e.g. resolve path like `exported_activities[0]` to actual dossier content). Drop or flag hypotheses with invalid refs.
+
+5. **Run artifacts**
+   - Ensure `report.json` is written with validated hypotheses; add optionally `observations.json`, `scan_meta.json`, `scan.log` under run folder as needed for the slice. Document schema if new.
+
+**Completion check:** One real APK → real dossier → (multi-turn) LLM → report with hypotheses and valid evidence_refs; all tests pass (mock LLM in CI).
 
 ---
 

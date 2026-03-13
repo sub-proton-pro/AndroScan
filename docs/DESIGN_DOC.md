@@ -296,11 +296,21 @@ Response is JSON with two optional top-level keys:
 
 ### Phase 3 — First vertical slice
 
-- Implement deterministic extraction (manifest, exported components, permissions, deep links).
-- Implement real prompts (global context + skills catalog) and real parsing of LLM output.
-- Implement at least one skill (e.g. get_decompiled_class) and multi-turn loop (max turns cap).
-- Report: write findings and run artifacts under `apps/<app_id>/<run_ts>/`.
-- Acceptance: One real APK → dossier → multi-turn LLM (with or without skill use) → report with 1–5 hypotheses and valid evidence_refs.
+**Goal:** Replace stubs with real extraction and real LLM; one real APK produces a dossier and report with evidence-backed hypotheses.
+
+**Implementation order (sub-steps):**
+
+1. **Real extraction** — Add real APK/manifest parsing using **apktool** (decode APK, parse decoded AndroidManifest.xml); build dossier from manifest (exported activities, services, receivers, providers, permissions, deep links). Replace extraction stub. Add integration test with fixture APK (dossier shape, at least one component or permission).
+
+2. **Real Ollama client** — Implement HTTP client calling Ollama API (config.ollama_base_url); keep `complete()` interface. Tests use mock so CI does not require live Ollama.
+
+3. **Real prompts and skills catalog** — Implement prompt templates per DESIGN_DOC (global context, skills catalog, per-turn user prompt). Optionally implement one real skill (e.g. get_decompiled_class via **jadx**) or keep stub; multi-turn loop consumes skill results.
+
+4. **evidence_ref validation** — Validate each hypothesis’s evidence_refs against dossier paths; drop or flag invalid refs before writing report.
+
+5. **Run artifacts** — Write report.json with validated hypotheses; add optionally observations.json, scan_meta.json, scan.log under run folder.
+
+**Acceptance:** One real APK → dossier → multi-turn LLM → report with 1–5 hypotheses and valid evidence_refs; all tests pass with mock LLM in CI.
 
 ### Phase 4 — Harden and extend
 
