@@ -1,8 +1,11 @@
-"""Tests for LLM stub: prompt builder and response parser."""
+"""Tests for LLM: client (Ollama), prompt builder, response parser."""
+
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
-from androscan.llm import build_prompt, parse_response
+from androscan.llm import build_prompt, complete, parse_response
 
 
 def test_build_prompt_contains_dossier():
@@ -37,3 +40,31 @@ def test_parse_response_invalid_json():
     resp = parse_response("not json at all")
     assert resp.hypotheses == []
     assert resp.skill_requests == []
+
+
+def test_complete_calls_ollama_and_returns_response():
+    """complete() POSTs to Ollama /api/generate and returns response text. No live Ollama."""
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {"response": '{"hypotheses": []}'}
+    with patch("androscan.llm.client.requests.post", return_value=mock_resp) as post_mock:
+        out = complete("test prompt", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=60, ollama_model="llama2"))
+    assert out == '{"hypotheses": []}'
+    mock_resp.raise_for_status.assert_called_once()
+    call_kw = post_mock.call_args.kwargs
+    assert call_kw["json"]["prompt"] == "test prompt"
+    assert call_kw["json"]["stream"] is False
+
+
+def test_complete_raises_on_connection_error():
+    """complete() raises RuntimeError when Ollama is unreachable."""
+    with patch("androscan.llm.client.requests.post", side_effect=requests.ConnectionError):
+        with pytest.raises(RuntimeError, match="Cannot connect to Ollama"):
+            complete("test", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=5, ollama_model="x"))
+
+
+def test_complete_raises_on_timeout():
+    """complete() raises RuntimeError on request timeout."""
+    with patch("androscan.llm.client.requests.post", side_effect=requests.Timeout):
+        with pytest.raises(RuntimeError, match="timed out"):
+            complete("test", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x"))

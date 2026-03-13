@@ -11,8 +11,10 @@ from androscan.internal.workflow import run_workflow
 
 
 def test_workflow_creates_report_file(tmp_path):
-    """Run workflow with stub (no live Ollama); run folder contains report.json with expected structure."""
-    run_workflow("/dummy.apk", ["exported_components"], tmp_path)
+    """Run workflow with mock LLM (no live Ollama); run folder contains report.json with expected structure."""
+    stub_json = '{"summary": "Stub analysis.", "hypotheses": [{"id": "H1", "component_type": "activity", "component_name": "com.example.app.MainActivity", "title": "Stub finding", "description": "Stub.", "evidence_refs": ["exported_activities[0]"], "exploitability": 3, "confidence": 2, "remediation_hint": "N/A"}]}'
+    with patch("androscan.internal.workflow.complete", return_value=stub_json):
+        run_workflow("/dummy.apk", ["exported_components"], tmp_path)
     report_file = tmp_path / "report.json"
     assert report_file.exists()
     data = json.loads(report_file.read_text())
