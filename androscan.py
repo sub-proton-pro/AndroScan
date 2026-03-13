@@ -24,7 +24,7 @@ def _sigterm_handler(_signum: int, _frame: Optional[object]) -> None:
 
 
 from androscan import constants
-from androscan.cli_term import grey, orange
+from androscan.cli_term import colored_json, grey, orange
 from androscan.config import load_config
 from androscan.extraction import extract_dossier
 from androscan.internal import app_id_from_dossier
@@ -127,6 +127,9 @@ def _run() -> int:
     _section("Extraction", config.section_rule)
     print(f"  Package:  {dossier.apk_info.package}")
     print(f"  Dossier:  {n_act} activities, {n_svc} services, {n_rec} receivers, {n_prv} providers, {n_perm} permissions, {n_deep} deep links")
+    print()
+    _subsection("Dossier")
+    print(colored_json(dossier.to_dict()))
     print()
 
     app_id = app_id_from_dossier(dossier)
