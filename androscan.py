@@ -8,10 +8,20 @@ Usage:
 import argparse
 import json
 import shutil
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+
+class ShutdownRequested(Exception):
+    """Raised when SIGTERM or other forceful shutdown is received."""
+
+
+def _sigterm_handler(_signum: int, _frame: Optional[object]) -> None:
+    raise ShutdownRequested()
+
 
 from androscan import constants
 from androscan.cli_term import grey, orange
@@ -40,6 +50,21 @@ def _exploitability_label(score: int) -> str:
 
 
 def main() -> int:
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        signal.signal(sigterm, _sigterm_handler)
+
+    try:
+        return _run()
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    except ShutdownRequested:
+        print("Shutdown requested.", file=sys.stderr)
+        return 143
+
+
+def _run() -> int:
     parser = argparse.ArgumentParser(
         description="AndroScan: analyze APK for exported component exploitability (LLM-assisted)."
     )
