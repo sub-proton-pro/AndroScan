@@ -1,19 +1,16 @@
-"""Orchestration: extraction -> dossier -> LLM (multi-turn) -> report."""
+"""Orchestration: pipeline skills -> dossier -> LLM (multi-turn) -> report skill."""
 
-import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from androscan.config import Config, load_config
-from androscan.extraction import extract_dossier
-from androscan.internal.dossier import app_id_from_dossier
-from androscan.internal.skills import run_skills
 from androscan.llm import complete, build_prompt, parse_response
-from androscan.llm.parser import LLMResponse, Hypothesis
+from androscan.llm.parser import Hypothesis
+from androscan.skills import SkillContext, execute, list_llm_skills, run_skills
 
 
 def run_workflow(apk_path: str, tasks: list[str], run_folder: Path, config: Optional[Config] = None) -> None:
-    """Run the analysis workflow: extract dossier, multi-turn LLM, write report.
+    """Run the analysis workflow: pipeline skills (extract_manifest, prepare_dossier), multi-turn LLM, generate_report.
 
     - tasks: list of task names (e.g. ["exported_components"]); stub uses first only.
     - run_folder: path to apps/<app_id>/<run_ts>/ where artifacts are written.
@@ -22,21 +19,34 @@ def run_workflow(apk_path: str, tasks: list[str], run_folder: Path, config: Opti
     _ = tasks  # Stub: ignore which tasks; Phase 3 will dispatch per task.
     if config is None:
         config = load_config()
-    dossier = extract_dossier(apk_path)
-    dossier_dict = dossier.to_dict()
+
+    ctx = SkillContext(config=config, run_folder=run_folder, apk_path=apk_path)
+
+    # Pipeline: extract manifest -> prepare dossier
+    manifest_result = execute("extract_manifest", {}, ctx)
+    if not manifest_result.success:
+        raise RuntimeError(f"extract_manifest failed: {manifest_result.text}")
+    dossier_result = execute("prepare_dossier", {"manifest": manifest_result.data}, ctx)
+    if not dossier_result.success:
+        raise RuntimeError(f"prepare_dossier failed: {dossier_result.text}")
+
+    dossier_dict = dossier_result.data
+    ctx.dossier_dict = dossier_dict
+
     prior_skill_results: list[str] = []
     hypotheses: list[Hypothesis] = []
+    resp = None
     turn = 0
     max_turns = config.max_turns
 
     while turn < max_turns:
         turn += 1
-        prompt = build_prompt(dossier_dict, prior_skill_results if prior_skill_results else None)
+        prompt = build_prompt(dossier_dict, prior_skill_results if prior_skill_results else None, list_llm_skills())
         raw = complete(prompt, config=config)
         resp = parse_response(raw)
 
         if resp.skill_requests:
-            results = run_skills(resp.skill_requests, dossier_dict, run_folder)
+            results = run_skills(resp.skill_requests, dossier_dict, run_folder, ctx)
             prior_skill_results.extend(results)
             continue
 
@@ -44,9 +54,8 @@ def run_workflow(apk_path: str, tasks: list[str], run_folder: Path, config: Opti
             hypotheses = resp.hypotheses
             break
 
-    # Write minimal report
-    report = {
-        "summary": getattr(resp, "summary", None) or "",
+    summary = getattr(resp, "summary", None) or "" if resp else ""
+    report_params = {
         "hypotheses": [
             {
                 "id": h.id,
@@ -61,6 +70,6 @@ def run_workflow(apk_path: str, tasks: list[str], run_folder: Path, config: Opti
             }
             for h in hypotheses
         ],
+        "summary": summary,
     }
-    report_path = run_folder / "report.json"
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    execute("generate_report", report_params, ctx)

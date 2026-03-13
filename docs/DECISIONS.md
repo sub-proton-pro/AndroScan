@@ -366,6 +366,28 @@ Use the following structure for new entries:
   - `docs/STATE.md`
   - `androscan/constants.py`, `global_config.yaml`
 
+### DEC-013: Skills as first-class layer with two-tier model
+- status: Active
+- date: 2026-03
+- owners: (project)
+- context:
+  Skills were an internal stub in `internal/skills.py`. Extraction and report writing were hardcoded in workflow. To support reuse by multiple vulnerability modules and by the LLM when it requests additional evidence, skills are promoted to a first-class architectural layer.
+- decision:
+  Introduce a **skills layer** (`androscan/skills/`) with a uniform contract (SkillMeta, SkillContext, SkillResult). Each skill exports SKILL_META and execute(). Two tiers: **pipeline** skills (orchestration calls in fixed order; not advertised to the LLM) and **llm** skills (advertised in the prompt catalog; run when the LLM includes them in skill_requests). Registry discovers skills from known modules; execute(), list_llm_skills(), run_skills() provide the API. Extraction and report writing become pipeline skills; decompilation-related capabilities are LLM-requestable skills.
+- rationale:
+  Composability: modules and the LLM reuse the same skills. Clear boundary: orchestration composes pipeline skills; LLM requests only the subset it is allowed to use. Testability: each skill is a small, testable unit.
+- alternatives considered:
+  - Keep skills as internal implementation detail (rejected: no reuse across modules)
+  - Single tier for all skills (rejected: would allow LLM to trigger extraction/report arbitrarily)
+- tradeoffs / consequences:
+  - New layer and contract to maintain
+  - Phase 3 extraction work is now "implement extract_manifest and prepare_dossier skills with apktool"
+- follow-up:
+  Phase 3 implements real logic in pipeline and LLM skills; modules can compose skills in later phases.
+- related docs:
+  - `docs/ARCHITECTURE.md` (Skills layer)
+  - `docs/DESIGN_DOC.md` (Section 7, skills)
+
 ---
 
 ## Superseded / deprecated decisions

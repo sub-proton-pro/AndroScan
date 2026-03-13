@@ -17,19 +17,19 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 ## What currently exists
 
 ### Implemented
-- Repository layout per DESIGN_DOC: `androscan/`, `androscan/config/`, `androscan/internal/`, `androscan/internal/report/`, `androscan/extraction/`, `androscan/llm/`, `androscan/modules/`, `androscan/modules/exported_components/`, `tests/`.
+- Repository layout per DESIGN_DOC: `androscan/`, `androscan/config/`, `androscan/internal/`, `androscan/internal/report/`, `androscan/skills/`, `androscan/extraction/`, `androscan/llm/`, `androscan/modules/`, `androscan/modules/exported_components/`, `tests/`.
 - Python project: `pyproject.toml` with dependencies (requests, PyYAML), dev deps (pytest).
 - CLI: `androscan.py` at repo root with `--apk`, `--task` (multi-valued), `--output`, `--config` (path to global_config.yaml).
 - Constants: `androscan.constants` — APP_ID_MAX_LEN, MAX_TURNS_DEFAULT, EXPLOITABILITY_LABELS, SECTION_RULE, tool cmd defaults.
 - Config: `androscan.config.load_config(config_path?)` — merge order: defaults → `global_config.yaml` (if present) → env. Config includes ollama_*, run_folder_root, max_turns, apktool_cmd, jadx_cmd, section_rule_*, etc. Env: ANDROSCAN_OLLAMA_URL, ANDROSCAN_OLLAMA_TIMEOUT, ANDROSCAN_RUN_FOLDER.
 - `global_config.yaml` at repo root (optional): YAML for ollama, paths, workflow, output; settings affect CLI, workflow, run folder, and future extraction/decompilation.
-- Dossier model: `androscan.internal.dossier` (ApkInfo, Dossier, exported components, deep_links); `app_id_from_dossier()` (sanitized package, truncate).
-- Extraction stub: `androscan.extraction.extract_dossier(apk_path)` returns hardcoded minimal dossier; no manifest parsing.
-- LLM stub: `androscan.llm.complete()` returns fixed JSON (no live Ollama); `build_prompt()`, `parse_response()` for skill_requests/hypotheses.
+- Dossier model: `androscan.internal.dossier` (ApkInfo, Dossier, exported components, deep_links); `app_id_from_dossier()`, `Dossier.from_dict()`.
+- Skills layer: `androscan.skills` — SkillMeta, SkillContext, SkillResult; registry with discover(), execute(), list_llm_skills(), run_skills(). Pipeline skills: extract_manifest, prepare_dossier, generate_report. LLM-requestable skills: get_decompiled_class, get_decompiled_method, list_classes_in_package (stubs). Prompt builder uses list_llm_skills() for catalog.
+- Extraction: `androscan.extraction.extract_dossier(apk_path)` delegates to skills (extract_manifest → prepare_dossier) and returns Dossier; stub implementations, no real manifest parsing yet.
+- LLM stub: `androscan.llm.complete()` returns fixed JSON (no live Ollama); `build_prompt(dossier, prior_results?, llm_skills?)`, `parse_response()` for skill_requests/hypotheses.
 - Run folder: `androscan.internal.run_folder.create_run_folder(app_id)` creates `apps/<app_id>/<run_ts>/` with human-readable timestamp.
-- Stub skills: registry with `get_decompiled_class` returning placeholder text.
-- Workflow: `run_workflow(apk_path, tasks, run_folder, config?)` — extraction → prompt → LLM (multi-turn from config.max_turns) → write `report.json`.
-- Tests: 14 tests (import, config, extraction, dossier/app_id, LLM prompt/parser, CLI parsing, workflow integration with mock).
+- Workflow: `run_workflow(apk_path, tasks, run_folder, config?)` — pipeline skills (extract_manifest, prepare_dossier) → multi-turn LLM with skill catalog → generate_report skill.
+- Tests: 20 tests (import, config, extraction, dossier/app_id, LLM prompt/parser, CLI parsing, workflow integration with mock, skills layer).
 
 ### Partially implemented
 - LLM layer: client is stub only; Phase 3 will add real Ollama HTTP calls.
@@ -47,7 +47,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 
 ## What is known to work
 
-- `pip install -e ".[dev]"` and `pytest` from repo root succeed (14 tests pass).
+- `pip install -e ".[dev]"` and `pytest` from repo root succeed (20 tests pass).
 - `python androscan.py --apk /dummy.apk --task exported_components` creates `apps/com_example_app/<run_ts>/report.json` with stub hypotheses.
 - `--task` can be repeated (e.g. `--task a --task b`).
 - Config loads from defaults, optional global_config.yaml (or --config path), and env overrides; default config has expected attributes.
@@ -70,8 +70,8 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 ## Active architectural realities
 
 - Presentation: CLI only (`androscan.py`).
-- Orchestration: `internal/workflow.run_workflow()`; calls extraction, config, llm, skills.
-- Dependency direction: CLI → workflow → extraction, internal (dossier, run_folder, skills), llm.
+- Orchestration: `internal/workflow.run_workflow()`; composes skills (pipeline then LLM multi-turn), config, llm. Extraction delegates to skills.
+- Dependency direction: CLI → workflow → skills, internal (dossier, run_folder), llm.
 - Extraction and LLM are stubs; interfaces are in place for Phase 3 replacement.
 
 ---
@@ -79,7 +79,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 ## Known gaps / technical debt
 
 - Stub LLM always returns hypotheses (no real model). Phase 3 will wire real Ollama.
-- Stub extraction ignores APK content. Phase 3 will add manifest parsing (e.g. androguard or similar).
+- Stub extraction ignores APK content. Phase 3 will implement extract_manifest and prepare_dossier skills with apktool.
 - Run folder artifacts: only report.json; other files (scan.log, etc.) to be added in Phase 3.
 
 ---
@@ -100,6 +100,7 @@ No known blockers at this time.
 
 ## Recent completed work
 
+- 2026-03 Skills refactor: skills layer (androscan/skills/) with two-tier model; workflow composes pipeline and LLM skills; extraction delegates to skills; Dossier.from_dict(); 20 tests. DEC-013, ARCHITECTURE, DESIGN_DOC, STATE, TASKS updated.
 - 2026-03-13 Phase 2 skeleton: layout, config, dossier model, extraction stub, LLM stub, workflow, run folder, CLI, 14 tests. STATE.md updated.
 
 ---

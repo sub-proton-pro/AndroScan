@@ -106,8 +106,16 @@ AndroScan/
       __init__.py
       # Orchestration, domain, finding model
       report/                  # Report generation (writes to apps/<app_id>/<run_ts>/)
-    extraction/                 # APK unpack, manifest, decompilation
-    llm/                        # Ollama, prompts, schema, multi-turn
+    skills/                    # First-class skills layer: pipeline + LLM-requestable skills
+      base.py                  # SkillMeta, SkillContext, SkillResult
+      extract_manifest.py      # pipeline
+      prepare_dossier.py        # pipeline
+      generate_report.py        # pipeline
+      get_decompiled_class.py   # llm
+      get_decompiled_method.py  # llm
+      list_classes_in_package.py # llm
+    extraction/                # APK unpack, manifest (delegates to skills)
+    llm/                       # Ollama, prompts, schema, multi-turn
     modules/                   # Vulnerability check modules
       exported_components/      # First module
         ...
@@ -257,10 +265,12 @@ Response is JSON with two optional top-level keys:
 
 ## 7. Prompt design and skills
 
+Skills use a two-tier model: **pipeline** (orchestration only: extract_manifest, prepare_dossier, generate_report) and **llm** (advertised in the prompt: get_decompiled_class, get_decompiled_method, list_classes_in_package). The prompt builder uses the registry’s `list_llm_skills()` for the catalog.
+
 ### 7.1 Global context (provided every turn)
 
 - **Role:** Senior Android security assessor; produce exploitability hypotheses with evidence_refs; prefer fewer, high-confidence findings.
-- **Available skills:** For each skill: name, description, parameters, when to use. Example skills:
+- **Available skills:** From the skills layer (`list_llm_skills()`). For each: name, description, parameters. Example skills:
   - **get_decompiled_class:** Decompiled Java/Kotlin for the class named in the dossier component. Params: `component_ref` (e.g. `exported_activities[0]`).
   - **get_decompiled_method:** Body of a specific method. Params: `class_name`, `method_name`.
   - **list_classes_in_package:** Class names under a package. Params: `package_prefix`.

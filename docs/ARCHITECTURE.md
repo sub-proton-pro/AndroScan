@@ -134,7 +134,33 @@ Rules:
 
 ---
 
-### 4.3 Application / Domain layer
+### 4.3 Skills layer
+
+The skills layer provides discrete, reusable capabilities that orchestration and the LLM can invoke through a single registry.
+
+Examples:
+- pipeline skills: extract_manifest, prepare_dossier, generate_report
+- LLM-requestable skills: get_decompiled_class, get_decompiled_method, list_classes_in_package
+
+Responsibilities:
+- define the skill contract (SkillMeta, SkillContext, SkillResult)
+- register and discover skills; execute by name
+- expose only LLM-requestable skills to the prompt catalog (list_llm_skills)
+- isolate tool-specific behavior (e.g. apktool, jadx) inside skill implementations
+
+Non-responsibilities:
+- workflow sequencing (orchestration decides order of pipeline skills)
+- LLM provider or prompt construction (LLM layer uses skill catalog)
+- business models like Dossier (domain layer)
+
+Rules:
+- each skill is a single file exporting SKILL_META and execute(params, context)
+- pipeline skills are not advertised to the LLM; LLM skills are
+- vulnerability modules may call execute() or run_skills() as needed
+
+---
+
+### 4.4 Application / Domain layer
 
 This is the core shared logic layer of the platform.
 
@@ -167,7 +193,7 @@ This layer is one of the most important parts of the architecture because it ena
 
 ---
 
-### 4.4 LLM layer
+### 4.5 LLM layer
 
 The LLM layer isolates all model-related behavior.
 
@@ -197,7 +223,7 @@ The LLM layer is a dependency of the platform, not the center of the architectur
 
 ---
 
-### 4.5 Vulnerability checks layer
+### 4.6 Vulnerability checks layer
 
 This layer contains feature modules for individual vulnerability classes or analysis capabilities.
 
@@ -227,7 +253,7 @@ This layer is the main extension mechanism for adding new features over time.
 
 ---
 
-### 4.6 Tool adapter layer
+### 4.7 Tool adapter layer
 
 The tool adapter layer wraps concrete tools and external integrations.
 
@@ -255,7 +281,7 @@ Rules:
 
 ---
 
-### 4.7 Infrastructure layer
+### 4.8 Infrastructure layer
 
 The infrastructure layer supports runtime and operational concerns.
 
@@ -286,9 +312,11 @@ Rules:
 The intended dependency direction is:
 
 - Presentation -> Orchestration / Application entry points
-- Orchestration -> Application / Domain
+- Orchestration -> Application / Domain, Skills (pipeline skills)
 - Application / Domain -> vulnerability module contracts, LLM abstractions, adapter abstractions, infrastructure abstractions
-- Vulnerability modules -> shared domain models/contracts, adapter abstractions, LLM abstractions where appropriate
+- Vulnerability modules -> shared domain models/contracts, adapter abstractions, LLM abstractions, Skills where appropriate
+- LLM layer -> Skills (for skill catalog only; execution is via orchestration)
+- Skills -> tool adapters or concrete tools where needed
 - Tool adapters -> concrete external tools
 - Infrastructure -> implementations backing abstract dependencies
 
@@ -340,14 +368,22 @@ A new output mode should usually involve:
 - reuse of normalized shared result models
 - minimal or no change to vulnerability modules
 
-### 6.3 Adding a new external tool
+### 6.3 Adding a new skill
+
+A new skill should usually involve:
+- a new file in `androscan/skills/` exporting SKILL_META and execute(params, context)
+- tier = "pipeline" (orchestration-only) or "llm" (advertised in prompt)
+- add the module name to the registry’s discover list in `androscan/skills/__init__.py`
+- unit test for the skill
+
+### 6.4 Adding a new external tool
 
 A new external tool should usually involve:
 - a new adapter or implementation module
 - stable integration through existing contracts
 - minimal effect on unrelated business logic
 
-### 6.4 Adding or changing LLM usage
+### 6.5 Adding or changing LLM usage
 
 Changes to LLM use should usually involve:
 - LLM layer changes

@@ -55,7 +55,8 @@ Phase 2 skeleton is complete. This task delivers the first end-to-end security a
 - Full observations.json schema if not needed for MVP.
 
 ### Affected layers/modules
-- extraction (real implementation)
+- skills (extract_manifest, prepare_dossier real implementation; optional get_decompiled_class)
+- extraction (delegates to skills; no change to API)
 - llm (real client, real prompts)
 - internal/workflow, internal/report
 - modules/exported_components (wire into workflow)
@@ -81,8 +82,8 @@ Phase 2 skeleton is complete. This task delivers the first end-to-end security a
 
 Execute in this order; each step is a logical sub-task that can be verified before moving on.
 
-1. **Real extraction**
-   - Add real APK/manifest parsing using **apktool** (decode APK, parse decoded AndroidManifest.xml); build dossier from manifest (exported activities, services, receivers, providers, permissions, deep links). Replace extraction stub.
+1. **Real extraction (skills)**
+   - Implement **extract_manifest** and **prepare_dossier** skills with **apktool** (decode APK, parse decoded AndroidManifest.xml); build dossier from manifest (exported activities, services, receivers, providers, permissions, deep links). Extraction layer already delegates to these skills.
    - Add integration test with a fixture APK: assert dossier shape and at least one exported component or permission.
 
 2. **Real Ollama client**
@@ -90,8 +91,8 @@ Execute in this order; each step is a logical sub-task that can be verified befo
    - Tests continue to use a mock (patch or inject) so CI does not require live Ollama.
 
 3. **Real prompts and skills catalog**
-   - Implement prompt templates per DESIGN_DOC: global context (role, task), skills catalog (name, description, params, when to use), and per-turn user prompt with dossier and optional prior skill results.
-   - Optionally implement at least one real skill (e.g. `get_decompiled_class` via decompiler) or keep stub for MVP; ensure multi-turn loop can request and consume skill results.
+   - Implement prompt templates per DESIGN_DOC: global context (role, task), skills catalog from `list_llm_skills()` (already wired in build_prompt), and per-turn user prompt with dossier and optional prior skill results.
+   - Optionally implement at least one real LLM skill (e.g. `get_decompiled_class` via jadx) or keep stub for MVP; ensure multi-turn loop can request and consume skill results.
 
 4. **evidence_ref validation**
    - In workflow or report path: for each hypothesis, validate every `evidence_ref` against the dossier (e.g. resolve path like `exported_activities[0]` to actual dossier content). Drop or flag hypotheses with invalid refs.

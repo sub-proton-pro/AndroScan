@@ -1,61 +1,25 @@
-"""Extract dossier from APK. Stub implementation returns minimal hardcoded dossier."""
+"""Extract dossier from APK. Delegates to skills layer; backward-compat API returns Dossier."""
 
 from pathlib import Path
 
-from androscan.internal.dossier import (
-    ApkInfo,
-    Dossier,
-    ExportedActivity,
-    IntentFilter,
-    IntentFilterData,
-)
+from androscan.config import load_config
+from androscan.internal.dossier import Dossier
+from androscan.skills import SkillContext, execute
 
 
 def extract_dossier(apk_path: str) -> Dossier:
     """Extract a component dossier from an APK path.
 
-    Stub: does not parse the APK. Verifies path exists (or is non-empty) and returns
-    a minimal hardcoded dossier. Phase 3 will implement real manifest parsing.
+    Delegates to pipeline skills extract_manifest and prepare_dossier; returns Dossier for backward compat.
     """
-    path = Path(apk_path)
-    if not apk_path.strip():
+    if not (apk_path or "").strip():
         raise ValueError("apk_path must be non-empty")
-    # Optionally check path.exists() for clearer errors; for stub we allow missing path
-    return _stub_dossier()
-
-
-def _stub_dossier() -> Dossier:
-    """Minimal dossier for skeleton: one activity, one permission."""
-    return Dossier(
-        apk_info=ApkInfo(
-            package="com.example.app",
-            version_name="1.0",
-            version_code=1,
-            min_sdk=21,
-            target_sdk=30,
-        ),
-        permissions=["android.permission.INTERNET"],
-        exported_activities=[
-            ExportedActivity(
-                name="com.example.app.MainActivity",
-                exported=True,
-                intent_filters=[
-                    IntentFilter(
-                        action=["android.intent.action.MAIN"],
-                        category=["android.intent.category.LAUNCHER"],
-                    ),
-                    IntentFilter(
-                        action=["android.intent.action.VIEW"],
-                        category=["android.intent.category.DEFAULT", "android.intent.category.BROWSABLE"],
-                        data=[
-                            IntentFilterData(scheme="https", host="example.com", pathPrefix="/open"),
-                        ],
-                    ),
-                ],
-            ),
-        ],
-        exported_services=[],
-        exported_receivers=[],
-        exported_providers=[],
-        deep_links=[],
-    )
+    config = load_config()
+    ctx = SkillContext(config=config, run_folder=Path("."), apk_path=apk_path)
+    manifest_result = execute("extract_manifest", {}, ctx)
+    if not manifest_result.success:
+        raise RuntimeError(f"extract_manifest failed: {manifest_result.text}")
+    dossier_result = execute("prepare_dossier", {"manifest": manifest_result.data}, ctx)
+    if not dossier_result.success:
+        raise RuntimeError(f"prepare_dossier failed: {dossier_result.text}")
+    return Dossier.from_dict(dossier_result.data)
