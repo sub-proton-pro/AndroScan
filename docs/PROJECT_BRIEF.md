@@ -14,7 +14,7 @@ This project is a modular security-analysis tool intended to analyze mobile appl
 
 - structured vulnerability checks
 - tool-assisted analysis
-- optional LLM-assisted reasoning
+- LLM-assisted reasoning
 - multiple presentation/output channels
 
 The project is designed to grow incrementally, one feature at a time, into a long-lived platform rather than a one-off script or prototype.
@@ -96,7 +96,7 @@ Examples of future capabilities may include:
 - artifact parsing and metadata extraction
 - evidence collection and normalization
 - report generation in different formats
-- optional LLM-assisted interpretation or summarization
+- LLM-assisted interpretation or summarization
 - policy-based filtering or severity handling
 - auditability and provenance of results
 
