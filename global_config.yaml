@@ -4,7 +4,7 @@
 ollama:
   base_url: "http://localhost:11434"
   timeout_sec: 120
-  model: "llama2"
+  model: "qwen3.5:35b"
 
 paths:
   run_folder_root: "apps"

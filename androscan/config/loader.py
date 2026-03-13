@@ -34,7 +34,7 @@ class Config:
         return cls(
             ollama_base_url="http://localhost:11434",
             ollama_timeout_sec=120,
-            ollama_model="llama2",
+            ollama_model="qwen3.5:35b",
             run_folder_root="apps",
             max_turns=constants.MAX_TURNS_DEFAULT,
             max_hypotheses_per_report=constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT,
@@ -70,7 +70,7 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     output = config_dict.get("output") or {}
     out["ollama_base_url"] = (ollama.get("base_url") or "").strip().rstrip("/") or "http://localhost:11434"
     out["ollama_timeout_sec"] = int(ollama.get("timeout_sec", 120)) if ollama.get("timeout_sec") is not None else 120
-    out["ollama_model"] = ollama.get("model") or "llama2"
+    out["ollama_model"] = ollama.get("model") or "qwen3.5:35b"
     out["run_folder_root"] = paths.get("run_folder_root") or "apps"
     out["max_turns"] = workflow.get("max_turns") if workflow.get("max_turns") is not None else constants.MAX_TURNS_DEFAULT
     out["max_hypotheses_per_report"] = workflow.get("max_hypotheses_per_report") or constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT

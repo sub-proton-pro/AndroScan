@@ -48,7 +48,7 @@ def test_complete_calls_ollama_and_returns_response():
     mock_resp.raise_for_status = MagicMock()
     mock_resp.json.return_value = {"message": {"role": "assistant", "content": '{"hypotheses": []}'}}
     with patch("androscan.llm.client.requests.post", return_value=mock_resp) as post_mock:
-        out = complete("test prompt", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=60, ollama_model="llama2"))
+        out = complete("test prompt", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=60, ollama_model="qwen3.5:35b"))
     assert out == '{"hypotheses": []}'
     mock_resp.raise_for_status.assert_called_once()
     call_args = post_mock.call_args
