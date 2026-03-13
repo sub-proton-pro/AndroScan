@@ -14,6 +14,7 @@ _CYAN = "\033[36m"
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _DIM = "\033[90m"
+_RED = "\033[31m"
 _RESET = "\033[0m"
 
 
@@ -39,12 +40,14 @@ def colored_json(obj: Any, indent: int = 2) -> str:
     def _enc(s: str) -> str:
         return json.dumps(s)
 
-    def _fmt(value: Any, depth: int) -> str:
+    def _fmt(value: Any, depth: int, key: Any = None) -> str:
         pad = " " * (depth * indent)
         pad_inner = " " * ((depth + 1) * indent)
         if value is None:
             return f"{_DIM}null{_RESET}"
         if value is True:
+            if key == "exported":
+                return f"{_RED}true{_RESET}"
             return f"{_DIM}true{_RESET}"
         if value is False:
             return f"{_DIM}false{_RESET}"
@@ -57,7 +60,7 @@ def colored_json(obj: Any, indent: int = 2) -> str:
                 return "[]"
             lines = ["["]
             for i, item in enumerate(value):
-                lines.append(f"{pad_inner}{_fmt(item, depth + 1)}{',' if i < len(value) - 1 else ''}")
+                lines.append(f"{pad_inner}{_fmt(item, depth + 1, None)}{',' if i < len(value) - 1 else ''}")
             lines.append(f"{pad}]")
             return "\n".join(lines)
         if isinstance(value, dict):
@@ -66,9 +69,9 @@ def colored_json(obj: Any, indent: int = 2) -> str:
             lines = ["{"]
             for i, (k, v) in enumerate(value.items()):
                 key_part = f'{_CYAN}{_enc(k)}{_RESET}: '
-                lines.append(f"{pad_inner}{key_part}{_fmt(v, depth + 1)}{',' if i < len(value) - 1 else ''}")
+                lines.append(f"{pad_inner}{key_part}{_fmt(v, depth + 1, k)}{',' if i < len(value) - 1 else ''}")
             lines.append(f"{pad}}}")
             return "\n".join(lines)
         return json.dumps(value)
 
-    return _fmt(obj, 0)
+    return _fmt(obj, 0, None)
