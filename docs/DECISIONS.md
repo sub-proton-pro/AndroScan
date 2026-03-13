@@ -191,7 +191,7 @@ Use the following structure for new entries:
   Define clear contracts for structured outputs and validation behavior.
 - related docs:
   - `docs/ARCHITECTURE.md`
-  - `docs/SECURITY_REQUIREMENTS.md`
+  - `docs/SAFETY_AND_SECURITY.md`
 
 ---
 

@@ -62,7 +62,7 @@ For every new feature:
 ## 7. Documentation rules
 Maintain and update when relevant:
 - ARCHITECTURE.md
-- SECURITY_REQUIREMENTS.md
+- SAFETY_AND_SECURITY.md
 - TEST_STRATEGY.md
 - ADRs in docs/adr/
 - feature specs / acceptance criteria

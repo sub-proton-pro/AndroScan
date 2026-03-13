@@ -425,7 +425,7 @@ Examples of untrusted input:
 - model output should not be treated as trusted by default
 - logging must avoid accidental sensitive leakage
 
-Refer to `docs/SECURITY_REQUIREMENTS.md` for more detailed controls.
+Refer to `docs/SAFETY_AND_SECURITY.md` for more detailed controls.
 
 ---
 

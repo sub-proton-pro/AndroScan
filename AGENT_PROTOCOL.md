@@ -68,7 +68,7 @@ Read additional documents only when needed.
 - architecture context is insufficient
 - the task involves a feature that is only partially implemented today
 
-### Read `docs/SECURITY_REQUIREMENTS.md` when:
+### Read `docs/SAFETY_AND_SECURITY.md` when:
 - the task handles untrusted input
 - the task uses external tools, files, repos, archives, parsers, or network interactions
 - the task touches auth, secrets, sensitive data, logging, or LLM usage
@@ -162,7 +162,7 @@ If multiple sources disagree, use this order of authority:
 1. Explicit instructions from the current task/session
 2. `docs/CONVENTIONS.md`
 3. `docs/ARCHITECTURE.md`
-4. `docs/SECURITY_REQUIREMENTS.md`
+4. `docs/SAFETY_AND_SECURITY.md`
 5. `docs/TEST_STRATEGY.md`
 6. `docs/DECISIONS.md`
 7. `docs/STATE.md`

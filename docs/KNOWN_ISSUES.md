@@ -180,7 +180,7 @@ Use the following format for new entries:
   - first LLM-assisted feature design
 - related docs:
   - `docs/ARCHITECTURE.md`
-  - `docs/SECURITY_REQUIREMENTS.md`
+  - `docs/SAFETY_AND_SECURITY.md`
   - `docs/DECISIONS.md`
 
 ---
@@ -247,7 +247,7 @@ Use the following format for new entries:
   - adapter safety tests
   - LLM output validation
 - related docs:
-  - `docs/SECURITY_REQUIREMENTS.md`
+  - `docs/SAFETY_AND_SECURITY.md`
   - `docs/STATE.md`
   - `docs/TASKS.md`
 
@@ -344,7 +344,7 @@ Use:
 - `docs/STATE.md` for current implementation truth
 - `docs/DECISIONS.md` for rationale
 - `docs/ARCHITECTURE.md` for intended structure
-- `docs/SECURITY_REQUIREMENTS.md` for desired security posture
+- `docs/SAFETY_AND_SECURITY.md` for desired security posture
 - `docs/TEST_STRATEGY.md` for testing expectations
 
 ---

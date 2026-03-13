@@ -157,7 +157,7 @@ The project is successful when:
 
 - new vulnerability features can be added with minimal cross-cutting changes
 - architecture boundaries remain clear
-- LLM usage, if any, is isolated and controlled
+- LLM usage is central, isolated, and controlled
 - output channels are separate from detection logic
 - external tools are wrapped cleanly behind adapters/interfaces
 - findings/evidence/results are normalized in shared models

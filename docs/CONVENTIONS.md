@@ -252,7 +252,7 @@ Treat security as a design constraint, not cleanup work.
 - define trust boundaries where needed
 - validate structured model output before downstream use
 
-If the task touches sensitive flows, consult `docs/SECURITY_REQUIREMENTS.md`.
+If the task touches sensitive flows, consult `docs/SAFETY_AND_SECURITY.md`.
 
 ---
 
@@ -286,7 +286,7 @@ Typical docs that may require updates:
 - `docs/TASKS.md`
 - `docs/ARCHITECTURE.md`
 - `docs/DECISIONS.md`
-- `docs/SECURITY_REQUIREMENTS.md`
+- `docs/SAFETY_AND_SECURITY.md`
 - `docs/TEST_STRATEGY.md`
 
 Update docs when:
