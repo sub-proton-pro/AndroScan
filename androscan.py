@@ -6,6 +6,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -65,7 +66,28 @@ def main() -> int:
         print(f"Error: workflow failed: {e}", file=sys.stderr)
         return 1
 
-    print(f"Run complete. Output: {run_folder}")
+    # Descriptive run summary
+    report_path = run_folder / "report.json"
+    n_findings = None
+    if report_path.exists():
+        try:
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            n_findings = len(data.get("hypotheses") or [])
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    package = dossier.apk_info.package
+    tasks_str = ", ".join(tasks)
+    print("AndroScan — run complete\n")
+    print(f"  APK:     {apk_path}")
+    print(f"  App:     {app_id} ({package})")
+    print(f"  Tasks:   {tasks_str}")
+    print(f"  Output:  {run_folder}")
+    if n_findings is not None:
+        word = "hypothesis" if n_findings == 1 else "hypotheses"
+        print(f"  Report:  report.json ({n_findings} {word})")
+    else:
+        print("  Report:  report.json")
     return 0
 
 
