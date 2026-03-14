@@ -12,14 +12,16 @@ OLLAMA_TIMEOUT_TIERS = [150, 300, 600, 900]
 OLLAMA_NUM_PREDICT_DEFAULT = 8192  # 2 * 4096
 OLLAMA_NUM_PREDICT_TIERS = [8192, 16384]
 
-# Exploitability scale 1-5 (LLM output)
-EXPLOITABILITY_LABELS = {
-    5: "critical",
-    4: "high",
-    3: "medium",
-    2: "low",
-    1: "minimal",
+# Issue severity (exploitability + impact); 1-5 from LLM. CVSS 3 scoring in a later phase.
+ISSUE_SEVERITY_LABELS = {
+    5: "Critical",
+    4: "High",
+    3: "Medium",
+    2: "Low",
+    1: "Informational",
 }
+# Backward compatibility: same mapping, lowercase (e.g. for aggregate "1 high, 2 medium")
+EXPLOITABILITY_LABELS = {k: v.lower() for k, v in ISSUE_SEVERITY_LABELS.items()}
 
 # CLI output
 SECTION_RULE_CHAR = "─"

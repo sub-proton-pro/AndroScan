@@ -20,7 +20,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 - Repository layout per DESIGN_DOC: `androscan/`, `androscan/config/`, `androscan/internal/`, `androscan/internal/report/`, `androscan/skills/`, `androscan/extraction/`, `androscan/llm/`, `androscan/modules/`, `androscan/modules/exported_components/`, `tests/`.
 - Python project: `pyproject.toml` with dependencies (requests, PyYAML), dev deps (pytest).
 - CLI: `androscan.py` at repo root with `--apk`, `--task` (multi-valued), `--output`, `--config` (path to global_config.yaml).
-- Constants: `androscan.constants` — APP_ID_MAX_LEN, MAX_TURNS_DEFAULT, EXPLOITABILITY_LABELS, SECTION_RULE, tool cmd defaults.
+- Constants: `androscan.constants` — APP_ID_MAX_LEN, MAX_TURNS_DEFAULT, ISSUE_SEVERITY_LABELS (Critical/High/Medium/Low/Informational), EXPLOITABILITY_LABELS, SECTION_RULE, tool cmd defaults.
 - Config: `androscan.config.load_config(config_path?)` — merge order: defaults → `global_config.yaml` (if present) → env. Config includes ollama_*, run_folder_root, max_turns, apktool_cmd, jadx_cmd, section_rule_*, etc. Env: ANDROSCAN_OLLAMA_URL, ANDROSCAN_OLLAMA_TIMEOUT, ANDROSCAN_RUN_FOLDER.
 - `global_config.yaml` at repo root (optional): YAML for ollama, paths, workflow, output; settings affect CLI, workflow, run folder, and future extraction/decompilation.
 - Dossier model: `androscan.internal.dossier` (ApkInfo, Dossier, exported components, deep_links); `app_id_from_dossier()`, `Dossier.from_dict()`.

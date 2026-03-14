@@ -250,7 +250,7 @@ Response is JSON with two optional top-level keys:
 | title | string | Short title |
 | description | string | Explanation |
 | evidence_refs | array of string | Dossier paths (e.g. `exported_providers[0]`, `deep_links[0]`) — must be valid paths in the dossier |
-| exploitability | integer | 1–5 (1=minimal, 5=critical) |
+| exploitability | integer | 1–5 (1=Informational, 5=Critical; see ISSUE_SEVERITY_LABELS) |
 | confidence | integer | 1–5 (1=low, 5=very high) |
 | remediation_hint | string | Brief remediation guidance |
 
