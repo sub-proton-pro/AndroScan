@@ -12,7 +12,7 @@ import signal
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 class ShutdownRequested(Exception):
@@ -54,6 +54,28 @@ def _exploitability_label(score: int) -> str:
 def _severity_label(score: int) -> str:
     """Display severity for CLI (brackets); uses ISSUE_SEVERITY_LABELS."""
     return constants.ISSUE_SEVERITY_LABELS.get(score, "Informational")
+
+
+def _component_name_from_ref(dossier: Any, ref: str) -> Optional[str]:
+    """Resolve evidence_ref (e.g. exported_activities[0]) to component name from dossier."""
+    if not ref or not isinstance(ref, str) or "[" not in ref or not ref.endswith("]"):
+        return None
+    key, rest = ref.split("[", 1)
+    try:
+        idx = int(rest.rstrip("]"))
+    except ValueError:
+        return None
+    if key == "exported_activities" and 0 <= idx < len(dossier.exported_activities):
+        return dossier.exported_activities[idx].name
+    if key == "exported_services" and 0 <= idx < len(dossier.exported_services):
+        return dossier.exported_services[idx].name
+    if key == "exported_receivers" and 0 <= idx < len(dossier.exported_receivers):
+        return dossier.exported_receivers[idx].name
+    if key == "exported_providers" and 0 <= idx < len(dossier.exported_providers):
+        return dossier.exported_providers[idx].name
+    if key == "deep_links" and 0 <= idx < len(dossier.deep_links):
+        return dossier.deep_links[idx].component
+    return None
 
 
 def main() -> int:
@@ -200,18 +222,22 @@ def _run() -> int:
             exp = h.get("exploitability", 1)
             by_exp[exp] = by_exp.get(exp, 0) + 1
         parts = [f"{by_exp[exp]} {_exploitability_label(exp)}" for exp in sorted(by_exp.keys(), reverse=True)]
-        print(f"  Findings:  {n} hypothesis" + ("es" if n != 1 else "") + f" ({', '.join(parts)} exploitability)")
+        print(f"  Findings:  {n} ({', '.join(parts)})")
         print()
         for i, h in enumerate(hypotheses, 1):
             title = h.get("title") or "(no title)"
             comp = h.get("component_name")
             if not comp and (refs := h.get("evidence_refs")):
-                comp = refs[0] if isinstance(refs[0], str) else "—"
+                first_ref = refs[0] if isinstance(refs[0], str) else None
+                if first_ref:
+                    comp = _component_name_from_ref(dossier, first_ref)
+                if not comp and first_ref:
+                    comp = first_ref
             comp = comp or "—"
             exp = h.get("exploitability", 1)
             conf = h.get("confidence", 0)
             print(f"  {i}. [{_severity_label(exp)}] {title}")
-            print(f"     Component: {comp}  (exploitability: {exp}, confidence: {conf})")
+            print(f"     Component: {comp}  (severity: {exp}, confidence: {conf})")
             print()
         print(f"  Full report:  {report_path}")
     else:

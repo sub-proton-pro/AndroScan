@@ -54,7 +54,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 - Extraction stub returns dossier with expected shape; `app_id_from_dossier` yields `com_example_app` for stub.
 - LLM parser parses valid JSON with skill_requests and hypotheses; invalid JSON returns empty response without crash.
 - Workflow integration test with mock LLM (skill_requests then hypotheses) runs two turns and writes report.
-- Run summary shows severity in brackets (e.g. `[High]`) per finding; component falls back to first `evidence_ref` when `component_name` is missing.
+- Run summary shows severity in brackets (e.g. `[High]`), "Findings: n (1 high, 1 low)" wording, and "(severity: …, confidence: …)" per finding; component name is resolved from dossier when `component_name` is missing (evidence_ref → e.g. `exported_activities[0]` → activity name), else first evidence_ref or "—".
 
 ---
 
