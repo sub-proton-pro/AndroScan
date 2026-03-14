@@ -1,4 +1,4 @@
-"""Ollama client: HTTP POST to /api/chat. Streaming, retries, system message, format json, think."""
+"""Ollama client: HTTP POST to /api/chat. Streaming, retries, system message, format json."""
 
 import json
 from dataclasses import dataclass
@@ -161,12 +161,12 @@ def complete(
             "messages": messages,
             "stream": stream,
             "format": "json",
-            "think": "low",
             "options": {
                 "temperature": temperature,
                 "num_predict": current_num_predict,
             },
         }
+        # Omit "think" for compatibility: older Ollama versions return 400 if they don't support it
 
         try:
             result = _do_request(url, payload, timeout, stream, on_token, on_thinking)
