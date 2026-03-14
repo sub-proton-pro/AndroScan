@@ -7,6 +7,11 @@ APP_ID_MAX_LEN = 128
 MAX_TURNS_DEFAULT = 3
 MAX_HYPOTHESES_PER_REPORT_DEFAULT = 10
 
+# Ollama retry: timeout tiers (sec), num_predict tiers (tokens)
+OLLAMA_TIMEOUT_TIERS = [150, 300, 600, 900]
+OLLAMA_NUM_PREDICT_DEFAULT = 8192  # 2 * 4096
+OLLAMA_NUM_PREDICT_TIERS = [8192, 16384]
+
 # Exploitability scale 1-5 (LLM output)
 EXPLOITABILITY_LABELS = {
     5: "critical",

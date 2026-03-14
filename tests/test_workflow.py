@@ -7,13 +7,15 @@ from unittest.mock import patch
 import pytest
 
 from androscan.extraction import extract_dossier
+from androscan.llm.client import CompleteResult
 from androscan.internal.workflow import run_workflow
 
 
 def test_workflow_creates_report_file(tmp_path):
     """Run workflow with mock LLM (no live Ollama); run folder contains report.json with expected structure."""
     stub_json = '{"summary": "Stub analysis.", "hypotheses": [{"id": "H1", "component_type": "activity", "component_name": "com.example.app.MainActivity", "title": "Stub finding", "description": "Stub.", "evidence_refs": ["exported_activities[0]"], "exploitability": 3, "confidence": 2, "remediation_hint": "N/A"}]}'
-    with patch("androscan.internal.workflow.complete", return_value=stub_json):
+    stub_result = CompleteResult(content=stub_json, thinking="", metadata={})
+    with patch("androscan.internal.workflow.complete", return_value=stub_result):
         run_workflow("/dummy.apk", ["exported_components"], tmp_path)
     report_file = tmp_path / "report.json"
     assert report_file.exists()
@@ -34,8 +36,10 @@ def test_workflow_multi_turn_with_mock_skill_request(tmp_path):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return '{"skill_requests": [{"skill": "get_decompiled_class", "params": {"component_ref": "exported_activities[0]"}}]}'
-        return '{"hypotheses": [{"id": "H2", "component_type": "activity", "component_name": "com.example.app.MainActivity", "title": "Mock", "description": "D", "evidence_refs": ["exported_activities[0]"], "exploitability": 2, "confidence": 3, "remediation_hint": ""}]}'
+            content = '{"skill_requests": [{"skill": "get_decompiled_class", "params": {"component_ref": "exported_activities[0]"}}]}'
+        else:
+            content = '{"hypotheses": [{"id": "H2", "component_type": "activity", "component_name": "com.example.app.MainActivity", "title": "Mock", "description": "D", "evidence_refs": ["exported_activities[0]"], "exploitability": 2, "confidence": 3, "remediation_hint": ""}]}'
+        return CompleteResult(content=content, thinking="", metadata={})
 
     with patch("androscan.internal.workflow.complete", side_effect=mock_complete):
         run_workflow("/dummy.apk", ["exported_components"], tmp_path)

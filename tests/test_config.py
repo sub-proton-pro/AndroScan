@@ -14,7 +14,9 @@ def test_default_config_has_expected_attributes():
     assert hasattr(cfg, "ollama_timeout_sec")
     assert hasattr(cfg, "run_folder_root")
     assert cfg.ollama_base_url == "http://localhost:11434"
-    assert cfg.ollama_timeout_sec == 120
+    assert cfg.ollama_timeout_sec == 150
+    assert cfg.ollama_temperature == 0.2
+    assert cfg.ollama_num_predict == 8192
     assert cfg.run_folder_root == "apps"
 
 

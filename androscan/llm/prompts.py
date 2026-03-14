@@ -6,6 +6,16 @@ from typing import Any, Optional
 from androscan.skills.base import SkillMeta
 
 
+def build_system_content() -> str:
+    """System message: role and output format instructions for the LLM."""
+    return (
+        "You are a security analyst. Analyze the exported component dossier and produce "
+        "exploitability hypotheses. Always return valid JSON with optional 'skill_requests' "
+        "and/or 'hypotheses'. Use evidence_refs as dossier paths (e.g. exported_activities[0]). "
+        "exploitability and confidence are integers 1-5."
+    )
+
+
 def build_prompt(
     dossier_dict: dict[str, Any],
     prior_skill_results: Optional[list[str]] = None,

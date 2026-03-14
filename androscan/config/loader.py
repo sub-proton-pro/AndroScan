@@ -21,6 +21,8 @@ class Config:
     ollama_base_url: str
     ollama_timeout_sec: int
     ollama_model: str
+    ollama_temperature: float
+    ollama_num_predict: int
     run_folder_root: str
     max_turns: int
     max_hypotheses_per_report: int
@@ -33,8 +35,10 @@ class Config:
     def default(cls) -> "Config":
         return cls(
             ollama_base_url="http://localhost:11434",
-            ollama_timeout_sec=120,
+            ollama_timeout_sec=150,
             ollama_model="qwen3.5:35b",
+            ollama_temperature=0.2,
+            ollama_num_predict=constants.OLLAMA_NUM_PREDICT_DEFAULT,
             run_folder_root="apps",
             max_turns=constants.MAX_TURNS_DEFAULT,
             max_hypotheses_per_report=constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT,
@@ -69,8 +73,10 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     workflow = config_dict.get("workflow") or {}
     output = config_dict.get("output") or {}
     out["ollama_base_url"] = (ollama.get("base_url") or "").strip().rstrip("/") or "http://localhost:11434"
-    out["ollama_timeout_sec"] = int(ollama.get("timeout_sec", 120)) if ollama.get("timeout_sec") is not None else 120
+    out["ollama_timeout_sec"] = int(ollama.get("timeout_sec", 150)) if ollama.get("timeout_sec") is not None else 150
     out["ollama_model"] = ollama.get("model") or "qwen3.5:35b"
+    out["ollama_temperature"] = float(ollama.get("temperature", 0.2)) if ollama.get("temperature") is not None else 0.2
+    out["ollama_num_predict"] = int(ollama.get("num_predict", constants.OLLAMA_NUM_PREDICT_DEFAULT)) if ollama.get("num_predict") is not None else constants.OLLAMA_NUM_PREDICT_DEFAULT
     out["run_folder_root"] = paths.get("run_folder_root") or "apps"
     out["max_turns"] = workflow.get("max_turns") if workflow.get("max_turns") is not None else constants.MAX_TURNS_DEFAULT
     out["max_hypotheses_per_report"] = workflow.get("max_hypotheses_per_report") or constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT
@@ -118,6 +124,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
         ollama_base_url=merged["ollama_base_url"],
         ollama_timeout_sec=merged["ollama_timeout_sec"],
         ollama_model=merged["ollama_model"],
+        ollama_temperature=merged["ollama_temperature"],
+        ollama_num_predict=max(1, merged["ollama_num_predict"]),
         run_folder_root=merged["run_folder_root"],
         max_turns=max(1, merged["max_turns"]),
         max_hypotheses_per_report=max(0, merged["max_hypotheses_per_report"]),

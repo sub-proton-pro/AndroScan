@@ -6,6 +6,7 @@ import pytest
 import requests
 
 from androscan.llm import build_prompt, complete, parse_response
+from androscan.llm.client import CompleteResult
 
 
 def test_build_prompt_contains_dossier():
@@ -43,33 +44,47 @@ def test_parse_response_invalid_json():
 
 
 def test_complete_calls_ollama_and_returns_response():
-    """complete() POSTs to Ollama /api/chat and returns response text. No live Ollama."""
+    """complete() POSTs to Ollama /api/chat and returns CompleteResult. No live Ollama."""
     mock_resp = MagicMock()
     mock_resp.raise_for_status = MagicMock()
-    mock_resp.json.return_value = {"message": {"role": "assistant", "content": '{"hypotheses": []}'}}
+    mock_resp.json.return_value = {
+        "message": {"role": "assistant", "content": '{"hypotheses": []}'},
+        "done_reason": "stop",
+    }
+    config = MagicMock(
+        ollama_base_url="http://localhost:11434",
+        ollama_timeout_sec=60,
+        ollama_model="qwen3.5:35b",
+        ollama_temperature=0.2,
+        ollama_num_predict=8192,
+    )
     with patch("androscan.llm.client.requests.post", return_value=mock_resp) as post_mock:
-        out = complete("test prompt", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=60, ollama_model="qwen3.5:35b"))
-    assert out == '{"hypotheses": []}'
+        result = complete("test prompt", config=config, stream=False)
+    assert isinstance(result, CompleteResult)
+    assert result.content == '{"hypotheses": []}'
     mock_resp.raise_for_status.assert_called_once()
     call_args = post_mock.call_args
     assert call_args[0][0].endswith("/api/chat")
     call_kw = call_args.kwargs
-    assert call_kw["json"]["messages"] == [{"role": "user", "content": "test prompt"}]
+    messages = call_kw["json"]["messages"]
+    assert any(m.get("role") == "user" and m.get("content") == "test prompt" for m in messages)
     assert call_kw["json"]["stream"] is False
 
 
 def test_complete_raises_on_connection_error():
     """complete() raises RuntimeError when Ollama is unreachable."""
+    config = MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=5, ollama_model="x", ollama_temperature=0.2, ollama_num_predict=8192)
     with patch("androscan.llm.client.requests.post", side_effect=requests.ConnectionError):
         with pytest.raises(RuntimeError, match="Cannot connect to Ollama"):
-            complete("test", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=5, ollama_model="x"))
+            complete("test", config=config)
 
 
 def test_complete_raises_on_timeout():
-    """complete() raises RuntimeError on request timeout."""
+    """complete() raises RuntimeError on request timeout after retries."""
+    config = MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x", ollama_temperature=0.2, ollama_num_predict=8192)
     with patch("androscan.llm.client.requests.post", side_effect=requests.Timeout):
         with pytest.raises(RuntimeError, match="timed out"):
-            complete("test", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x"))
+            complete("test", config=config)
 
 
 def test_complete_raises_friendly_message_on_404():
@@ -79,9 +94,11 @@ def test_complete_raises_friendly_message_on_404():
     http_err = requests.HTTPError("404 Not Found")
     http_err.response = mock_resp
     mock_resp.raise_for_status.side_effect = http_err
+    config = MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x", ollama_temperature=0.2, ollama_num_predict=8192)
+    mock_resp.json.return_value = {}  # so _parse_http_error uses generic 404 message
     with patch("androscan.llm.client.requests.post", return_value=mock_resp):
         with pytest.raises(RuntimeError) as exc_info:
-            complete("test", config=MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x"))
+            complete("test", config=config, stream=False)
     msg = str(exc_info.value)
     assert "endpoint not found" in msg.lower() or "not found" in msg.lower()
     assert "ollama.com" in msg or "Ensure Ollama" in msg

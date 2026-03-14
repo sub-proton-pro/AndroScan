@@ -24,11 +24,13 @@ def _sigterm_handler(_signum: int, _frame: Optional[object]) -> None:
 
 
 from androscan import constants
+from androscan.cli_spinner import pause_active, resume_active, spinner
 from androscan.cli_term import colored_json, grey, orange
 from androscan.config import load_config
 from androscan.extraction import extract_dossier
 from androscan.internal import app_id_from_dossier
 from androscan.internal.run_folder import create_run_folder
+from androscan.internal.run_log import RunLogger
 from androscan.internal.workflow import run_workflow
 from androscan.llm import is_ollama_available
 from androscan.llm.client import OLLAMA_SETUP_TIP
@@ -89,7 +91,14 @@ def _run() -> int:
         metavar="FILE",
         help="Path to global_config.yaml (default: cwd or config/global_config.yaml)",
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="count",
+        default=1,
+        help="Verbosity (default: 1; -vv shows LLM thinking in terminal)",
+    )
     args = parser.parse_args()
+    verbosity = max(1, args.verbose)
 
     config = load_config(args.config)
     apk_path = args.apk
@@ -151,11 +160,21 @@ def _run() -> int:
     print(f"  Running:  {tasks_str}")
     print()
 
-    try:
-        run_workflow(apk_path, tasks, run_folder, config)
-    except Exception as e:
-        print(f"Error: workflow failed: {e}", file=sys.stderr)
-        return 1
+    def _cli_sink(kind: str, payload: object) -> None:
+        if kind == "task":
+            _spinner_ref.update(str(payload))
+        elif kind == "thinking":
+            pause_active()
+            print(grey(str(payload)))
+            resume_active()
+
+    with spinner("Analysis starting...", done_message="Analysis complete.") as _spinner_ref:
+        run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink)
+        try:
+            run_workflow(apk_path, tasks, run_folder, config, run_logger=run_logger)
+        except Exception as e:
+            print(f"Error: workflow failed: {e}", file=sys.stderr)
+            return 1
 
     report_path = run_folder / "report.json"
     report_data = None
