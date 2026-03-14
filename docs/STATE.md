@@ -27,7 +27,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 - Skills layer: `androscan.skills` — SkillMeta, SkillContext, SkillResult; registry with discover(), execute(), list_llm_skills(), run_skills(). Pipeline skills: extract_manifest, prepare_dossier, generate_report. LLM-requestable skills: get_decompiled_class, get_decompiled_method, list_classes_in_package (stubs). Prompt builder uses list_llm_skills() for catalog.
 - Extraction: `androscan.extraction.extract_dossier(apk_path)` delegates to skills (extract_manifest → prepare_dossier) and returns Dossier; stub implementations, no real manifest parsing yet.
 - LLM stub: `androscan.llm.complete()` returns fixed JSON (no live Ollama); `build_prompt(dossier, prior_results?, llm_skills?)`, `parse_response()` for skill_requests/hypotheses.
-- Run folder: `androscan.internal.run_folder.create_run_folder(app_id)` creates `apps/<app_id>/<run_ts>/` with human-readable timestamp.
+- Run folder: `androscan.internal.run_folder.create_run_folder(app_id)` creates `apps/<app_id>/<run_ts>/` with human-readable timestamp (hyphens in time for Windows); `run_folder_display_path()` returns a display string with time as HH:MM:SS for CLI Appendix.
 - Workflow: `run_workflow(apk_path, tasks, run_folder, config?)` — pipeline skills (extract_manifest, prepare_dossier) → multi-turn LLM with skill catalog → generate_report skill.
 - Tests: 20 tests (import, config, extraction, dossier/app_id, LLM prompt/parser, CLI parsing, workflow integration with mock, skills layer).
 

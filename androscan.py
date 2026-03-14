@@ -29,7 +29,7 @@ from androscan.cli_term import colored_json, grey, orange
 from androscan.config import load_config
 from androscan.extraction import extract_dossier
 from androscan.internal import app_id_from_dossier
-from androscan.internal.run_folder import create_run_folder
+from androscan.internal.run_folder import create_run_folder, run_folder_display_path
 from androscan.internal.run_log import RunLogger
 from androscan.internal.workflow import run_workflow
 from androscan.llm import is_ollama_available
@@ -220,11 +220,12 @@ def _run() -> int:
 
     _section("Appendix", config.section_rule)
     _subsection("Run log")
+    display_output = run_folder_display_path(run_folder)
     print(f"  APK:      {apk_path}")
     print(f"  App:      {app_id} ({package})")
     print(f"  Tasks:    {tasks_str}")
-    print(f"  Output:   {run_folder}")
-    print(f"  Report:   {report_path}")
+    print(f"  Output:   {display_output}")
+    print(f"  Report:   {Path(display_output) / 'report.json'}")
     return 0
 
 
