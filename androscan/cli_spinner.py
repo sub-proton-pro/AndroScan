@@ -73,7 +73,8 @@ class _Spinner:
         if self._thread:
             self._thread.join(timeout=1)
         if final_message:
-            sys.stdout.write(f"\r    ✓ {final_message}\n")
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.write(f"    ✓ {final_message}\n")
         else:
             sys.stdout.write("\r" + " " * 80 + "\r")
         sys.stdout.flush()
