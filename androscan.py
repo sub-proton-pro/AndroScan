@@ -51,6 +51,11 @@ def _exploitability_label(score: int) -> str:
     return constants.EXPLOITABILITY_LABELS.get(score, str(score))
 
 
+def _severity_label(score: int) -> str:
+    """Display severity for CLI (brackets); uses ISSUE_SEVERITY_LABELS."""
+    return constants.ISSUE_SEVERITY_LABELS.get(score, "Informational")
+
+
 def main() -> int:
     sigterm = getattr(signal, "SIGTERM", None)
     if sigterm is not None:
@@ -199,10 +204,13 @@ def _run() -> int:
         print()
         for i, h in enumerate(hypotheses, 1):
             title = h.get("title") or "(no title)"
-            comp = h.get("component_name") or "—"
-            exp = h.get("exploitability", 0)
+            comp = h.get("component_name")
+            if not comp and (refs := h.get("evidence_refs")):
+                comp = refs[0] if isinstance(refs[0], str) else "—"
+            comp = comp or "—"
+            exp = h.get("exploitability", 1)
             conf = h.get("confidence", 0)
-            print(f"  {i}. [{h.get('id', '—')}] {title}")
+            print(f"  {i}. [{_severity_label(exp)}] {title}")
             print(f"     Component: {comp}  (exploitability: {exp}, confidence: {conf})")
             print()
         print(f"  Full report:  {report_path}")
