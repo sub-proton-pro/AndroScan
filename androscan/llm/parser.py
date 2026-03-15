@@ -53,12 +53,14 @@ def parse_response(raw: str) -> LLMResponse:
         if not isinstance(h, dict):
             continue
         try:
+            # LLM often returns finding title in "name" when "title" is absent (use as fallback)
+            title_val = h.get("title") or h.get("name") or ""
             out.hypotheses.append(
                 Hypothesis(
                     id=str(h.get("id", "")),
                     component_type=str(h.get("component_type", "")),
                     component_name=str(h.get("component_name", "")),
-                    title=str(h.get("title", "")),
+                    title=str(title_val),
                     description=str(h.get("description", "")),
                     evidence_refs=list(h.get("evidence_refs") or []),
                     exploitability=int(h.get("exploitability", 1)),
