@@ -237,7 +237,7 @@ def _run() -> int:
             exp = h.get("exploitability", 1)
             conf = h.get("confidence", 0)
             print(f"  {i}. [{_severity_label(exp)}] {title}")
-            print(f"     Component: {comp}  (severity: {exp}, confidence: {conf})")
+            print(f"     Component: {comp}  (confidence: {conf})")
             print()
         print(f"  Full report:  {report_path}")
     else:
