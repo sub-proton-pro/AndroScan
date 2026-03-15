@@ -168,7 +168,7 @@ def _run() -> int:
     print(colored_json(dossier.to_dict()))
     print()
 
-    app_id = app_id_from_dossier(dossier)
+    app_id = app_id_from_dossier(dossier) or "unknown_app"
 
     if args.output:
         from androscan.internal.run_folder import run_timestamp
@@ -199,8 +199,8 @@ def _run() -> int:
             print(orange("[ERROR] " + str(payload)), file=sys.stderr)
             resume_active()
 
+    run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink)
     with spinner("Analysis starting...", done_message="Analysis complete.") as _spinner_ref:
-        run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink)
         try:
             run_workflow(apk_path, tasks, run_folder, config, run_logger=run_logger)
         except Exception as e:
@@ -217,8 +217,8 @@ def _run() -> int:
             pass
 
     package = dossier.apk_info.package
-
-    _section("Run summary", config.section_rule)
+    section_rule = config.section_rule or constants.SECTION_RULE
+    run_summary_lines = [section_rule, "[*] Run summary", section_rule]
     if report_data and report_data.get("hypotheses"):
         hypotheses = report_data["hypotheses"]
         n = len(hypotheses)
@@ -227,8 +227,8 @@ def _run() -> int:
             exp = h.get("exploitability", 1)
             by_exp[exp] = by_exp.get(exp, 0) + 1
         parts = [f"{by_exp[exp]} {_exploitability_label(exp)}" for exp in sorted(by_exp.keys(), reverse=True)]
-        print(f"  Findings:  {n} ({', '.join(parts)})")
-        print()
+        run_summary_lines.append(f"  Findings:  {n} ({', '.join(parts)})")
+        run_summary_lines.append("")
         for i, h in enumerate(hypotheses, 1):
             title = h.get("title") or "(no title)"
             comp = h.get("component_name")
@@ -241,13 +241,19 @@ def _run() -> int:
             comp = comp or "—"
             exp = h.get("exploitability", 1)
             conf = h.get("confidence", 0)
-            print(f"  {i}. [{_severity_label(exp)}] {title}")
-            print(f"     Component: {comp}  (confidence: {conf})")
-            print()
-        print(f"  Full report:  {report_path}")
+            desc = (h.get("description") or "").strip()
+            run_summary_lines.append(f"  {i}. [{_severity_label(exp)}] {title}")
+            run_summary_lines.append(f"     Component: {comp}  (confidence: {conf})")
+            if desc:
+                run_summary_lines.append(f"     Description: {desc}")
+            run_summary_lines.append("")
+        run_summary_lines.append(f"  Full report:  {report_path}")
     else:
-        print("  Findings:  0 hypotheses")
-        print(f"  Full report:  {report_path}")
+        run_summary_lines.append("  Findings:  0 hypotheses")
+        run_summary_lines.append(f"  Full report:  {report_path}")
+    run_summary_text = "\n".join(run_summary_lines)
+    print(run_summary_text)
+    run_logger.write_raw(run_summary_text)
 
     _section("Appendix", config.section_rule)
     _subsection("Run log")

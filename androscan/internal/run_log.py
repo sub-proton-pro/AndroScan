@@ -64,6 +64,16 @@ class RunLogger:
         self._append_log(f"[INFORMATIONAL] {message}")
         self._ui_sink("info", message)
 
+    def write_raw(self, content: str) -> None:
+        """Append content to run.log with no [tag] prefix—same as presentation layer."""
+        try:
+            self.run_folder.mkdir(parents=True, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                for line in content.splitlines():
+                    f.write(line + "\n")
+        except OSError:
+            pass
+
     def _append_log(self, content: str) -> None:
         try:
             self.run_folder.mkdir(parents=True, exist_ok=True)
