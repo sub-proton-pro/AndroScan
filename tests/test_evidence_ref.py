@@ -1,8 +1,8 @@
-"""Tests for evidence_ref validation."""
+"""Tests for evidence_ref validation and resolution."""
 
 import pytest
 
-from androscan.internal.evidence_ref import validate_ref
+from androscan.internal.evidence_ref import resolve_ref, validate_ref
 
 
 def test_validate_ref_valid_exported_activities():
@@ -31,3 +31,29 @@ def test_validate_ref_malformed():
     assert validate_ref(dossier, "no_bracket") is False
     assert validate_ref(dossier, "exported_activities[") is False
     assert validate_ref(dossier, "exported_activities[abc]") is False
+
+
+def test_validate_ref_strips_whitespace():
+    """Refs with leading/trailing whitespace are accepted after normalization."""
+    dossier = {"exported_activities": [{"name": "com.example.Main"}]}
+    assert validate_ref(dossier, "  exported_activities[0]  ") is True
+    assert validate_ref(dossier, "exported_activities[0]\n") is True
+
+
+def test_resolve_ref_returns_valid_path_unchanged():
+    """resolve_ref returns a valid dossier path as-is."""
+    dossier = {"exported_activities": [{"name": "com.example.Main"}]}
+    assert resolve_ref(dossier, "exported_activities[0]") == "exported_activities[0]"
+    assert resolve_ref(dossier, "  exported_activities[0]  ") == "exported_activities[0]"
+
+
+def test_resolve_ref_resolves_component_name_to_path():
+    """resolve_ref resolves short or full component name to dossier path."""
+    dossier = {
+        "exported_activities": [{"name": "com.example.weakbank.SecretActivity"}],
+        "exported_receivers": [{"name": "androidx.profileinstaller.ProfileInstallReceiver"}],
+    }
+    assert resolve_ref(dossier, "SecretActivity") == "exported_activities[0]"
+    assert resolve_ref(dossier, "ProfileInstallReceiver") == "exported_receivers[0]"
+    assert resolve_ref(dossier, "com.example.weakbank.SecretActivity") == "exported_activities[0]"
+    assert resolve_ref(dossier, "nonexistent") is None

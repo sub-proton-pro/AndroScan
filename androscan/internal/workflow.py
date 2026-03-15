@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 from androscan.config import Config, load_config
 from androscan.internal.app_meta import compute_apk_sha256, load_app_meta, save_app_meta
-from androscan.internal.evidence_ref import validate_ref
+from androscan.internal.evidence_ref import resolve_ref, validate_ref
 from androscan.internal.observations_store import append_observations, load_observations
 from androscan.internal.run_folder import write_run_meta
 from androscan.llm import build_prompt, build_system_content, complete, parse_response
@@ -126,13 +126,30 @@ def run_workflow(
             hypotheses = resp.hypotheses
             break
 
-    # Drop hypotheses with any invalid evidence_ref (Phase 3)
-    validated = [
-        h for h in hypotheses
-        if all(validate_ref(dossier_dict, ref) for ref in (h.evidence_refs or []))
-    ]
+    # Normalize and resolve evidence_refs; keep hypothesis if at least one ref validates (avoid dropping true positives)
+    validated = []
+    for h in hypotheses:
+        resolved_refs = []
+        for ref in h.evidence_refs or []:
+            resolved = resolve_ref(dossier_dict, ref)
+            if resolved and validate_ref(dossier_dict, resolved) and resolved not in resolved_refs:
+                resolved_refs.append(resolved)
+        if resolved_refs:
+            validated.append(
+                Hypothesis(
+                    id=h.id,
+                    component_type=h.component_type,
+                    component_name=h.component_name,
+                    title=h.title,
+                    description=h.description,
+                    evidence_refs=resolved_refs,
+                    exploitability=h.exploitability,
+                    confidence=h.confidence,
+                    remediation_hint=h.remediation_hint,
+                )
+            )
     if run_logger and len(validated) < len(hypotheses):
-        run_logger.warning(f"Dropped {len(hypotheses) - len(validated)} hypotheses with invalid evidence_refs")
+        run_logger.warning(f"Dropped {len(hypotheses) - len(validated)} hypotheses with no valid evidence_refs after resolution")
 
     summary = getattr(resp, "summary", None) or "" if resp else ""
     report_params = {
