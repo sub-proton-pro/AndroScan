@@ -215,6 +215,8 @@ Prefer tasks like:
 
 3. **Keep a short status overview.** For the active phase, keep a compact status table or checklist (e.g. "Sub-task status") at the top of the implementation plan so the next agent can see at a glance what is done and what is next.
 
+4. **External tool availability.** When adding or changing code that uses an external tool (apktool, jadx, etc.), the implementation must check tool availability (e.g. `shutil.which(cmd)`) and handle missing tools without crashing (return a clear result; do not raise raw subprocess/OS errors). See `docs/CONVENTIONS.md` §4 External tool availability.
+
 ---
 
 ## Default execution rule

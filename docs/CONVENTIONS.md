@@ -160,6 +160,10 @@ Avoid:
 
 If a task requires a new dependency direction, document and justify it.
 
+### External tool availability
+
+Any code that depends on an **external tool** (e.g. apktool, jadx) **must check that the tool is available** before use (e.g. `shutil.which(cmd)` or equivalent). If the tool is missing, the code must return a clear result (e.g. `SkillResult` with `success=False` or a clear message in `text`/`data`) and must **not** raise a raw subprocess or OS error. This applies to skills and any other callers that invoke such tools. The goal is safe behavior in CI and on agents where the tool may not be installed.
+
 ---
 
 ## 5. Modularity rules

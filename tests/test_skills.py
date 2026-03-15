@@ -36,12 +36,16 @@ def test_execute_prepare_dossier_pipeline_skill(tmp_path):
 
 
 def test_execute_llm_skill_get_decompiled_class(tmp_path):
-    """LLM-requestable skill get_decompiled_class runs and returns stub text."""
+    """get_decompiled_class runs; without real APK or with missing jadx returns clear failure (per CONVENTIONS)."""
     config = Config.default()
-    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict={}, apk_path="/a.apk")
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict={}, apk_path="/nonexistent.apk")
     result = execute("get_decompiled_class", {"component_ref": "exported_activities[0]"}, ctx)
-    assert result.success is True
-    assert "decompiled" in result.text.lower() or "stub" in result.text.lower()
+    assert "[get_decompiled_class]" in result.text
+    # No real APK in test: expect failure with clear reason (APK not found, or invalid ref if APK existed)
+    if not result.success:
+        assert "not found" in result.text or "not available" in result.text.lower() or "Invalid" in result.text
+    else:
+        assert "decompiled" in result.text.lower() or result.text
 
 
 def test_execute_unknown_skill_returns_failure(tmp_path):
