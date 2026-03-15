@@ -84,3 +84,52 @@ def test_run_skills_compat(tmp_path):
     assert name == "get_decompiled_class"
     assert isinstance(res, SkillResult)
     assert len(res.text) > 0
+
+
+def test_execute_get_decompiled_method_missing_params(tmp_path):
+    """get_decompiled_method requires class_name and method_name; returns clear failure when missing."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, apk_path="/a.apk")
+    r1 = execute("get_decompiled_method", {}, ctx)
+    assert r1.success is False
+    assert "[get_decompiled_method]" in r1.text
+    assert "class_name" in r1.text
+    r2 = execute("get_decompiled_method", {"class_name": "com.example.Foo"}, ctx)
+    assert r2.success is False
+    assert "method_name" in r2.text
+
+
+def test_execute_get_decompiled_method_no_apk_or_jadx(tmp_path):
+    """get_decompiled_method fails with clear message when APK missing or jadx not available."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, apk_path="/nonexistent.apk")
+    result = execute(
+        "get_decompiled_method",
+        {"class_name": "com.example.Main", "method_name": "onCreate"},
+        ctx,
+    )
+    assert "[get_decompiled_method]" in result.text
+    assert result.success is False
+    assert "not found" in result.text or "not available" in result.text.lower()
+
+
+def test_extract_method_bodies():
+    """_extract_method_bodies extracts method signature + body from Java-like source."""
+    from androscan.skills.get_decompiled_method import _extract_method_bodies
+
+    source = """
+public class Main {
+    public void onCreate(Bundle b) {
+        setContentView(R.layout.main);
+        return;
+    }
+    private void helper() { }
+}
+"""
+    body = _extract_method_bodies(source, "onCreate")
+    assert "onCreate" in body
+    assert "setContentView" in body
+    assert "return;" in body
+    body2 = _extract_method_bodies(source, "helper")
+    assert "helper" in body2
+    assert _extract_method_bodies(source, "nonexistent") == ""
