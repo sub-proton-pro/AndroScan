@@ -87,15 +87,15 @@ Execute in this order; each step is a logical sub-task that can be verified befo
 
 | # | Sub-task | Status |
 |---|----------|--------|
-| 1 | Real extraction (skills) | Done (gap: integration test with fixture APK) |
+| 1 | Real extraction (skills) | Done (fixture APK test parked) |
 | 2 | Real Ollama client | Done |
 | 3 | Real prompts and skills catalog | Done |
 | 4 | evidence_ref validation | Done |
 | 5 | Run artifacts | Done |
 
-1. **Real extraction (skills)** — [x] Done (fixture APK test optional)
+1. **Real extraction (skills)** — [x] Done (fixture APK test parked)
    - Implement **extract_manifest** and **prepare_dossier** skills with **apktool** (decode APK, parse decoded AndroidManifest.xml); build dossier from manifest (exported activities, services, receivers, providers, permissions, deep links). Extraction layer already delegates to these skills.
-   - Add integration test with a fixture APK: assert dossier shape and at least one exported component or permission.
+   - Integration test with fixture APK (assert dossier shape + exported component/permission): **parked**; optional for later (see Backlog).
 
 2. **Real Ollama client** — [x] Done
    - Implement HTTP client that calls Ollama API (config.ollama_base_url); keep existing `complete()` interface so workflow is unchanged.
@@ -149,7 +149,7 @@ Example:
 
 Use for real future work, not vague ideas.
 
-Examples:
+- **Integration test with fixture APK** (extraction + dossier shape) — parked; optional for later.
 - add second vulnerability module
 - add JSON output renderer
 - add richer evidence provenance tracking
