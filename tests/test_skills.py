@@ -7,6 +7,7 @@ import pytest
 from androscan.config import Config
 from androscan.skills import (
     SkillContext,
+    SkillResult,
     execute,
     list_llm_skills,
     run_skills,
@@ -71,7 +72,7 @@ def test_list_llm_skills_returns_only_llm_tier():
 
 
 def test_run_skills_compat(tmp_path):
-    """run_skills runs LLM-format requests and returns list of result strings."""
+    """run_skills runs LLM-format requests and returns list of (skill_name, SkillResult)."""
     config = Config.default()
     ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict={}, apk_path="/a.apk")
     requests = [
@@ -79,5 +80,7 @@ def test_run_skills_compat(tmp_path):
     ]
     results = run_skills(requests, {}, tmp_path, ctx)
     assert len(results) == 1
-    assert isinstance(results[0], str)
-    assert len(results[0]) > 0
+    name, res = results[0]
+    assert name == "get_decompiled_class"
+    assert isinstance(res, SkillResult)
+    assert len(res.text) > 0

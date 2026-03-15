@@ -194,6 +194,10 @@ def _run() -> int:
             pause_active()
             print(grey(str(payload)))
             resume_active()
+        elif kind == "error":
+            pause_active()
+            print(orange("[ERROR] " + str(payload)), file=sys.stderr)
+            resume_active()
 
     with spinner("Analysis starting...", done_message="Analysis complete.") as _spinner_ref:
         run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink)

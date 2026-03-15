@@ -52,6 +52,7 @@ def run_workflow(
     ctx.dossier_dict = dossier_dict
 
     prior_skill_results: list[str] = []
+    skill_result_memory_cache: dict[str, str] = {}
     hypotheses: list[Hypothesis] = []
     resp = None
     turn = 0
@@ -89,14 +90,19 @@ def run_workflow(
                     params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
                     skill_descs.append(f"{name}({params})")
                 run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
-            results = run_skills(resp.skill_requests, dossier_dict, run_folder, ctx)
+            results = run_skills(
+                resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
+            )
             if run_logger:
+                for name, res in results:
+                    if not res.success:
+                        run_logger.error(f"{name}: {res.text}")
                 executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in resp.skill_requests]
                 run_logger.info("Skills executed by tool: " + ", ".join(executed))
-                # Data sent to LLM after executing requested skills (next prompt)
-                next_prompt = build_prompt(dossier_dict, prior_skill_results + results, list_llm_skills())
+                result_texts = [r.text for _, r in results]
+                next_prompt = build_prompt(dossier_dict, prior_skill_results + result_texts, list_llm_skills())
                 run_logger.info("Data sent to LLM after executing requested skills:\n" + next_prompt)
-            prior_skill_results.extend(results)
+            prior_skill_results.extend(r.text for _, r in results)
             continue
 
         if resp.hypotheses:

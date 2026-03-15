@@ -1,8 +1,11 @@
 """Skills layer: registry, discover, execute, list_llm_skills. All skills implement SkillMeta + execute()."""
 
+import json
 import importlib
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Optional
 
+from androscan.internal.skill_results_cache import lookup as cache_lookup, store as cache_store
 from androscan.skills.base import SkillContext, SkillMeta, SkillResult
 
 # Registry: name -> (SkillMeta, execute_fn)
@@ -50,20 +53,65 @@ def list_llm_skills() -> list[SkillMeta]:
     return [meta for meta, _ in _REGISTRY.values() if meta.tier == "llm"]
 
 
-def run_skills(skill_requests: list[Any], dossier_dict: dict[str, Any], run_folder: Any, context: SkillContext) -> list[str]:
-    """Run requested skills (LLM format) and return list of result text strings. Backward compat for workflow."""
-    results = []
+def _skill_cache_key(skill: str, params: dict[str, Any]) -> str:
+    """Stable key for (skill, params). Must match skill_results_cache normalization."""
+    return skill + "\n" + json.dumps(params, sort_keys=True)
+
+
+def run_skills(
+    skill_requests: list[Any],
+    dossier_dict: dict[str, Any],
+    run_folder: Any,
+    context: SkillContext,
+    memory_cache: Optional[dict[str, str]] = None,
+) -> list[tuple[str, SkillResult]]:
+    """Run requested skills (LLM format). Uses in-memory and disk cache for successful results.
+
+    Returns list of (skill_name, SkillResult). Workflow should log failures and use result.text
+    for prior_skill_results. memory_cache is keyed by _skill_cache_key(skill, params) -> result_text;
+    pass the same dict across calls in one run to avoid reruns for same params.
+    """
+    run_folder_path = Path(context.run_folder)
+    run_folder_root = run_folder_path.parent.parent
+    app_id = run_folder_path.parent.name
+    run_folder_name = run_folder_path.name
+    mem = memory_cache if memory_cache is not None else {}
+
+    results: list[tuple[str, SkillResult]] = []
     for req in skill_requests:
         skill_name = getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else None)
         params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
+        skill_name = skill_name or ""
+        params = dict(params) if isinstance(params, dict) else {}
+
         ctx = SkillContext(
             config=context.config,
             run_folder=context.run_folder,
             dossier_dict=dossier_dict,
             apk_path=context.apk_path,
         )
-        result = execute(skill_name or "", params, ctx)
-        results.append(result.text)
+
+        cache_key = _skill_cache_key(skill_name, params)
+
+        # In-memory cache (same run)
+        if cache_key in mem:
+            text = "[cached from run " + run_folder_name + "] " + mem[cache_key]
+            results.append((skill_name, SkillResult(success=True, data=None, text=text)))
+            continue
+
+        # Disk cache
+        cached = cache_lookup(run_folder_root, app_id, skill_name, params)
+        if cached:
+            text = "[cached from run " + cached["run_folder"] + "] " + cached["result_text"]
+            results.append((skill_name, SkillResult(success=True, data=None, text=text)))
+            mem[cache_key] = cached["result_text"]
+            continue
+
+        result = execute(skill_name, params, ctx)
+        if result.success:
+            mem[cache_key] = result.text
+            cache_store(run_folder_root, app_id, run_folder_name, skill_name, params, result.text)
+        results.append((skill_name, result))
     return results
 
 
