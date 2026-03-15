@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from androscan.config import Config, load_config
+from androscan.internal.app_meta import compute_apk_sha256, load_app_meta, save_app_meta
 from androscan.internal.evidence_ref import validate_ref
 from androscan.internal.observations_store import append_observations, load_observations
 from androscan.internal.run_folder import write_run_meta
@@ -36,19 +37,35 @@ def run_workflow(
 
     started_at = datetime.now()
     ctx = SkillContext(config=config, run_folder=run_folder, apk_path=apk_path)
+    app_id_root = run_folder.parent
 
-    if run_logger:
-        run_logger.task_update("Extracting manifest...")
-    manifest_result = execute("extract_manifest", {}, ctx)
-    if not manifest_result.success:
-        raise RuntimeError(f"extract_manifest failed: {manifest_result.text}")
-    if run_logger:
-        run_logger.task_update("Building dossier...")
-    dossier_result = execute("prepare_dossier", {"manifest": manifest_result.data}, ctx)
-    if not dossier_result.success:
-        raise RuntimeError(f"prepare_dossier failed: {dossier_result.text}")
+    dossier_dict = None
+    try:
+        if Path(apk_path).exists():
+            current_hash = compute_apk_sha256(apk_path)
+            meta = load_app_meta(app_id_root)
+            if meta and meta.get("apk_sha256") == current_hash and meta.get("dossier"):
+                dossier_dict = meta["dossier"]
+                if run_logger:
+                    run_logger.task_update("Using cached dossier...")
+    except (OSError, TypeError):
+        pass
 
-    dossier_dict = dossier_result.data
+    if dossier_dict is None:
+        if run_logger:
+            run_logger.task_update("Extracting manifest...")
+        manifest_result = execute("extract_manifest", {}, ctx)
+        if not manifest_result.success:
+            raise RuntimeError(f"extract_manifest failed: {manifest_result.text}")
+        if run_logger:
+            run_logger.task_update("Building dossier...")
+        dossier_result = execute("prepare_dossier", {"manifest": manifest_result.data}, ctx)
+        if not dossier_result.success:
+            raise RuntimeError(f"prepare_dossier failed: {dossier_result.text}")
+        dossier_dict = dossier_result.data
+        if manifest_result.data.get("apk_sha256"):
+            save_app_meta(app_id_root, manifest_result.data["apk_sha256"], dossier_dict, apk_path)
+
     ctx.dossier_dict = dossier_dict
 
     prior_skill_results: list[str] = []
