@@ -18,7 +18,8 @@ This file should be kept current.
    - expected tests
    - documentation impact
 4. After completion:
-   - move the task to Completed
+   - **update sub-task status in this file immediately** (mark the sub-task done, e.g. `[x]` or move to completed list) so other IDEs and agents know where to take over
+   - move the task to Completed when the whole phase/task is done
    - update follow-ups if needed
    - update `docs/STATE.md` if current reality changed
 
@@ -82,22 +83,32 @@ Phase 2 skeleton is complete. This task delivers the first end-to-end security a
 
 Execute in this order; each step is a logical sub-task that can be verified before moving on.
 
-1. **Real extraction (skills)**
+**Sub-task status (update as soon as each is completed):**
+
+| # | Sub-task | Status |
+|---|----------|--------|
+| 1 | Real extraction (skills) | Done (gap: integration test with fixture APK) |
+| 2 | Real Ollama client | Done |
+| 3 | Real prompts and skills catalog | Done |
+| 4 | evidence_ref validation | Not started |
+| 5 | Run artifacts | Partial (report.json, run.log; optional observations.json, scan_meta.json not added) |
+
+1. **Real extraction (skills)** — [x] Done (fixture APK test optional)
    - Implement **extract_manifest** and **prepare_dossier** skills with **apktool** (decode APK, parse decoded AndroidManifest.xml); build dossier from manifest (exported activities, services, receivers, providers, permissions, deep links). Extraction layer already delegates to these skills.
    - Add integration test with a fixture APK: assert dossier shape and at least one exported component or permission.
 
-2. **Real Ollama client**
+2. **Real Ollama client** — [x] Done
    - Implement HTTP client that calls Ollama API (config.ollama_base_url); keep existing `complete()` interface so workflow is unchanged.
    - Tests continue to use a mock (patch or inject) so CI does not require live Ollama.
 
-3. **Real prompts and skills catalog**
+3. **Real prompts and skills catalog** — [x] Done
    - Implement prompt templates per DESIGN_DOC: global context (role, task), skills catalog from `list_llm_skills()` (already wired in build_prompt), and per-turn user prompt with dossier and optional prior skill results.
    - Optionally implement at least one real LLM skill (e.g. `get_decompiled_class` via jadx) or keep stub for MVP; ensure multi-turn loop can request and consume skill results.
 
-4. **evidence_ref validation**
+4. **evidence_ref validation** — [ ] Not started
    - In workflow or report path: for each hypothesis, validate every `evidence_ref` against the dossier (e.g. resolve path like `exported_activities[0]` to actual dossier content). Drop or flag hypotheses with invalid refs.
 
-5. **Run artifacts**
+5. **Run artifacts** — [ ] Partial
    - Ensure `report.json` is written with validated hypotheses; add optionally `observations.json`, `scan_meta.json`, `scan.log` under run folder as needed for the slice. Document schema if new.
 
 **Completion check:** One real APK → real dossier → (multi-turn) LLM → report with hypotheses and valid evidence_refs; all tests pass (mock LLM in CI).
@@ -189,6 +200,20 @@ Prefer tasks like:
 - “add normalized finding model for first feature module”
 - “implement adapter wrapper for tool X behind interface Y”
 - “add negative tests for malformed artifact input in module Z”
+
+---
+
+## Phase and task list rules
+
+**So other IDEs and agents know where to take over:**
+
+1. **List sub-tasks explicitly.** For every phase or multi-step task, the implementation plan in this file MUST list sub-tasks explicitly (numbered or bulleted), not only in prose. Each sub-task should be verifiable on its own.
+
+2. **Update status as soon as a sub-task is completed.** When a sub-task is finished (code done, tests pass, behaviour verified), update this file in the same work session:
+   - Mark the sub-task done (e.g. add `[x] Done` or `— [x] Done` next to the heading, or update a status table).
+   - Do not leave a phase "in progress" without reflecting which sub-tasks are already done.
+
+3. **Keep a short status overview.** For the active phase, keep a compact status table or checklist (e.g. "Sub-task status") at the top of the implementation plan so the next agent can see at a glance what is done and what is next.
 
 ---
 
