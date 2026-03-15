@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from androscan.config import Config, load_config
+from androscan.internal.evidence_ref import validate_ref
 from androscan.llm import build_prompt, build_system_content, complete, parse_response
 from androscan.llm.parser import Hypothesis
 from androscan.skills import SkillContext, execute, list_llm_skills, run_skills
@@ -85,6 +86,12 @@ def run_workflow(
             hypotheses = resp.hypotheses
             break
 
+    # Drop hypotheses with any invalid evidence_ref (Phase 3)
+    validated = [
+        h for h in hypotheses
+        if all(validate_ref(dossier_dict, ref) for ref in (h.evidence_refs or []))
+    ]
+
     summary = getattr(resp, "summary", None) or "" if resp else ""
     report_params = {
         "hypotheses": [
@@ -99,7 +106,7 @@ def run_workflow(
                 "confidence": h.confidence,
                 "remediation_hint": h.remediation_hint,
             }
-            for h in hypotheses
+            for h in validated
         ],
         "summary": summary,
     }

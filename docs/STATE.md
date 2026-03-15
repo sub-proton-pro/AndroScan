@@ -39,7 +39,6 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 ### Not yet implemented
 - Real APK/manifest parsing.
 - Real prompt templates and skills catalog in prompts.
-- evidence_ref validation against dossier.
 - observations.json, enriched_scan_config.json, scan.log, scan_meta.json in run folder.
 - Phase 3 (first vertical slice) and Phase 4 (hardening, CI).
 
@@ -54,7 +53,8 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 - Extraction stub returns dossier with expected shape; `app_id_from_dossier` yields `com_example_app` for stub.
 - LLM parser parses valid JSON with skill_requests and hypotheses; invalid JSON returns empty response without crash.
 - Workflow integration test with mock LLM (skill_requests then hypotheses) runs two turns and writes report.
-- Run summary shows severity in brackets (e.g. `[High]`), "Findings: n (1 high, 1 low)" wording, and "(severity: …, confidence: …)" per finding; component name is resolved from dossier when `component_name` is missing (evidence_ref → e.g. `exported_activities[0]` → activity name), else first evidence_ref or "—".
+- Run summary shows severity in brackets (e.g. `[High]`), "Findings: n (1 high, 1 low)" wording, and "(confidence: …)" per finding; component name is resolved from dossier when `component_name` is missing (evidence_ref → e.g. `exported_activities[0]` → activity name), else first evidence_ref or "—".
+- evidence_ref validation: hypotheses with any invalid evidence_ref are dropped before writing the report (`androscan.internal.evidence_ref.validate_ref`).
 
 ---
 
@@ -62,7 +62,6 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 
 - No real APK has been analyzed; extraction is stub only.
 - No live Ollama call; LLM is stub only.
-- evidence_refs are not validated against dossier paths.
 - Run folder does not yet contain scan.log, scan_meta.json, observations.json.
 - CLI does not validate APK path beyond existence (stub allows /dummy.apk).
 

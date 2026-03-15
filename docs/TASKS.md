@@ -90,7 +90,7 @@ Execute in this order; each step is a logical sub-task that can be verified befo
 | 1 | Real extraction (skills) | Done (gap: integration test with fixture APK) |
 | 2 | Real Ollama client | Done |
 | 3 | Real prompts and skills catalog | Done |
-| 4 | evidence_ref validation | Not started |
+| 4 | evidence_ref validation | Done |
 | 5 | Run artifacts | Partial (report.json, run.log; optional observations.json, scan_meta.json not added) |
 
 1. **Real extraction (skills)** — [x] Done (fixture APK test optional)
@@ -105,7 +105,7 @@ Execute in this order; each step is a logical sub-task that can be verified befo
    - Implement prompt templates per DESIGN_DOC: global context (role, task), skills catalog from `list_llm_skills()` (already wired in build_prompt), and per-turn user prompt with dossier and optional prior skill results.
    - Optionally implement at least one real LLM skill (e.g. `get_decompiled_class` via jadx) or keep stub for MVP; ensure multi-turn loop can request and consume skill results.
 
-4. **evidence_ref validation** — [ ] Not started
+4. **evidence_ref validation** — [x] Done
    - In workflow or report path: for each hypothesis, validate every `evidence_ref` against the dossier (e.g. resolve path like `exported_activities[0]` to actual dossier content). Drop or flag hypotheses with invalid refs.
 
 5. **Run artifacts** — [ ] Partial

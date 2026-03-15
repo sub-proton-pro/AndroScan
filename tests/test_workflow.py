@@ -50,3 +50,17 @@ def test_workflow_multi_turn_with_mock_skill_request(tmp_path):
     data = json.loads(report_file.read_text())
     assert len(data["hypotheses"]) == 1
     assert data["hypotheses"][0]["id"] == "H2"
+
+
+def test_workflow_drops_hypothesis_with_invalid_evidence_ref(tmp_path):
+    """Hypotheses with invalid evidence_ref are dropped; only valid refs appear in report."""
+    stub_json = '{"summary": "Ok.", "hypotheses": ['
+    stub_json += '{"id": "H1", "component_type": "activity", "component_name": "com.example.Main", "title": "Valid", "description": "D", "evidence_refs": ["exported_activities[0]"], "exploitability": 3, "confidence": 2, "remediation_hint": ""},'
+    stub_json += '{"id": "H2", "component_type": "activity", "component_name": "com.example.Ghost", "title": "Invalid ref", "description": "D", "evidence_refs": ["exported_activities[99]"], "exploitability": 4, "confidence": 1, "remediation_hint": ""}'
+    stub_json += ']}'
+    stub_result = CompleteResult(content=stub_json, thinking="", metadata={})
+    with patch("androscan.internal.workflow.complete", return_value=stub_result):
+        run_workflow("/dummy.apk", ["exported_components"], tmp_path)
+    data = json.loads((tmp_path / "report.json").read_text())
+    assert len(data["hypotheses"]) == 1
+    assert data["hypotheses"][0]["id"] == "H1"
