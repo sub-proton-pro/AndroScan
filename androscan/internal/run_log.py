@@ -60,8 +60,8 @@ class RunLogger:
         self._ui_sink("warning", message)
 
     def info(self, message: str) -> None:
-        """Log informational message. Written to run.log with [INFO] prefix."""
-        self._append_log(f"[INFO] {message}")
+        """Log informational message. Written to run.log with [INFORMATIONAL] prefix."""
+        self._append_log(f"[INFORMATIONAL] {message}")
         self._ui_sink("info", message)
 
     def _append_log(self, content: str) -> None:

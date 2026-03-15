@@ -82,7 +82,20 @@ def run_workflow(
         if resp.skill_requests:
             if run_logger:
                 run_logger.task_update("Running requested skills...")
+                # [INFORMATIONAL] skills requested by the LLM
+                skill_descs = []
+                for req in resp.skill_requests:
+                    name = getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?")
+                    params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
+                    skill_descs.append(f"{name}({params})")
+                run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
             results = run_skills(resp.skill_requests, dossier_dict, run_folder, ctx)
+            if run_logger:
+                executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in resp.skill_requests]
+                run_logger.info("Skills executed by tool: " + ", ".join(executed))
+                # Data sent to LLM after executing requested skills (next prompt)
+                next_prompt = build_prompt(dossier_dict, prior_skill_results + results, list_llm_skills())
+                run_logger.info("Data sent to LLM after executing requested skills:\n" + next_prompt)
             prior_skill_results.extend(results)
             continue
 

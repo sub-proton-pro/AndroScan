@@ -54,7 +54,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 - Workflow integration test with mock LLM (skill_requests then hypotheses) runs two turns and writes report.
 - Run summary shows severity in brackets (e.g. `[High]`), "Findings: n (1 high, 1 low)" wording, and "(confidence: …)" per finding; component name is resolved from dossier when `component_name` is missing (evidence_ref → e.g. `exported_activities[0]` → activity name), else first evidence_ref or "—".
 - evidence_ref validation: hypotheses with any invalid evidence_ref are dropped before writing the report (`androscan.internal.evidence_ref.validate_ref`).
-- Run artifacts: `run_meta.json` (apk_path, app_id, run_timestamp, started_at, finished_at, hypotheses_count); `run.log` with [task], [ERROR], [WARNING], [INFO], [retry], [thinking]; persistent `observations.json` at `apps/<app_id>/observations.json` for LLM/tool use across runs.
+- Run artifacts: `run_meta.json` (apk_path, app_id, run_timestamp, started_at, finished_at, hypotheses_count); `run.log` with [task], [ERROR], [WARNING], [INFORMATIONAL], [retry], [thinking] (INFORMATIONAL: skills requested by LLM, skills executed, data sent to LLM after skills); persistent `observations.json` at `apps/<app_id>/observations.json` for LLM/tool use across runs.
 
 ---
 

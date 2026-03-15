@@ -109,7 +109,7 @@ Execute in this order; each step is a logical sub-task that can be verified befo
    - In workflow or report path: for each hypothesis, validate every `evidence_ref` against the dossier (e.g. resolve path like `exported_activities[0]` to actual dossier content). Drop or flag hypotheses with invalid refs.
 
 5. **Run artifacts** — [x] Done
-   - `report.json` with validated hypotheses; `run_meta.json` (run metadata) and `run.log` (task/LLM + [ERROR]/[WARNING]/[INFO]) per run; `observations.json` at app_id level (persistent store for LLM/tool across runs). No separate scan.log (same as run.log).
+   - `report.json` with validated hypotheses; `run_meta.json` (run metadata) and `run.log` (task/LLM + [ERROR]/[WARNING]/[INFORMATIONAL]; INFORMATIONAL = skills requested by LLM, skills executed, data sent to LLM after skills) per run; `observations.json` at app_id level (persistent store for LLM/tool across runs). No separate scan.log (same as run.log).
 
 **Completion check:** One real APK → real dossier → (multi-turn) LLM → report with hypotheses and valid evidence_refs; all tests pass (mock LLM in CI).
 

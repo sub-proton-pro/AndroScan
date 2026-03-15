@@ -125,7 +125,7 @@ AndroScan/
       <run_timestamp>/           # Human-readable, e.g. 13-mar-26_01-30-52
         report.json             # Validated hypotheses + summary
         run_meta.json            # Run metadata: apk_path, app_id, run_timestamp, started_at, finished_at, hypotheses_count
-        run.log                  # [task], [ERROR], [WARNING], [INFO], [retry], [thinking]
+        run.log                  # [task], [ERROR], [WARNING], [INFORMATIONAL], [retry], [thinking]; INFORMATIONAL = skills requested, skills executed, data sent to LLM after skills
       observations.json         # At app_id level: persistent store for LLM/tool observations across runs (schema: { "observations": [ { "run_ts?", "source", "text" } ] })
   docs/
   tests/
