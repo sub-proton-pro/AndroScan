@@ -33,14 +33,13 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 
 ### Partially implemented
 - LLM layer: client is stub only; Phase 3 will add real Ollama HTTP calls.
-- Report: only `report.json` written; no observations.json, scan.log, scan_meta.json yet (Phase 3).
+- Report: `report.json`, `run_meta.json`, `run.log` per run; `observations.json` at app_id (Phase 3 done).
 - Modules: `exported_components` is an empty package; workflow does not dispatch by task name yet.
 
 ### Not yet implemented
 - Real APK/manifest parsing.
 - Real prompt templates and skills catalog in prompts.
-- observations.json, enriched_scan_config.json, scan.log, scan_meta.json in run folder.
-- Phase 3 (first vertical slice) and Phase 4 (hardening, CI).
+- Phase 4 (hardening, CI).
 
 ---
 
@@ -55,6 +54,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 - Workflow integration test with mock LLM (skill_requests then hypotheses) runs two turns and writes report.
 - Run summary shows severity in brackets (e.g. `[High]`), "Findings: n (1 high, 1 low)" wording, and "(confidence: …)" per finding; component name is resolved from dossier when `component_name` is missing (evidence_ref → e.g. `exported_activities[0]` → activity name), else first evidence_ref or "—".
 - evidence_ref validation: hypotheses with any invalid evidence_ref are dropped before writing the report (`androscan.internal.evidence_ref.validate_ref`).
+- Run artifacts: `run_meta.json` (apk_path, app_id, run_timestamp, started_at, finished_at, hypotheses_count); `run.log` with [task], [ERROR], [WARNING], [INFO], [retry], [thinking]; persistent `observations.json` at `apps/<app_id>/observations.json` for LLM/tool use across runs.
 
 ---
 
@@ -62,7 +62,6 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 
 - No real APK has been analyzed; extraction is stub only.
 - No live Ollama call; LLM is stub only.
-- Run folder does not yet contain scan.log, scan_meta.json, observations.json.
 - CLI does not validate APK path beyond existence (stub allows /dummy.apk).
 
 ---
@@ -80,7 +79,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 
 - Stub LLM always returns hypotheses (no real model). Phase 3 will wire real Ollama.
 - Stub extraction ignores APK content. Phase 3 will implement extract_manifest and prepare_dossier skills with apktool.
-- Run folder artifacts: only report.json; other files (scan.log, etc.) to be added in Phase 3.
+- Run folder artifacts: report.json, run_meta.json, run.log per run; observations.json at app_id level.
 
 ---
 
@@ -88,7 +87,7 @@ Current status: **Phase 2 (skeleton) complete.** Platform skeleton is in place w
 
 - Do not assume extraction reads the APK; it is a stub.
 - Do not assume LLM calls Ollama; it returns fixed JSON.
-- Do not assume all run-folder artifacts exist; only report.json is written.
+- Do not assume all run-folder artifacts exist; report.json, run_meta.json, run.log are written per run when workflow completes.
 
 ---
 

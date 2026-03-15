@@ -8,6 +8,7 @@ import pytest
 
 from androscan.extraction import extract_dossier
 from androscan.llm.client import CompleteResult
+from androscan.internal.run_log import RunLogger
 from androscan.internal.workflow import run_workflow
 
 
@@ -53,14 +54,33 @@ def test_workflow_multi_turn_with_mock_skill_request(tmp_path):
 
 
 def test_workflow_drops_hypothesis_with_invalid_evidence_ref(tmp_path):
-    """Hypotheses with invalid evidence_ref are dropped; only valid refs appear in report."""
+    """Hypotheses with invalid evidence_ref are dropped; only valid refs appear in report; [WARNING] in run.log."""
     stub_json = '{"summary": "Ok.", "hypotheses": ['
     stub_json += '{"id": "H1", "component_type": "activity", "component_name": "com.example.Main", "title": "Valid", "description": "D", "evidence_refs": ["exported_activities[0]"], "exploitability": 3, "confidence": 2, "remediation_hint": ""},'
     stub_json += '{"id": "H2", "component_type": "activity", "component_name": "com.example.Ghost", "title": "Invalid ref", "description": "D", "evidence_refs": ["exported_activities[99]"], "exploitability": 4, "confidence": 1, "remediation_hint": ""}'
     stub_json += ']}'
     stub_result = CompleteResult(content=stub_json, thinking="", metadata={})
+    run_logger = RunLogger(tmp_path)
     with patch("androscan.internal.workflow.complete", return_value=stub_result):
-        run_workflow("/dummy.apk", ["exported_components"], tmp_path)
+        run_workflow("/dummy.apk", ["exported_components"], tmp_path, run_logger=run_logger)
     data = json.loads((tmp_path / "report.json").read_text())
     assert len(data["hypotheses"]) == 1
     assert data["hypotheses"][0]["id"] == "H1"
+    assert "[WARNING]" in (tmp_path / "run.log").read_text()
+
+
+def test_workflow_writes_run_meta_and_run_log(tmp_path):
+    """Workflow writes report.json, run_meta.json, and run.log when run_logger is provided."""
+    stub_json = '{"summary": "Ok.", "hypotheses": [{"id": "H1", "component_type": "activity", "component_name": "com.example.Main", "title": "T", "description": "D", "evidence_refs": ["exported_activities[0]"], "exploitability": 3, "confidence": 2, "remediation_hint": ""}]}'
+    run_logger = RunLogger(tmp_path)
+    with patch("androscan.internal.workflow.complete", return_value=CompleteResult(content=stub_json, thinking="", metadata={})):
+        run_workflow("/dummy.apk", ["exported_components"], tmp_path, run_logger=run_logger)
+    assert (tmp_path / "report.json").exists()
+    assert (tmp_path / "run_meta.json").exists()
+    assert (tmp_path / "run.log").exists()
+    meta = json.loads((tmp_path / "run_meta.json").read_text())
+    assert meta.get("apk_path") == "/dummy.apk"
+    assert "run_timestamp" in meta
+    assert meta.get("hypotheses_count") == 1
+    log_content = (tmp_path / "run.log").read_text()
+    assert "[task]" in log_content

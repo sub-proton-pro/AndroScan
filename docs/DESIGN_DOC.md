@@ -123,11 +123,10 @@ AndroScan/
   apps/                         # Runtime output only; not in version control
     <app_id>/                   # app_id = sanitized package name; truncate if too long
       <run_timestamp>/           # Human-readable, e.g. 13-mar-26_01-30-52
-        observations.json
-        enriched_scan_config.json
-        scan.log
-        scan_meta.json
-        report.json             # (and/or report.txt)
+        report.json             # Validated hypotheses + summary
+        run_meta.json            # Run metadata: apk_path, app_id, run_timestamp, started_at, finished_at, hypotheses_count
+        run.log                  # [task], [ERROR], [WARNING], [INFO], [retry], [thinking]
+      observations.json         # At app_id level: persistent store for LLM/tool observations across runs (schema: { "observations": [ { "run_ts?", "source", "text" } ] })
   docs/
   tests/
   global_config.yaml           # Optional runtime config (YAML); overridden by env. Use --config to pass path.
@@ -136,7 +135,7 @@ AndroScan/
 - **Configuration:** App constants in `androscan/constants.py`. Runtime settings from `global_config.yaml` (optional; merge: defaults → YAML → env). CLI `--config <file>` to pass config path. See `docs/DECISIONS.md` DEC-012.
 - **app_id:** Default = sanitized package name (e.g. `com_example_myapp`). Replace `.` with `_`; truncate if too long (e.g. max 80–128 chars).
 - **Run folder name:** Human-readable timestamp, e.g. `DD-mon-YY_HH-MM-SS` (e.g. `13-mar-26_01-30-52`).
-- **Report and run artifacts:** All written under `apps/<app_id>/<run_timestamp>/`; no global report directory.
+- **Report and run artifacts:** Per-run artifacts under `apps/<app_id>/<run_timestamp>/` (report.json, run_meta.json, run.log). Persistent observations at `apps/<app_id>/observations.json`.
 
 ---
 

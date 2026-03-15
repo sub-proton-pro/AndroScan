@@ -200,6 +200,7 @@ def _run() -> int:
         try:
             run_workflow(apk_path, tasks, run_folder, config, run_logger=run_logger)
         except Exception as e:
+            run_logger.error(f"Workflow failed: {e}")
             print(f"Error: workflow failed: {e}", file=sys.stderr)
             return 1
 

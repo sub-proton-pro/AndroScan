@@ -1,10 +1,13 @@
 """Orchestration: pipeline skills -> dossier -> LLM (multi-turn) -> report skill."""
 
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from androscan.config import Config, load_config
 from androscan.internal.evidence_ref import validate_ref
+from androscan.internal.observations_store import append_observations, load_observations
+from androscan.internal.run_folder import write_run_meta
 from androscan.llm import build_prompt, build_system_content, complete, parse_response
 from androscan.llm.parser import Hypothesis
 from androscan.skills import SkillContext, execute, list_llm_skills, run_skills
@@ -31,6 +34,7 @@ def run_workflow(
     if config is None:
         config = load_config()
 
+    started_at = datetime.now()
     ctx = SkillContext(config=config, run_folder=run_folder, apk_path=apk_path)
 
     if run_logger:
@@ -91,6 +95,8 @@ def run_workflow(
         h for h in hypotheses
         if all(validate_ref(dossier_dict, ref) for ref in (h.evidence_refs or []))
     ]
+    if run_logger and len(validated) < len(hypotheses):
+        run_logger.warning(f"Dropped {len(hypotheses) - len(validated)} hypotheses with invalid evidence_refs")
 
     summary = getattr(resp, "summary", None) or "" if resp else ""
     report_params = {
@@ -111,3 +117,11 @@ def run_workflow(
         "summary": summary,
     }
     execute("generate_report", report_params, ctx)
+    finished_at = datetime.now()
+    write_run_meta(run_folder, apk_path, started_at, finished_at, hypotheses_count=len(validated))
+    # Persistent observations store (app_id level) for future runs
+    run_folder_root = run_folder.parent.parent
+    app_id = run_folder.parent.name
+    run_ts = run_folder.name
+    observation_text = (summary or "").strip() or f"Run completed with {len(validated)} hypotheses."
+    append_observations(run_folder_root, app_id, [{"run_ts": run_ts, "source": "run", "text": observation_text}])

@@ -1,10 +1,13 @@
-"""Run folder creation: apps/<app_id>/<run_ts>/ with human-readable timestamp."""
+"""Run folder creation: apps/<app_id>/<run_ts>/ with human-readable timestamp. Run metadata (run_meta.json)."""
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
 from androscan.config import Config
+
+RUN_META_FILENAME = "run_meta.json"
 
 
 def run_timestamp() -> str:
@@ -35,3 +38,25 @@ def create_run_folder(app_id: str, config: Optional[Config] = None) -> Path:
     folder = root / app_id / run_timestamp()
     folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def write_run_meta(
+    run_folder: Path,
+    apk_path: str,
+    started_at: datetime,
+    finished_at: datetime,
+    hypotheses_count: int = 0,
+) -> None:
+    """Write run_meta.json under run_folder. Schema: apk_path, app_id, run_timestamp, started_at, finished_at, hypotheses_count."""
+    app_id = run_folder.parent.name
+    run_timestamp_val = run_folder.name
+    meta = {
+        "apk_path": apk_path,
+        "app_id": app_id,
+        "run_timestamp": run_timestamp_val,
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "hypotheses_count": hypotheses_count,
+    }
+    path = run_folder / RUN_META_FILENAME
+    path.write_text(json.dumps(meta, indent=2), encoding="utf-8")

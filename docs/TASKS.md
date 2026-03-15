@@ -91,7 +91,7 @@ Execute in this order; each step is a logical sub-task that can be verified befo
 | 2 | Real Ollama client | Done |
 | 3 | Real prompts and skills catalog | Done |
 | 4 | evidence_ref validation | Done |
-| 5 | Run artifacts | Partial (report.json, run.log; optional observations.json, scan_meta.json not added) |
+| 5 | Run artifacts | Done |
 
 1. **Real extraction (skills)** — [x] Done (fixture APK test optional)
    - Implement **extract_manifest** and **prepare_dossier** skills with **apktool** (decode APK, parse decoded AndroidManifest.xml); build dossier from manifest (exported activities, services, receivers, providers, permissions, deep links). Extraction layer already delegates to these skills.
@@ -108,8 +108,8 @@ Execute in this order; each step is a logical sub-task that can be verified befo
 4. **evidence_ref validation** — [x] Done
    - In workflow or report path: for each hypothesis, validate every `evidence_ref` against the dossier (e.g. resolve path like `exported_activities[0]` to actual dossier content). Drop or flag hypotheses with invalid refs.
 
-5. **Run artifacts** — [ ] Partial
-   - Ensure `report.json` is written with validated hypotheses; add optionally `observations.json`, `scan_meta.json`, `scan.log` under run folder as needed for the slice. Document schema if new.
+5. **Run artifacts** — [x] Done
+   - `report.json` with validated hypotheses; `run_meta.json` (run metadata) and `run.log` (task/LLM + [ERROR]/[WARNING]/[INFO]) per run; `observations.json` at app_id level (persistent store for LLM/tool across runs). No separate scan.log (same as run.log).
 
 **Completion check:** One real APK → real dossier → (multi-turn) LLM → report with hypotheses and valid evidence_refs; all tests pass (mock LLM in CI).
 

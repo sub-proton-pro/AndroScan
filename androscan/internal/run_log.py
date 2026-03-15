@@ -49,6 +49,21 @@ class RunLogger:
         self._append_log(f"[retry] {reason}: {detail}")
         self._ui_sink("retry", {"reason": reason, "detail": detail})
 
+    def error(self, message: str) -> None:
+        """Log an error. Written to run.log with [ERROR] prefix."""
+        self._append_log(f"[ERROR] {message}")
+        self._ui_sink("error", message)
+
+    def warning(self, message: str) -> None:
+        """Log a warning. Written to run.log with [WARNING] prefix."""
+        self._append_log(f"[WARNING] {message}")
+        self._ui_sink("warning", message)
+
+    def info(self, message: str) -> None:
+        """Log informational message. Written to run.log with [INFO] prefix."""
+        self._append_log(f"[INFO] {message}")
+        self._ui_sink("info", message)
+
     def _append_log(self, content: str) -> None:
         try:
             self.run_folder.mkdir(parents=True, exist_ok=True)
