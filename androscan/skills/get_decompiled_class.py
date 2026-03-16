@@ -10,8 +10,8 @@ from androscan.skills.base import SkillContext, SkillMeta, SkillResult
 
 SKILL_META = SkillMeta(
     name="get_decompiled_class",
-    description="Decompiled Java/Kotlin source for the class named in the dossier component.",
-    params_schema={"component_ref": "dossier path e.g. exported_activities[0]"},
+    description="Decompiled Java/Kotlin source for a class. Accepts dossier path (e.g. exported_activities[0]) or full class name (e.g. com.example.WeakBankLab).",
+    params_schema={"component_ref": "dossier path e.g. exported_activities[0], or full class name e.g. com.example.MyClass"},
     tier="llm",
 )
 
@@ -42,9 +42,14 @@ def _class_name_from_ref(dossier_dict: dict[str, Any], ref: str) -> Optional[str
     return None
 
 
+def _is_dossier_path(ref: str) -> bool:
+    """True if ref looks like a dossier path (e.g. exported_activities[0])."""
+    return bool(ref and "[" in ref and ref.endswith("]"))
+
+
 def execute(params: dict, context: SkillContext) -> SkillResult:
-    """Decompile the class for the given component_ref via jadx. Checks jadx availability first."""
-    component_ref = params.get("component_ref") or ""
+    """Decompile the class for the given component_ref via jadx. component_ref may be a dossier path or full class name."""
+    component_ref = (params.get("component_ref") or "").strip()
     dossier_dict = context.dossier_dict or {}
     apk_path = (context.apk_path or "").strip()
     if not apk_path:
@@ -61,7 +66,10 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
             text="[get_decompiled_class] jadx not available. Install jadx and ensure it is on PATH.",
         )
 
-    class_name = _class_name_from_ref(dossier_dict, component_ref)
+    if _is_dossier_path(component_ref):
+        class_name = _class_name_from_ref(dossier_dict, component_ref)
+    else:
+        class_name = component_ref if component_ref else None
     if not class_name:
         return SkillResult(
             success=False,

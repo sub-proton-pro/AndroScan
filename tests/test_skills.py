@@ -49,6 +49,18 @@ def test_execute_llm_skill_get_decompiled_class(tmp_path):
         assert "decompiled" in result.text.lower() or result.text
 
 
+def test_execute_get_decompiled_class_accepts_class_name(tmp_path):
+    """get_decompiled_class accepts full class name when component_ref is not a dossier path."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict={}, apk_path="/nonexistent.apk")
+    result = execute("get_decompiled_class", {"component_ref": "com.example.weakbank.WeakBankLab"}, ctx)
+    assert "[get_decompiled_class]" in result.text
+    # Should not be "Invalid or unresolved" (we accepted the class name); failure is APK not found or jadx
+    assert "Invalid or unresolved" not in result.text
+    assert not result.success
+    assert "not found" in result.text or "not available" in result.text.lower()
+
+
 def test_execute_unknown_skill_returns_failure(tmp_path):
     """Unknown skill name returns failure SkillResult."""
     config = Config.default()
