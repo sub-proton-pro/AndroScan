@@ -26,6 +26,7 @@ class Config:
     run_folder_root: str
     max_turns: int
     max_hypotheses_per_report: int
+    per_component_analysis: bool
     apktool_cmd: str
     jadx_cmd: str
     section_rule_char: str
@@ -42,6 +43,7 @@ class Config:
             run_folder_root="apps",
             max_turns=constants.MAX_TURNS_DEFAULT,
             max_hypotheses_per_report=constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT,
+            per_component_analysis=constants.PER_COMPONENT_ANALYSIS_DEFAULT,
             apktool_cmd=constants.APKTOOL_CMD_DEFAULT,
             jadx_cmd=constants.JADX_CMD_DEFAULT,
             section_rule_char=constants.SECTION_RULE_CHAR,
@@ -80,6 +82,7 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["run_folder_root"] = paths.get("run_folder_root") or "apps"
     out["max_turns"] = workflow.get("max_turns") if workflow.get("max_turns") is not None else constants.MAX_TURNS_DEFAULT
     out["max_hypotheses_per_report"] = workflow.get("max_hypotheses_per_report") or constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT
+    out["per_component_analysis"] = bool(workflow.get("per_component_analysis") if workflow.get("per_component_analysis") is not None else constants.PER_COMPONENT_ANALYSIS_DEFAULT)
     out["apktool_cmd"] = paths.get("apktool_cmd") or constants.APKTOOL_CMD_DEFAULT
     out["jadx_cmd"] = paths.get("jadx_cmd") or constants.JADX_CMD_DEFAULT
     out["section_rule_char"] = output.get("section_rule_char") or constants.SECTION_RULE_CHAR
@@ -129,6 +132,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         run_folder_root=merged["run_folder_root"],
         max_turns=max(1, merged["max_turns"]),
         max_hypotheses_per_report=max(0, merged["max_hypotheses_per_report"]),
+        per_component_analysis=bool(merged.get("per_component_analysis", constants.PER_COMPONENT_ANALYSIS_DEFAULT)),
         apktool_cmd=merged["apktool_cmd"],
         jadx_cmd=merged["jadx_cmd"],
         section_rule_char=merged["section_rule_char"] or constants.SECTION_RULE_CHAR,

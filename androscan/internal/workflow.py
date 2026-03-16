@@ -2,19 +2,36 @@
 
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from androscan.config import Config, load_config
 from androscan.internal.app_meta import compute_apk_sha256, load_app_meta, save_app_meta
 from androscan.internal.evidence_ref import resolve_ref, validate_ref
 from androscan.internal.observations_store import append_observations, load_observations
 from androscan.internal.run_folder import write_run_meta
-from androscan.llm import build_prompt, build_system_content, complete, parse_response
+from androscan.llm import (
+    build_component_prompt,
+    build_prompt,
+    build_system_content,
+    complete,
+    iter_dossier_components,
+    parse_response,
+)
 from androscan.llm.parser import Hypothesis
 from androscan.skills import SkillContext, execute, list_llm_skills, run_skills
 
 if TYPE_CHECKING:
     from androscan.internal.run_log import RunLogger
+
+
+def consolidate_hypotheses(
+    hypotheses: List[Hypothesis],
+    run_logger: Optional["RunLogger"] = None,
+) -> List[Hypothesis]:
+    """Deduplicate and merge hypotheses (e.g. via LLM). Stub: no-op, log and return unchanged."""
+    if run_logger:
+        run_logger.info("Skipping LLM hypotheses consolidation step.")
+    return hypotheses
 
 
 def run_workflow(
@@ -72,59 +89,135 @@ def run_workflow(
     skill_result_memory_cache: dict[str, str] = {}
     hypotheses: list[Hypothesis] = []
     resp = None
-    turn = 0
     max_turns = config.max_turns
 
-    while turn < max_turns:
-        turn += 1
-        prompt = build_prompt(dossier_dict, prior_skill_results if prior_skill_results else None, list_llm_skills())
-        if run_logger:
-            run_logger.task_update("LLM is analysing exported components...")
-            run_logger.llm_busy(True)
-        try:
-            result = complete(
-                prompt,
-                config=config,
-                system_content=build_system_content(),
-                stream=True,
-                run_logger=run_logger,
-            )
-        finally:
-            if run_logger:
-                run_logger.llm_busy(False)
-        if run_logger and result.thinking:
-            run_logger.llm_thinking(result.thinking)
-        raw = result.content
-        resp = parse_response(raw)
+    if getattr(config, "per_component_analysis", False):
+        # Per-component: one prompt per exported component, then aggregate and consolidate (stub).
+        all_hypotheses: list[Hypothesis] = []
+        for slice_dict, component_type, label, list_key, full_index in iter_dossier_components(dossier_dict):
+            comp_prior: list[str] = []
+            turn = 0
+            comp_resp = None
+            while turn < max_turns:
+                turn += 1
+                prompt = build_component_prompt(
+                    slice_dict, component_type, label,
+                    comp_prior if comp_prior else None,
+                    list_llm_skills(),
+                )
+                if run_logger:
+                    run_logger.task_update(f"LLM analysing {component_type}: {label}...")
+                    run_logger.llm_busy(True)
+                try:
+                    result = complete(
+                        prompt,
+                        config=config,
+                        system_content=build_system_content(),
+                        stream=True,
+                        run_logger=run_logger,
+                    )
+                finally:
+                    if run_logger:
+                        run_logger.llm_busy(False)
+                if run_logger and result.thinking:
+                    run_logger.llm_thinking(result.thinking)
+                comp_resp = parse_response(result.content)
 
-        if resp.skill_requests:
-            if run_logger:
-                run_logger.task_update("Running requested skills...")
-                # [INFORMATIONAL] skills requested by the LLM
-                skill_descs = []
-                for req in resp.skill_requests:
-                    name = getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?")
-                    params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
-                    skill_descs.append(f"{name}({params})")
-                run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
-            results = run_skills(
-                resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
-            )
-            if run_logger:
-                for name, res in results:
-                    if not res.success:
-                        run_logger.error(f"{name}: {res.text}")
-                executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in resp.skill_requests]
-                run_logger.info("Skills executed by tool: " + ", ".join(executed))
-                result_texts = [r.text for _, r in results]
-                next_prompt = build_prompt(dossier_dict, prior_skill_results + result_texts, list_llm_skills())
-                run_logger.info("Data sent to LLM after executing requested skills:\n" + next_prompt)
-            prior_skill_results.extend(r.text for _, r in results)
-            continue
+                if comp_resp.skill_requests:
+                    if run_logger:
+                        run_logger.task_update("Running requested skills...")
+                        skill_descs = []
+                        for req in comp_resp.skill_requests:
+                            name = getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?")
+                            params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
+                            skill_descs.append(f"{name}({params})")
+                        run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
+                    results = run_skills(
+                        comp_resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
+                    )
+                    if run_logger:
+                        for name, res in results:
+                            if not res.success:
+                                run_logger.error(f"{name}: {res.text}")
+                        executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in comp_resp.skill_requests]
+                        run_logger.info("Skills executed by tool: " + ", ".join(executed))
+                    comp_prior.extend(r.text for _, r in results)
+                    continue
 
-        if resp.hypotheses:
-            hypotheses = resp.hypotheses
-            break
+                if comp_resp.hypotheses:
+                    # Rewrite evidence_refs from slice (e.g. exported_activities[0]) to full dossier index.
+                    slice_ref = f"{list_key}[0]"
+                    full_ref = f"{list_key}[{full_index}]"
+                    for h in comp_resp.hypotheses:
+                        refs = list(h.evidence_refs or [])
+                        refs = [full_ref if r.strip() == slice_ref else r for r in refs]
+                        all_hypotheses.append(
+                            Hypothesis(
+                                id=h.id,
+                                component_type=h.component_type,
+                                component_name=h.component_name,
+                                title=h.title,
+                                description=h.description,
+                                evidence_refs=refs,
+                                exploitability=h.exploitability,
+                                confidence=h.confidence,
+                                remediation_hint=h.remediation_hint,
+                            )
+                        )
+                    break
+        hypotheses = consolidate_hypotheses(all_hypotheses, run_logger)
+    else:
+        # Single-shot: one prompt with full dossier.
+        turn = 0
+        while turn < max_turns:
+            turn += 1
+            prompt = build_prompt(dossier_dict, prior_skill_results if prior_skill_results else None, list_llm_skills())
+            if run_logger:
+                run_logger.task_update("LLM is analysing exported components...")
+                run_logger.llm_busy(True)
+            try:
+                result = complete(
+                    prompt,
+                    config=config,
+                    system_content=build_system_content(),
+                    stream=True,
+                    run_logger=run_logger,
+                )
+            finally:
+                if run_logger:
+                    run_logger.llm_busy(False)
+            if run_logger and result.thinking:
+                run_logger.llm_thinking(result.thinking)
+            raw = result.content
+            resp = parse_response(raw)
+
+            if resp.skill_requests:
+                if run_logger:
+                    run_logger.task_update("Running requested skills...")
+                    skill_descs = []
+                    for req in resp.skill_requests:
+                        name = getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?")
+                        params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
+                        skill_descs.append(f"{name}({params})")
+                    run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
+                results = run_skills(
+                    resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
+                )
+                if run_logger:
+                    for name, res in results:
+                        if not res.success:
+                            run_logger.error(f"{name}: {res.text}")
+                    executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in resp.skill_requests]
+                    run_logger.info("Skills executed by tool: " + ", ".join(executed))
+                    result_texts = [r.text for _, r in results]
+                    next_prompt = build_prompt(dossier_dict, prior_skill_results + result_texts, list_llm_skills())
+                    run_logger.info("Data sent to LLM after executing requested skills:\n" + next_prompt)
+                prior_skill_results.extend(r.text for _, r in results)
+                continue
+
+            if resp.hypotheses:
+                hypotheses = resp.hypotheses
+                break
 
     # Normalize and resolve evidence_refs; keep hypothesis if at least one ref validates (avoid dropping true positives)
     validated = []

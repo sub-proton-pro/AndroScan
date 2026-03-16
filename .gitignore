@@ -1,5 +1,6 @@
 # Runtime output
 apps/
+extracted_apk/
 
 # Python
 __pycache__/

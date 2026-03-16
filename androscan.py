@@ -27,8 +27,8 @@ from androscan import constants
 from androscan.cli_spinner import pause_active, resume_active, spinner
 from androscan.cli_term import colored_json, grey, orange
 from androscan.config import load_config
-from androscan.extraction import extract_dossier
-from androscan.internal import app_id_from_dossier
+from androscan.internal.app_meta import extracted_apk_path, save_app_meta
+from androscan.internal.resolve_app_id import resolve_app_id
 from androscan.internal.run_folder import create_run_folder, run_folder_display_path
 from androscan.internal.run_log import RunLogger
 from androscan.internal.workflow import run_workflow
@@ -149,7 +149,7 @@ def _run() -> int:
     print()
 
     try:
-        dossier = extract_dossier(apk_path)
+        app_id, dossier, temp_extraction, apk_hash = resolve_app_id(apk_path, config)
     except Exception as e:
         print(f"Error: extraction failed: {e}", file=sys.stderr)
         return 1
@@ -168,14 +168,24 @@ def _run() -> int:
     print(colored_json(dossier.to_dict()))
     print()
 
-    app_id = app_id_from_dossier(dossier) or "unknown_app"
-
     if args.output:
         from androscan.internal.run_folder import run_timestamp
         run_folder = Path(args.output) / app_id / run_timestamp()
         run_folder.mkdir(parents=True, exist_ok=True)
     else:
         run_folder = create_run_folder(app_id, config)
+
+    # Move fresh extraction from system temp to apps/<app_id>/extracted_apk/
+    if temp_extraction is not None:
+        app_id_root = run_folder.parent
+        final_extracted = extracted_apk_path(app_id_root)
+        temp_extracted = temp_extraction / "extracted_apk"
+        if temp_extracted.is_dir() and not final_extracted.exists():
+            final_extracted.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(temp_extracted), str(final_extracted))
+        shutil.rmtree(temp_extraction, ignore_errors=True)
+        if apk_hash:
+            save_app_meta(app_id_root, apk_hash, dossier.to_dict(), apk_path)
 
     base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
     if not is_ollama_available(base_url):
