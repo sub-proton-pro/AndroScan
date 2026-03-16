@@ -14,7 +14,7 @@ paths:
   jadx_cmd: "jadx"
 
 workflow:
-  max_turns: 3
+  max_turns: 5
   max_hypotheses_per_report: 10
 
 output:

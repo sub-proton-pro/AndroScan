@@ -3,8 +3,8 @@
 # Dossier / app identity
 APP_ID_MAX_LEN = 128
 
-# Workflow / LLM
-MAX_TURNS_DEFAULT = 3
+# Workflow / LLM (used when global_config.yaml does not set workflow.max_turns)
+MAX_TURNS_DEFAULT = 5
 MAX_HYPOTHESES_PER_REPORT_DEFAULT = 10
 
 # Ollama retry: timeout tiers (sec), num_predict tiers (tokens)
