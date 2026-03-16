@@ -140,7 +140,8 @@ def _run() -> int:
         print(grey("Install: https://apktool.org/docs/install"), file=sys.stderr)
         return 1
 
-    started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_start = datetime.now()
+    started = run_start.strftime("%Y-%m-%d %H:%M:%S")
     tasks_str = ", ".join(tasks)
     _section("Run started", config.section_rule)
     print(f"  Started:  {started}")
@@ -208,6 +209,23 @@ def _run() -> int:
             pause_active()
             print(orange("[ERROR] " + str(payload)), file=sys.stderr)
             resume_active()
+        elif kind == "component_findings":
+            pause_active()
+            if isinstance(payload, dict):
+                comp_type = payload.get("component_type") or "component"
+                comp_label = payload.get("component_label") or "—"
+                hyps = payload.get("hypotheses") or []
+                n = len(hyps)
+                print(f"  [{comp_type}] {comp_label}: {n} finding(s)")
+                for h in hyps:
+                    title = h.get("title") or "(no title)"
+                    exp = h.get("exploitability", 1)
+                    conf = h.get("confidence", 0)
+                    desc = (h.get("description") or "").strip()
+                    print(f"     • [{_severity_label(exp)}] {title} (confidence: {conf})")
+                    if desc:
+                        print(f"       Description: {desc}")
+            resume_active()
 
     run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink)
     with spinner("Analysis starting...", done_message="Analysis complete.") as _spinner_ref:
@@ -228,7 +246,13 @@ def _run() -> int:
 
     package = dossier.apk_info.package
     section_rule = config.section_rule or constants.SECTION_RULE
-    run_summary_lines = [section_rule, "[*] Run summary", section_rule]
+    run_elapsed = datetime.now() - run_start
+    total_sec = max(0, run_elapsed.total_seconds())
+    hours = int(total_sec // 3600)
+    minutes = int((total_sec % 3600) // 60)
+    seconds = int(total_sec % 60)
+    duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    run_summary_lines = [section_rule, "[*] Run summary", section_rule, f"  Duration:  {duration_str}", ""]
     if report_data and report_data.get("hypotheses"):
         hypotheses = report_data["hypotheses"]
         n = len(hypotheses)

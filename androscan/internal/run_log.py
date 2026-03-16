@@ -1,7 +1,9 @@
 """Run logger: writes task updates, LLM busy state, and thinking to run.log. Optional UI sink for CLI/web."""
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+
+from androscan import constants
 
 RUN_LOG_FILENAME = "run.log"
 
@@ -63,6 +65,40 @@ class RunLogger:
         """Log informational message. Written to run.log with [INFORMATIONAL] prefix."""
         self._append_log(f"[INFORMATIONAL] {message}")
         self._ui_sink("info", message)
+
+    def component_findings(
+        self,
+        component_type: str,
+        component_label: str,
+        hypotheses: list[Any],
+    ) -> None:
+        """Stream findings for one component to run.log and UI (per-component analysis mode)."""
+        if not hypotheses:
+            return
+        severity_labels = constants.ISSUE_SEVERITY_LABELS
+        header = f"--- Findings for {component_type}: {component_label} ---"
+        self._append_log(header)
+        payload_hypotheses: list[dict[str, Any]] = []
+        for h in hypotheses:
+            title = getattr(h, "title", None) or "(no title)"
+            exp = int(getattr(h, "exploitability", 1))
+            conf = int(getattr(h, "confidence", 0))
+            desc = (getattr(h, "description", None) or "").strip()
+            severity = severity_labels.get(exp, "Informational")
+            self._append_log(f"  • [{severity}] {title} (confidence: {conf})")
+            if desc:
+                self._append_log(f"    Description: {desc}")
+            payload_hypotheses.append({
+                "title": title,
+                "exploitability": exp,
+                "description": desc,
+                "confidence": conf,
+            })
+        self._ui_sink("component_findings", {
+            "component_type": component_type,
+            "component_label": component_label,
+            "hypotheses": payload_hypotheses,
+        })
 
     def write_raw(self, content: str) -> None:
         """Append content to run.log with no [tag] prefix—same as presentation layer."""

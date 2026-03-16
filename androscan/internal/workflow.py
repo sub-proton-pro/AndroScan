@@ -148,22 +148,25 @@ def run_workflow(
                     # Rewrite evidence_refs from slice (e.g. exported_activities[0]) to full dossier index.
                     slice_ref = f"{list_key}[0]"
                     full_ref = f"{list_key}[{full_index}]"
+                    component_hyps: list[Hypothesis] = []
                     for h in comp_resp.hypotheses:
                         refs = list(h.evidence_refs or [])
                         refs = [full_ref if r.strip() == slice_ref else r for r in refs]
-                        all_hypotheses.append(
-                            Hypothesis(
-                                id=h.id,
-                                component_type=h.component_type,
-                                component_name=h.component_name,
-                                title=h.title,
-                                description=h.description,
-                                evidence_refs=refs,
-                                exploitability=h.exploitability,
-                                confidence=h.confidence,
-                                remediation_hint=h.remediation_hint,
-                            )
+                        rewritten = Hypothesis(
+                            id=h.id,
+                            component_type=h.component_type,
+                            component_name=h.component_name,
+                            title=h.title,
+                            description=h.description,
+                            evidence_refs=refs,
+                            exploitability=h.exploitability,
+                            confidence=h.confidence,
+                            remediation_hint=h.remediation_hint,
                         )
+                        component_hyps.append(rewritten)
+                        all_hypotheses.append(rewritten)
+                    if run_logger and component_hyps:
+                        run_logger.component_findings(component_type, label, component_hyps)
                     break
         hypotheses = consolidate_hypotheses(all_hypotheses, run_logger)
     else:
