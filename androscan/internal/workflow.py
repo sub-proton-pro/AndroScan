@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional
 from androscan.config import Config, load_config
 from androscan.internal.app_meta import compute_apk_sha256, load_app_meta, save_app_meta
 from androscan.internal.evidence_ref import resolve_ref, validate_ref
+from androscan.internal.exploit_verification import run_exploit_verification
 from androscan.internal.observations_store import append_observations, load_observations
 from androscan.internal.run_folder import write_run_meta
 from androscan.llm import (
@@ -98,7 +99,6 @@ def run_workflow(
     - config: optional Config; if None, load_config() is called.
     - run_logger: optional RunLogger for task updates, llm_busy, and thinking log.
     """
-    _ = tasks  # Stub: ignore which tasks; Phase 3 will dispatch per task.
     if config is None:
         config = load_config()
 
@@ -300,6 +300,16 @@ def run_workflow(
     if run_logger and len(validated) < len(hypotheses):
         run_logger.warning(f"Dropped {len(hypotheses) - len(validated)} hypotheses with no valid evidence_refs after resolution")
 
+    # Exploit verification (Phase 5): run per-hypothesis steps, write under exploit_verification/<module>/
+    verification_results: list = []
+    if validated and tasks:
+        vuln_module = tasks[0]
+        if run_logger:
+            run_logger.task_update("Running exploit verification...")
+        verification_results = run_exploit_verification(
+            validated, dossier_dict, run_folder, vuln_module, ctx, run_logger
+        )
+
     summary = getattr(resp, "summary", None) or "" if resp else ""
     report_params = {
         "hypotheses": [
@@ -317,6 +327,7 @@ def run_workflow(
             for h in validated
         ],
         "summary": summary,
+        "verification_results": verification_results,
     }
     execute("generate_report", report_params, ctx)
     finished_at = datetime.now()
