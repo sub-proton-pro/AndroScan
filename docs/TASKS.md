@@ -71,7 +71,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 | 7 | run_exploit_command skill | Done |
 | 8 | verify_exploit_result skill | Done |
 | 9 | Exploit verification orchestration | Done |
-| 10 | Report after verification | Pending |
+| 10 | Report after verification | Done |
 
 | # | Task | Deliverable | Depends on |
 |---|------|-------------|------------|
@@ -91,7 +91,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 ## Priority Queue
 
 ### P1
-- Next: Task 10 (report after verification).
+- Phase 5 complete. Next: Phase 4 (unpark) or backlog.
 
 ---
 

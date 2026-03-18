@@ -1,5 +1,6 @@
 """Tests for skills layer: registry, execute, list_llm_skills."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,50 @@ def test_execute_prepare_dossier_pipeline_skill(tmp_path):
     assert isinstance(result.data, dict)
     assert "apk_info" in result.data
     assert result.data["apk_info"].get("package") == "com.example.app"
+
+
+def test_generate_report_includes_verification_results(tmp_path):
+    """generate_report merges verification_results into hypotheses (verified, verification_artifact_dir)."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, apk_path="/some.apk")
+    result = execute(
+        "generate_report",
+        {
+            "hypotheses": [
+                {"id": "H1", "component_type": "activity", "component_name": "Main", "title": "T", "description": "D",
+                 "evidence_refs": ["exported_activities[0]"], "exploitability": 3, "confidence": 2, "remediation_hint": ""},
+            ],
+            "summary": "Done.",
+            "verification_results": [
+                {"hypothesis_id": "H1", "verified": True, "reasoning": "Activity launched.", "artifact_dir": "/run/exploit_verification/exported_components/H1"},
+            ],
+        },
+        ctx,
+    )
+    assert result.success is True
+    report_path = tmp_path / "report.json"
+    assert report_path.exists()
+    data = json.loads(report_path.read_text())
+    assert len(data["hypotheses"]) == 1
+    h = data["hypotheses"][0]
+    assert h["id"] == "H1"
+    assert h["verified"] is True
+    assert "Activity launched" in (h.get("verification_reasoning") or "")
+    assert h.get("verification_artifact_dir") == "/run/exploit_verification/exported_components/H1"
+
+
+def test_generate_report_no_verification_uses_none(tmp_path):
+    """generate_report sets verified/reasoning/artifact_dir to None when no verification_results."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, apk_path="/some.apk")
+    execute(
+        "generate_report",
+        {"hypotheses": [{"id": "H2", "title": "T", "evidence_refs": [], "exploitability": 1, "confidence": 1, "remediation_hint": ""}], "summary": ""},
+        ctx,
+    )
+    data = json.loads((tmp_path / "report.json").read_text())
+    assert data["hypotheses"][0]["verified"] is None
+    assert data["hypotheses"][0]["verification_artifact_dir"] is None
 
 
 def test_execute_llm_skill_get_decompiled_class(tmp_path):
