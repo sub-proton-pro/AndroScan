@@ -25,6 +25,41 @@ def orange(msg: str) -> str:
     return f"\033[33m{msg}\033[0m"
 
 
+def dark_red(msg: str) -> str:
+    """Dark red (e.g. Critical severity)."""
+    if not _use_color():
+        return msg
+    return f"\033[38;5;88m{msg}\033[0m"
+
+
+def bright_red(msg: str) -> str:
+    """Bright red (e.g. High severity)."""
+    if not _use_color():
+        return msg
+    return f"\033[91m{msg}\033[0m"
+
+
+def blue(msg: str) -> str:
+    """Blue (e.g. Low severity)."""
+    if not _use_color():
+        return msg
+    return f"\033[34m{msg}\033[0m"
+
+
+def green(msg: str) -> str:
+    """Green (e.g. Informational severity)."""
+    if not _use_color():
+        return msg
+    return f"\033[32m{msg}\033[0m"
+
+
+def gold(msg: str) -> str:
+    """Return message with gold color (for component headings in Analysis). Plain text when not TTY."""
+    if not _use_color():
+        return msg
+    return f"\033[38;5;214m{msg}\033[0m"
+
+
 def grey(msg: str) -> str:
     """Return message with grey/dim color (for tips). Plain text when not TTY."""
     if not _use_color():

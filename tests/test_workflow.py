@@ -6,18 +6,26 @@ from unittest.mock import patch
 
 import pytest
 
+from androscan.config import Config
 from androscan.extraction import extract_dossier
 from androscan.llm.client import CompleteResult
 from androscan.internal.run_log import RunLogger
 from androscan.internal.workflow import run_workflow
 
 
+def _single_shot_config() -> Config:
+    """Config with per_component_analysis=False so workflow uses single-shot path (for tests that expect fixed complete() count)."""
+    c = Config.default()
+    return c  # default has per_component_analysis=False
+
+
 def test_workflow_creates_report_file(tmp_path):
     """Run workflow with mock LLM (no live Ollama); run folder contains report.json with expected structure."""
     stub_json = '{"summary": "Stub analysis.", "hypotheses": [{"id": "H1", "component_type": "activity", "component_name": "com.example.app.MainActivity", "title": "Stub finding", "description": "Stub.", "evidence_refs": ["exported_activities[0]"], "exploitability": 3, "confidence": 2, "remediation_hint": "N/A"}]}'
     stub_result = CompleteResult(content=stub_json, thinking="", metadata={})
+    config = _single_shot_config()
     with patch("androscan.internal.workflow.complete", return_value=stub_result):
-        run_workflow("/dummy.apk", ["exported_components"], tmp_path)
+        run_workflow("/dummy.apk", ["exported_components"], tmp_path, config=config)
     report_file = tmp_path / "report.json"
     assert report_file.exists()
     data = json.loads(report_file.read_text())
@@ -42,8 +50,9 @@ def test_workflow_multi_turn_with_mock_skill_request(tmp_path):
             content = '{"hypotheses": [{"id": "H2", "component_type": "activity", "component_name": "com.example.app.MainActivity", "title": "Mock", "description": "D", "evidence_refs": ["exported_activities[0]"], "exploitability": 2, "confidence": 3, "remediation_hint": ""}]}'
         return CompleteResult(content=content, thinking="", metadata={})
 
+    config = _single_shot_config()
     with patch("androscan.internal.workflow.complete", side_effect=mock_complete):
-        run_workflow("/dummy.apk", ["exported_components"], tmp_path)
+        run_workflow("/dummy.apk", ["exported_components"], tmp_path, config=config)
 
     assert call_count == 2
     report_file = tmp_path / "report.json"
@@ -61,8 +70,9 @@ def test_workflow_drops_hypothesis_with_invalid_evidence_ref(tmp_path):
     stub_json += ']}'
     stub_result = CompleteResult(content=stub_json, thinking="", metadata={})
     run_logger = RunLogger(tmp_path)
+    config = _single_shot_config()
     with patch("androscan.internal.workflow.complete", return_value=stub_result):
-        run_workflow("/dummy.apk", ["exported_components"], tmp_path, run_logger=run_logger)
+        run_workflow("/dummy.apk", ["exported_components"], tmp_path, config=config, run_logger=run_logger)
     data = json.loads((tmp_path / "report.json").read_text())
     assert len(data["hypotheses"]) == 1
     assert data["hypotheses"][0]["id"] == "H1"
@@ -73,8 +83,9 @@ def test_workflow_writes_run_meta_and_run_log(tmp_path):
     """Workflow writes report.json, run_meta.json, and run.log when run_logger is provided."""
     stub_json = '{"summary": "Ok.", "hypotheses": [{"id": "H1", "component_type": "activity", "component_name": "com.example.Main", "title": "T", "description": "D", "evidence_refs": ["exported_activities[0]"], "exploitability": 3, "confidence": 2, "remediation_hint": ""}]}'
     run_logger = RunLogger(tmp_path)
+    config = _single_shot_config()
     with patch("androscan.internal.workflow.complete", return_value=CompleteResult(content=stub_json, thinking="", metadata={})):
-        run_workflow("/dummy.apk", ["exported_components"], tmp_path, run_logger=run_logger)
+        run_workflow("/dummy.apk", ["exported_components"], tmp_path, config=config, run_logger=run_logger)
     assert (tmp_path / "report.json").exists()
     assert (tmp_path / "run_meta.json").exists()
     assert (tmp_path / "run.log").exists()

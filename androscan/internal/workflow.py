@@ -11,6 +11,8 @@ from androscan.internal.observations_store import append_observations, load_obse
 from androscan.internal.run_folder import write_run_meta
 from androscan.llm import (
     build_component_prompt,
+    build_consolidation_prompt,
+    build_consolidation_system_content,
     build_prompt,
     build_system_content,
     complete,
@@ -24,13 +26,61 @@ if TYPE_CHECKING:
     from androscan.internal.run_log import RunLogger
 
 
+def _hypothesis_to_dict(h: Hypothesis) -> dict:
+    """Serialize Hypothesis for consolidation prompt."""
+    return {
+        "id": h.id,
+        "component_type": h.component_type,
+        "component_name": h.component_name,
+        "title": h.title,
+        "description": h.description,
+        "evidence_refs": list(h.evidence_refs or []),
+        "exploitability": h.exploitability,
+        "confidence": h.confidence,
+        "remediation_hint": h.remediation_hint or "",
+    }
+
+
 def consolidate_hypotheses(
     hypotheses: List[Hypothesis],
+    config: Optional[Config] = None,
     run_logger: Optional["RunLogger"] = None,
 ) -> List[Hypothesis]:
-    """Deduplicate and merge hypotheses (e.g. via LLM). Stub: no-op, log and return unchanged."""
+    """Deduplicate and merge overlapping hypotheses via one LLM call. On failure or empty response, return original list."""
+    if not hypotheses:
+        return []
+    if config is None:
+        config = load_config()
+
+    dict_list = [_hypothesis_to_dict(h) for h in hypotheses]
+    prompt = build_consolidation_prompt(dict_list)
+    if not prompt:
+        return hypotheses
+
     if run_logger:
-        run_logger.info("Skipping LLM hypotheses consolidation step.")
+        run_logger.task_update("Consolidating hypotheses...")
+        run_logger.llm_busy(True)
+    try:
+        result = complete(
+            prompt,
+            config=config,
+            system_content=build_consolidation_system_content(),
+            stream=True,
+            run_logger=run_logger,
+        )
+    finally:
+        if run_logger:
+            run_logger.llm_busy(False)
+    if run_logger and result.thinking:
+        run_logger.llm_thinking(result.thinking)
+
+    resp = parse_response(result.content)
+    if resp.hypotheses:
+        if run_logger:
+            run_logger.info(f"Consolidation: {len(hypotheses)} -> {len(resp.hypotheses)} hypotheses.")
+        return resp.hypotheses
+    if run_logger:
+        run_logger.warning("Consolidation returned no hypotheses; using original list.")
     return hypotheses
 
 
@@ -95,6 +145,8 @@ def run_workflow(
         # Per-component: one prompt per exported component, then aggregate and consolidate (stub).
         all_hypotheses: list[Hypothesis] = []
         for slice_dict, component_type, label, list_key, full_index in iter_dossier_components(dossier_dict):
+            if run_logger:
+                run_logger.write_raw("\n---------- Component: " + component_type + " - " + label + " ----------\n")
             comp_prior: list[str] = []
             turn = 0
             comp_resp = None
@@ -106,6 +158,7 @@ def run_workflow(
                     list_llm_skills(),
                 )
                 if run_logger:
+                    run_logger.info("Prompt sent to LLM:\n" + prompt)
                     run_logger.task_update(f"LLM analysing {component_type}: {label}...")
                     run_logger.llm_busy(True)
                 try:
@@ -168,7 +221,7 @@ def run_workflow(
                     if run_logger and component_hyps:
                         run_logger.component_findings(component_type, label, component_hyps)
                     break
-        hypotheses = consolidate_hypotheses(all_hypotheses, run_logger)
+        hypotheses = consolidate_hypotheses(all_hypotheses, config, run_logger)
     else:
         # Single-shot: one prompt with full dossier.
         turn = 0

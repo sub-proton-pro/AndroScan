@@ -122,3 +122,35 @@ def build_prompt(
         "Use evidence_refs as dossier paths. exploitability and confidence are integers 1-5.",
     ])
     return "\n".join(parts)
+
+
+def build_consolidation_prompt(hypotheses: list[dict[str, Any]]) -> str:
+    """Build prompt for LLM to deduplicate and merge overlapping security findings."""
+    if not hypotheses:
+        return ""
+    parts = [
+        "Below are security findings from a per-component analysis. Some may duplicate or overlap (same component, same issue, different wording).",
+        "",
+        "Tasks:",
+        "1. Deduplicate: merge findings that describe the same or overlapping issue (especially same evidence_ref / component).",
+        "2. For merged findings: write one clear title and one clear description that captures the issue.",
+        "3. Keep evidence_refs, exploitability (1-5), and confidence (1-5). Use the highest exploitability when merging.",
+        "4. Return valid JSON only, with a single key \"hypotheses\" and an array of finding objects.",
+        "5. Each object must have: id, component_type, component_name, title, description, evidence_refs (array of strings), exploitability, confidence, remediation_hint.",
+        "",
+        "## Findings (JSON)",
+        json.dumps(hypotheses, indent=2),
+        "",
+        "Return valid JSON: { \"hypotheses\": [ ... ] }",
+    ]
+    return "\n".join(parts)
+
+
+def build_consolidation_system_content() -> str:
+    """System message for the consolidation LLM call."""
+    return (
+        "You are a security report editor. Merge duplicate or overlapping findings into a single, clear finding. "
+        "Return only valid JSON with key \"hypotheses\" and an array of objects. "
+        "Each object: id (string), component_type, component_name, title, description, evidence_refs (array of strings), "
+        "exploitability (integer 1-5), confidence (integer 1-5), remediation_hint (string)."
+    )

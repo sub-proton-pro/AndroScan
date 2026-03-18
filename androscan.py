@@ -25,7 +25,7 @@ def _sigterm_handler(_signum: int, _frame: Optional[object]) -> None:
 
 from androscan import constants
 from androscan.cli_spinner import pause_active, resume_active, spinner
-from androscan.cli_term import colored_json, grey, orange
+from androscan.cli_term import blue, bright_red, colored_json, dark_red, gold, green, grey, orange
 from androscan.config import load_config
 from androscan.internal.app_meta import extracted_apk_path, save_app_meta
 from androscan.internal.resolve_app_id import resolve_app_id
@@ -54,6 +54,19 @@ def _exploitability_label(score: int) -> str:
 def _severity_label(score: int) -> str:
     """Display severity for CLI (brackets); uses ISSUE_SEVERITY_LABELS."""
     return constants.ISSUE_SEVERITY_LABELS.get(score, "Informational")
+
+
+def _severity_label_colored(score: int) -> str:
+    """Severity label with color for terminal: Critical=dark_red, High=bright_red, Medium=orange, Low=blue, Informational=green."""
+    labels_colors = {
+        5: ("Critical", dark_red),
+        4: ("High", bright_red),
+        3: ("Medium", orange),
+        2: ("Low", blue),
+        1: ("Informational", green),
+    }
+    text, color_fn = labels_colors.get(score, ("Informational", green))
+    return color_fn(f"[{text}]")
 
 
 def _component_name_from_ref(dossier: Any, ref: str) -> Optional[str]:
@@ -216,15 +229,16 @@ def _run() -> int:
                 comp_label = payload.get("component_label") or "—"
                 hyps = payload.get("hypotheses") or []
                 n = len(hyps)
-                print(f"  [{comp_type}] {comp_label}: {n} finding(s)")
+                print(gold(f"  [{comp_type}] {comp_label}: {n} finding(s)"))
                 for h in hyps:
                     title = h.get("title") or "(no title)"
                     exp = h.get("exploitability", 1)
                     conf = h.get("confidence", 0)
                     desc = (h.get("description") or "").strip()
-                    print(f"     • [{_severity_label(exp)}] {title} (confidence: {conf})")
+                    print(f"     • {_severity_label_colored(exp)} {title} (confidence: {conf})")
                     if desc:
                         print(f"       Description: {desc}")
+                        print()
             resume_active()
 
     run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink)
@@ -253,6 +267,7 @@ def _run() -> int:
     seconds = int(total_sec % 60)
     duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     run_summary_lines = [section_rule, "[*] Run summary", section_rule, f"  Duration:  {duration_str}", ""]
+    run_summary_lines_display = list(run_summary_lines)
     if report_data and report_data.get("hypotheses"):
         hypotheses = report_data["hypotheses"]
         n = len(hypotheses)
@@ -261,8 +276,11 @@ def _run() -> int:
             exp = h.get("exploitability", 1)
             by_exp[exp] = by_exp.get(exp, 0) + 1
         parts = [f"{by_exp[exp]} {_exploitability_label(exp)}" for exp in sorted(by_exp.keys(), reverse=True)]
-        run_summary_lines.append(f"  Findings:  {n} ({', '.join(parts)})")
+        line = f"  Findings:  {n} ({', '.join(parts)})"
+        run_summary_lines.append(line)
+        run_summary_lines_display.append(line)
         run_summary_lines.append("")
+        run_summary_lines_display.append("")
         for i, h in enumerate(hypotheses, 1):
             title = h.get("title") or "(no title)"
             comp = h.get("component_name")
@@ -277,16 +295,24 @@ def _run() -> int:
             conf = h.get("confidence", 0)
             desc = (h.get("description") or "").strip()
             run_summary_lines.append(f"  {i}. [{_severity_label(exp)}] {title}")
+            run_summary_lines_display.append(f"  {i}. {_severity_label_colored(exp)} {title}")
             run_summary_lines.append(f"     Component: {comp}  (confidence: {conf})")
+            run_summary_lines_display.append(f"     Component: {comp}  (confidence: {conf})")
             if desc:
                 run_summary_lines.append(f"     Description: {desc}")
+                run_summary_lines_display.append(f"     Description: {desc}")
             run_summary_lines.append("")
+            run_summary_lines_display.append("")
         run_summary_lines.append(f"  Full report:  {report_path}")
+        run_summary_lines_display.append(f"  Full report:  {report_path}")
     else:
         run_summary_lines.append("  Findings:  0 hypotheses")
+        run_summary_lines_display.append("  Findings:  0 hypotheses")
         run_summary_lines.append(f"  Full report:  {report_path}")
+        run_summary_lines_display.append(f"  Full report:  {report_path}")
     run_summary_text = "\n".join(run_summary_lines)
-    print(run_summary_text)
+    run_summary_text_display = "\n".join(run_summary_lines_display)
+    print(run_summary_text_display)
     run_logger.write_raw(run_summary_text)
 
     _section("Appendix", config.section_rule)
