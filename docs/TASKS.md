@@ -69,7 +69,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 | 5 | build_exploit_command skill | Done |
 | 6 | capture_signals skill | Done |
 | 7 | run_exploit_command skill | Done |
-| 8 | verify_exploit_result skill | Pending |
+| 8 | verify_exploit_result skill | Done |
 | 9 | Exploit verification orchestration | Pending |
 | 10 | Report after verification | Pending |
 
@@ -91,7 +91,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 ## Priority Queue
 
 ### P1
-- Next: Task 8 (verify_exploit_result skill).
+- Next: Task 9 (exploit verification orchestration).
 
 ---
 

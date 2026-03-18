@@ -24,6 +24,7 @@ _SKILL_MODULES = [
     "androscan.skills.build_exploit_command",
     "androscan.skills.capture_signals",
     "androscan.skills.run_exploit_command",
+    "androscan.skills.verify_exploit_result",
 ]
 
 

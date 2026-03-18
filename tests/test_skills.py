@@ -491,3 +491,69 @@ def test_run_exploit_command_exit_nonzero(tmp_path, monkeypatch):
     assert result.data["success"] is False
     assert result.data["returncode"] == 1
     assert "Activity not found" in result.data["stderr"]
+
+
+# --- verify_exploit_result ---
+
+def test_verify_exploit_result_requires_hypothesis(tmp_path):
+    """verify_exploit_result returns failure when hypothesis is missing."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "verify_exploit_result",
+        {"before_signals": {}, "after_signals": {}},
+        ctx,
+    )
+    assert result.success is False
+    assert "[verify_exploit_result]" in result.text
+    assert "hypothesis" in result.text.lower()
+
+
+def test_verify_exploit_result_success(tmp_path, monkeypatch):
+    """verify_exploit_result calls LLM and returns verified + reasoning."""
+    from androscan.llm.client import CompleteResult
+
+    def fake_complete(*args, **kwargs):
+        return CompleteResult(
+            content='{"verified": true, "reasoning": "Activity launched; logcat shows target."}',
+            thinking="",
+            metadata={},
+        )
+    monkeypatch.setattr("androscan.skills.verify_exploit_result.complete", fake_complete)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "verify_exploit_result",
+        {
+            "hypothesis": {"title": "Exported activity", "description": "Launchable", "evidence_refs": ["exported_activities[0]"]},
+            "before_signals": {"logcat": "old log"},
+            "after_signals": {"logcat": "new log with activity"},
+        },
+        ctx,
+    )
+    assert result.success is True
+    assert result.data["verified"] is True
+    assert "Activity launched" in result.data["reasoning"]
+    assert result.log_summary is not None
+    assert "Verified: yes" in result.log_summary
+    assert result.spinner_text == "Verifying exploit result..."
+
+
+def test_verify_exploit_result_verified_false(tmp_path, monkeypatch):
+    """verify_exploit_result parses verified=false from LLM."""
+    from androscan.llm.client import CompleteResult
+
+    monkeypatch.setattr(
+        "androscan.skills.verify_exploit_result.complete",
+        lambda *a, **k: CompleteResult(content='{"verified": false, "reasoning": "No UI change."}', thinking="", metadata={}),
+    )
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "verify_exploit_result",
+        {"hypothesis": {"title": "X"}, "before_signals": {}, "after_signals": {}},
+        ctx,
+    )
+    assert result.success is True
+    assert result.data["verified"] is False
+    assert "No UI change" in result.data["reasoning"]
