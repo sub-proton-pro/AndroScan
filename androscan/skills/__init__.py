@@ -51,7 +51,17 @@ def execute(name: str, params: dict[str, Any], context: SkillContext) -> SkillRe
 
 def list_llm_skills() -> list[SkillMeta]:
     """Return metadata for all skills with tier=llm (for prompt catalog)."""
-    return [meta for meta, _ in _REGISTRY.values() if meta.tier == "llm"]
+    return list_skills_by_tier("llm")
+
+
+def list_skills_by_tier(tier: str) -> list[SkillMeta]:
+    """Return metadata for all skills with the given tier (e.g. llm, exploit)."""
+    return [meta for meta, _ in _REGISTRY.values() if meta.tier == tier]
+
+
+def list_exploit_skills() -> list[SkillMeta]:
+    """Return metadata for all skills with tier=exploit (for exploit verification)."""
+    return list_skills_by_tier("exploit")
 
 
 def _skill_cache_key(skill: str, params: dict[str, Any]) -> str:
@@ -134,7 +144,9 @@ __all__ = [
     "SkillResult",
     "discover",
     "execute",
+    "list_exploit_skills",
     "list_llm_skills",
+    "list_skills_by_tier",
     "register",
     "run_skills",
 ]

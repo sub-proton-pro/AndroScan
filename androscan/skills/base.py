@@ -14,7 +14,7 @@ class SkillMeta:
     name: str
     description: str
     params_schema: dict[str, Any]  # e.g. {"component_ref": "dossier path", ...}
-    tier: Literal["pipeline", "llm"]
+    tier: Literal["pipeline", "llm", "exploit"]
 
 
 @dataclass

@@ -63,7 +63,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 |---|------|--------|
 | 1 | Docs: park Phase 4, add Phase 5 active with this list | Done |
 | 2 | Vuln–skill–signal_profile JSON | Done |
-| 3 | Exploit skill tier | Pending |
+| 3 | Exploit skill tier | Done |
 | 4 | app_env_check skill | Pending |
 | 5 | build_exploit_command skill | Pending |
 | 6 | capture_signals skill | Pending |
@@ -90,7 +90,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 ## Priority Queue
 
 ### P1
-- Next: Task 3 (Exploit skill tier).
+- Next: Task 4 (app_env_check skill).
 
 ---
 

@@ -9,7 +9,9 @@ from androscan.skills import (
     SkillContext,
     SkillResult,
     execute,
+    list_exploit_skills,
     list_llm_skills,
+    list_skills_by_tier,
     run_skills,
 )
 
@@ -81,6 +83,24 @@ def test_list_llm_skills_returns_only_llm_tier():
     assert "generate_report" not in names
     for meta in skills:
         assert meta.tier == "llm"
+
+
+def test_list_skills_by_tier():
+    """list_skills_by_tier returns only skills with the given tier."""
+    llm = list_skills_by_tier("llm")
+    assert all(m.tier == "llm" for m in llm)
+    pipeline = list_skills_by_tier("pipeline")
+    assert all(m.tier == "pipeline" for m in pipeline)
+    exploit = list_skills_by_tier("exploit")
+    assert all(m.tier == "exploit" for m in exploit)
+
+
+def test_list_exploit_skills():
+    """list_exploit_skills returns only tier=exploit; none registered yet."""
+    skills = list_exploit_skills()
+    assert isinstance(skills, list)
+    for meta in skills:
+        assert meta.tier == "exploit"
 
 
 def test_run_skills_compat(tmp_path):
