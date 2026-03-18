@@ -22,6 +22,7 @@ _SKILL_MODULES = [
     "androscan.skills.list_classes_in_package",
     "androscan.skills.app_env_check",
     "androscan.skills.build_exploit_command",
+    "androscan.skills.capture_signals",
 ]
 
 

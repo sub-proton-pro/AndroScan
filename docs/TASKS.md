@@ -67,7 +67,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 | 3 | Exploit skill tier | Done |
 | 4 | app_env_check skill | Done |
 | 5 | build_exploit_command skill | Done |
-| 6 | capture_signals skill | Pending |
+| 6 | capture_signals skill | Done |
 | 7 | run_exploit_command skill | Pending |
 | 8 | verify_exploit_result skill | Pending |
 | 9 | Exploit verification orchestration | Pending |
@@ -91,7 +91,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 ## Priority Queue
 
 ### P1
-- Next: Task 6 (capture_signals skill).
+- Next: Task 7 (run_exploit_command skill).
 
 ---
 

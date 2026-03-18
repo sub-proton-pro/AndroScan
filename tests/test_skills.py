@@ -336,3 +336,83 @@ def test_build_exploit_command_deep_link_success(tmp_path):
     assert result.data["template_id"] == "open_deep_link"
     assert "android.intent.action.VIEW" in result.data["command"]
     assert "https://example.com/open" in result.data["command"]
+
+
+# --- capture_signals ---
+
+def test_capture_signals_requires_params(tmp_path):
+    """capture_signals returns failure when required params are missing."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    r = execute("capture_signals", {}, ctx)
+    assert r.success is False
+    assert "[capture_signals]" in r.text
+    assert "device_serial" in r.text or "package" in r.text or "vuln_module" in r.text or "profile" in r.text
+
+
+def test_capture_signals_no_adb(tmp_path, monkeypatch):
+    """capture_signals returns clear failure when adb is not on PATH."""
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "capture_signals",
+        {"device_serial": "emulator-5554", "package": "com.example.app", "vuln_module": "exported_components", "profile": "exported_activity"},
+        ctx,
+    )
+    assert result.success is False
+    assert "adb" in result.text.lower()
+
+
+def test_capture_signals_unknown_profile(tmp_path):
+    """capture_signals returns failure for unknown profile."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "capture_signals",
+        {"device_serial": "emulator-5554", "package": "com.example.app", "vuln_module": "exported_components", "profile": "unknown_profile"},
+        ctx,
+    )
+    assert result.success is False
+    assert "Unknown profile" in result.text or "unknown_profile" in result.text
+
+
+def test_capture_signals_success_volatile_then_non_volatile(tmp_path, monkeypatch):
+    """capture_signals runs volatile first then non-volatile; returns log_summary and spinner_text."""
+    def fake_run(cmd, *args, capture_output=True, text=True, timeout=15, **kwargs):
+        class R:
+            returncode = 0
+            stdout = "fake logcat or dumpsys output\n"
+            stderr = ""
+        if "exec-out" in cmd or "screencap" in str(cmd):
+            class RBinary:
+                returncode = 0
+                stdout = b"\x89PNG\r\n\x1a\n"
+                stderr = b""
+            return RBinary()
+        return R()
+    monkeypatch.setattr("subprocess.run", fake_run)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "capture_signals",
+        {"device_serial": "emulator-5554", "package": "com.example.app", "vuln_module": "exported_components", "profile": "exported_activity"},
+        ctx,
+    )
+    assert result.success is True
+    assert result.data is not None
+    assert "signals" in result.data
+    assert "volatile_captured" in result.data
+    assert "non_volatile_captured" in result.data
+    assert result.data["volatile_captured"] == ["screenshot"]
+    assert "logcat" in result.data["non_volatile_captured"] or "logcat" in result.data["signals"]
+    assert result.log_summary is not None
+    assert "Captured" in result.log_summary
+    assert result.spinner_text == "Capturing signals..."
+
+
+def test_capture_signals_list_exploit_includes_capture_signals():
+    """list_exploit_skills includes capture_signals."""
+    skills = list_exploit_skills()
+    names = [m.name for m in skills]
+    assert "capture_signals" in names
