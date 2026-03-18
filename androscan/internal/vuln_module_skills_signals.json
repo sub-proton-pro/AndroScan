@@ -1,0 +1,54 @@
+{
+  "modules": {
+    "exported_components": {
+      "skills": [
+        "app_env_check",
+        "build_exploit_command",
+        "capture_signals",
+        "run_exploit_command",
+        "verify_exploit_result"
+      ],
+      "profiles": {
+        "exported_activity": {
+          "signal_types": ["screenshot", "logcat", "dumpsys_activity", "window_stack"],
+          "template_intents": ["launch_activity"],
+          "volatile": ["screenshot"]
+        },
+        "exported_service": {
+          "signal_types": ["logcat", "dumpsys_activity"],
+          "template_intents": ["start_service"],
+          "volatile": []
+        },
+        "exported_receiver": {
+          "signal_types": ["logcat"],
+          "template_intents": ["broadcast"],
+          "volatile": []
+        },
+        "deep_link": {
+          "signal_types": ["screenshot", "logcat", "dumpsys_activity"],
+          "template_intents": ["open_deep_link"],
+          "volatile": ["screenshot"]
+        },
+        "exported_provider": {
+          "signal_types": ["logcat", "content_provider_query", "app_data_snapshot"],
+          "template_intents": ["query_provider"],
+          "volatile": []
+        }
+      }
+    }
+  },
+  "signal_type_metadata": {
+    "screenshot": { "volatile": true },
+    "toast": { "volatile": true },
+    "logcat": { "volatile": false },
+    "dumpsys_activity": { "volatile": false },
+    "dumpsys_package": { "volatile": false },
+    "dumpsys_window": { "volatile": false },
+    "window_stack": { "volatile": false },
+    "app_data_snapshot": { "volatile": false },
+    "content_provider_query": { "volatile": false },
+    "notification_list": { "volatile": false },
+    "clipboard_snapshot": { "volatile": false },
+    "network_capture": { "volatile": false, "stub": true }
+  }
+}

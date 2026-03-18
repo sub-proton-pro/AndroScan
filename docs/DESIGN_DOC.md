@@ -329,6 +329,13 @@ Skills use a two-tier model: **pipeline** (orchestration only: extract_manifest,
 - **Tests:** Unit tests (dossier build, extraction parsing, LLM output parsing); integration test (extraction → dossier → mock LLM → report). **Who runs tests:** Developers run locally (e.g. `pytest`); CI runs the same suite on every push/PR. **How:** Pytest from repo root; no live Ollama in CI (mocks/fixtures only).
 - Docs: Update `STATE.md`, `TASKS.md`, schema docs as needed.
 
+### Phase 5 — Exploit verification
+
+- **Workflow order:** Analysis → Hypotheses → **Exploit verification** → Report generation. Report is produced only after verification so it can include verified/unverified status and artifact refs.
+- **Exploit verification step:** Use emulator + ADB: device selection (adb devices -l; user chooses if multiple), emulator check (getprop ro.kernel.qemu), app installed (pm path); build exploit command from template catalog (or RAG later); capture signals (volatile in parallel, then non-volatile; network_capture stub); run command; LLM verifies success from before/after signals.
+- **Artifacts:** `apps/<app_id>/<run_ts>/exploit_verification/<vuln_module>/` (e.g. exported_components) with before/after screenshots, logcat, commands, and verification result. Each vuln module has its own subfolder.
+- **Skills (exploit tier):** app_env_check, build_exploit_command, capture_signals, run_exploit_command, verify_exploit_result. Vuln–skill–signal_profile matrix (JSON) defines which signal types each module captures.
+
 ---
 
 ## 9. Risks and mitigations

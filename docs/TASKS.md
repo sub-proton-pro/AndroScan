@@ -30,72 +30,76 @@ Do not start multiple unrelated tasks at once unless explicitly instructed.
 ## Active Task
 
 ### Task ID
-phase-4-harden-extend
+phase-5-exploit-verification
 
 ### Title
-Phase 4: Harden and extend
+Phase 5: Exploit verification
 
 ### Objective
-Add CI so pytest runs on every push/PR; improve error handling and user-facing messages where needed; keep STATE.md and TASKS.md current.
+Verify that reported vulnerabilities are actually exploitable on an emulator: device selection, app env check, build/run exploit commands, capture signals (volatile then non-volatile), LLM verification; then generate report after verification.
 
 ### Why this task matters
-Phase 3 vertical slice is complete. This task ensures tests are run in CI, failures are caught early, and behaviour is documented.
+Phase 3 delivers hypotheses; Phase 5 adds evidence that each finding can be triggered on a live device (emulator + ADB). Report is generated only after exploit verification so it reflects verified/unverified status.
 
-### In scope
-- CI workflow (e.g. GitHub Actions or similar) that runs `pytest` on every push/PR. No live Ollama or real APK required (mocks/fixtures only).
-- Error handling and user-facing messages for extraction and Ollama failures (per DESIGN_DOC §9 and AC (Ollama)); validate and fail cleanly where appropriate.
-- Config and timeouts already in place; document or tweak as needed.
-- STATE.md and TASKS.md updated (done as part of Phase 3 closure).
+### Scope
+- **Workflow order:** Analysis → Hypotheses → Exploit verification → Report generation (report after verification).
+- **Exploit tier:** Skills used during exploit verification (e.g. `tier="exploit"`) separate from analysis LLM skills.
+- **Skills:** app_env_check (device selection, emulator check, app installed), build_exploit_command (template catalog; RAG stub), capture_signals (volatile parallel then non-volatile; network_capture stub), run_exploit_command, verify_exploit_result (LLM).
+- **Artifacts:** `apps/<app_id>/<run_ts>/exploit_verification/<vuln_module>/` (e.g. exported_components) with before/after signals, commands, screenshots.
+- **Vuln–skill–signal_profile:** Single JSON file (modules, profiles, signal_type_metadata with volatile/stub) to drive which signals each module captures.
 
-### Out of scope
-- New vulnerability modules.
+### Out of scope (for Phase 5)
+- Phase 4 (CI, hardening) — parked.
+- RAG (LanceDB) for exploit templates — later task or backlog; build_exploit_command uses in-code catalog until then.
 - Integration test with fixture APK (remains in backlog).
 
-### Affected layers/modules
-- CI config (e.g. .github/workflows/)
-- llm (client error messages), skills/extraction (clear failure messages)
-- docs (STATE.md, TASKS.md)
+### Phase 5 implementation plan (one task at a time)
 
-### Expected deliverables
-- CI runs pytest on push/PR; all 54+ tests pass without live Ollama.
-- Clear errors for Ollama unreachable, extraction failures, timeouts.
-- Docs reflect Phase 4 completion when done.
-
-### Completion conditions
-- Tests pass locally and in CI.
-- STATE.md and TASKS.md updated when Phase 4 is complete.
-
-### Phase 4 implementation plan (order of work)
-
-Execute in this order; each step is a logical sub-task that can be verified before moving on.
+Execute in order; each step is a single-focus task verified before moving on.
 
 **Sub-task status:**
 
-| # | Sub-task | Status |
-|---|----------|--------|
-| 1 | CI: pytest on push/PR | Pending |
-| 2 | Error handling / user messages | Pending |
+| # | Task | Status |
+|---|------|--------|
+| 1 | Docs: park Phase 4, add Phase 5 active with this list | Done |
+| 2 | Vuln–skill–signal_profile JSON | Done |
+| 3 | Exploit skill tier | Pending |
+| 4 | app_env_check skill | Pending |
+| 5 | build_exploit_command skill | Pending |
+| 6 | capture_signals skill | Pending |
+| 7 | run_exploit_command skill | Pending |
+| 8 | verify_exploit_result skill | Pending |
+| 9 | Exploit verification orchestration | Pending |
+| 10 | Report after verification | Pending |
 
-1. **CI: pytest on push/PR** — [ ] Pending
-   - Add workflow (e.g. GitHub Actions) that installs deps and runs `pytest` from repo root. No Ollama, no real APK; use existing mocks/fixtures.
-   - Ensure all tests pass in CI environment.
-
-2. **Error handling / user messages** — [ ] Pending
-   - Review DESIGN_DOC §9 and Ollama AC: clear message when Ollama unreachable, friendly message on 404/timeout. Extraction: validate and fail with clear message for malformed APK or missing apktool/jadx if needed.
-   - Add or adjust tests for error paths where valuable.
+| # | Task | Deliverable | Depends on |
+|---|------|-------------|------------|
+| 1 | **Docs** | Park Phase 4; add Phase 5 as active with this task list; update STATE.md | — |
+| 2 | **Vuln–skill–signal_profile JSON** | Single JSON file (modules, profiles, signal_type_metadata with volatile/stub) | — |
+| 3 | **Exploit skill tier** | Add tier="exploit" to contract and registry; list by tier | — |
+| 4 | **app_env_check skill** | Skill: adb devices -l, getprop ro.kernel.qemu, pm path; device selection | 3 |
+| 5 | **build_exploit_command skill** | In-code template catalog; resolve hypothesis + dossier → command; RAG stub | 2, 3 |
+| 6 | **capture_signals skill** | Volatile (parallel) then non-volatile; read JSON; network_capture stub | 2, 3 |
+| 7 | **run_exploit_command skill** | adb -s shell; return success, stdout, stderr | 3 |
+| 8 | **verify_exploit_result skill** | LLM call with before/after signals; return verified + reasoning | 3 |
+| 9 | **Exploit verification orchestration** | Workflow: after validated hypotheses, run exploit steps; write under exploit_verification/<module>/ | 4–8 |
+| 10 | **Report after verification** | generate_report accepts verification results; report.json includes verified flag / artifact refs | 9 |
 
 ---
 
 ## Priority Queue
 
 ### P1
-- (Phase 4 is now the active task; queue cleared for next pick.)
+- Next: Task 3 (Exploit skill tier).
 
 ---
 
 ## Blocked Tasks
 
-Use this section for tasks that should not be started yet.
+### Phase 4: Harden and extend
+- blocked by: decision to park Phase 5 first.
+- why blocked: Parked; unblock when ready.
+- unblock condition: Resume Phase 4 when exploit verification work is paused or complete.
 
 Format:
 

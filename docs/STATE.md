@@ -10,7 +10,7 @@ This file should be updated whenever a task materially changes what exists, what
 
 ## Summary
 
-Current status: **Phase 3 (first vertical slice) complete.** Real extraction (apktool), real Ollama client, real prompts and skills catalog, evidence_ref validation, and run artifacts are in place. One real APK produces a dossier and report with evidence-backed hypotheses. Phase 4 (harden and extend, CI) is next.
+Current status: **Phase 3 (first vertical slice) complete.** Real extraction (apktool), real Ollama client, real prompts and skills catalog, evidence_ref validation, and run artifacts are in place. Phase 4 (harden and extend, CI) is parked. Phase 5 (exploit verification) is next: verify findings on emulator + ADB, then generate report.
 
 ---
 
@@ -36,7 +36,8 @@ Current status: **Phase 3 (first vertical slice) complete.** Real extraction (ap
 - Modules: `exported_components` workflow is wired; task dispatch supports multiple --task values; first module is the only one implemented.
 
 ### Not yet implemented
-- Phase 4: CI (pytest on every push/PR), additional hardening and error handling.
+- Phase 4: CI (pytest on every push/PR), additional hardening and error handling — parked.
+- Phase 5: Exploit verification — device selection, app_env_check, exploit command build/run, capture_signals (volatile then non-volatile; network_capture stub), verify_exploit_result (LLM), report generated after verification; artifacts under exploit_verification/<vuln_module>/.
 - Integration test with fixture APK (extraction + dossier shape) — parked in backlog.
 
 ---
@@ -103,7 +104,7 @@ No known blockers at this time.
 
 ## Next expected milestone
 
-Phase 4: Harden and extend — CI runs pytest on every push/PR; error handling and config; STATE.md and TASKS.md kept current.
+Phase 5: Exploit verification — emulator + ADB checks, signal capture (volatile then non-volatile), report generated after verification; STATE.md and TASKS.md kept current.
 
 ---
 
