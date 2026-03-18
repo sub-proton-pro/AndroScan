@@ -96,10 +96,11 @@ def test_list_skills_by_tier():
 
 
 def test_list_exploit_skills():
-    """list_exploit_skills returns only tier=exploit (e.g. app_env_check)."""
+    """list_exploit_skills returns only tier=exploit (e.g. app_env_check, build_exploit_command)."""
     skills = list_exploit_skills()
     assert isinstance(skills, list)
     assert any(m.name == "app_env_check" for m in skills)
+    assert any(m.name == "build_exploit_command" for m in skills)
     for meta in skills:
         assert meta.tier == "exploit"
 
@@ -206,3 +207,132 @@ public class Main {
     body2 = _extract_method_bodies(source, "helper")
     assert "helper" in body2
     assert _extract_method_bodies(source, "nonexistent") == ""
+
+
+# --- build_exploit_command ---
+
+_MINIMAL_DOSSIER = {
+    "apk_info": {"package": "com.example.app"},
+    "exported_activities": [{"name": "com.example.app.SecretActivity", "exported": True, "intent_filters": []}],
+    "exported_services": [],
+    "exported_receivers": [],
+    "exported_providers": [{"name": "com.example.app.Provider", "exported": True, "authority": "com.example.app.provider"}],
+    "deep_links": [
+        {"component": "com.example.app.MainActivity", "scheme": "https", "host": "example.com", "path_prefix": "/open", "intent_filter_index": 0}
+    ],
+}
+
+
+def test_build_exploit_command_missing_hypothesis(tmp_path):
+    """build_exploit_command returns failure when hypothesis is missing."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict=_MINIMAL_DOSSIER)
+    result = execute("build_exploit_command", {"dossier_dict": _MINIMAL_DOSSIER, "vuln_module": "exported_components"}, ctx)
+    assert result.success is False
+    assert "[build_exploit_command]" in result.text
+    assert "hypothesis" in result.text.lower()
+
+
+def test_build_exploit_command_missing_dossier(tmp_path):
+    """build_exploit_command returns failure when dossier_dict is missing."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict=None)
+    result = execute(
+        "build_exploit_command",
+        {"hypothesis": {"evidence_refs": ["exported_activities[0]"]}, "vuln_module": "exported_components"},
+        ctx,
+    )
+    assert result.success is False
+    assert "dossier" in result.text.lower()
+
+
+def test_build_exploit_command_missing_vuln_module(tmp_path):
+    """build_exploit_command returns failure when vuln_module is missing."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict=_MINIMAL_DOSSIER)
+    result = execute(
+        "build_exploit_command",
+        {"hypothesis": {"evidence_refs": ["exported_activities[0]"]}, "dossier_dict": _MINIMAL_DOSSIER},
+        ctx,
+    )
+    assert result.success is False
+    assert "vuln_module" in result.text.lower()
+
+
+def test_build_exploit_command_empty_evidence_refs(tmp_path):
+    """build_exploit_command returns failure when evidence_refs is empty."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict=_MINIMAL_DOSSIER)
+    result = execute(
+        "build_exploit_command",
+        {"hypothesis": {"evidence_refs": []}, "dossier_dict": _MINIMAL_DOSSIER, "vuln_module": "exported_components"},
+        ctx,
+    )
+    assert result.success is False
+    assert "evidence_refs" in result.text
+
+
+def test_build_exploit_command_activity_success(tmp_path):
+    """build_exploit_command builds launch_activity command for exported_activities[0]."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict=_MINIMAL_DOSSIER)
+    result = execute(
+        "build_exploit_command",
+        {
+            "hypothesis": {"evidence_refs": ["exported_activities[0]"], "component_type": "activity"},
+            "dossier_dict": _MINIMAL_DOSSIER,
+            "vuln_module": "exported_components",
+        },
+        ctx,
+    )
+    assert result.success is True
+    assert result.data is not None
+    assert result.data["template_id"] == "launch_activity"
+    assert result.data["profile"] == "exported_activity"
+    assert "am start -n com.example.app/com.example.app.SecretActivity" == result.data["command"]
+    assert result.log_summary is not None
+    assert "Exploit command built" in result.log_summary
+    assert "launch_activity" in result.log_summary
+    assert result.spinner_text == "Building exploit command..."
+
+
+def test_build_exploit_command_uses_context_dossier(tmp_path):
+    """build_exploit_command uses context.dossier_dict when dossier_dict not in params."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict=_MINIMAL_DOSSIER)
+    result = execute(
+        "build_exploit_command",
+        {"hypothesis": {"evidence_refs": ["exported_activities[0]"]}, "vuln_module": "exported_components"},
+        ctx,
+    )
+    assert result.success is True
+    assert result.data["command"] == "am start -n com.example.app/com.example.app.SecretActivity"
+
+
+def test_build_exploit_command_provider_success(tmp_path):
+    """build_exploit_command builds query_provider command for exported_providers[0]."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict=_MINIMAL_DOSSIER)
+    result = execute(
+        "build_exploit_command",
+        {"hypothesis": {"evidence_refs": ["exported_providers[0]"]}, "dossier_dict": _MINIMAL_DOSSIER, "vuln_module": "exported_components"},
+        ctx,
+    )
+    assert result.success is True
+    assert result.data["template_id"] == "query_provider"
+    assert "content read --uri content://com.example.app.provider/" in result.data["command"]
+
+
+def test_build_exploit_command_deep_link_success(tmp_path):
+    """build_exploit_command builds open_deep_link command for deep_links[0]."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, dossier_dict=_MINIMAL_DOSSIER)
+    result = execute(
+        "build_exploit_command",
+        {"hypothesis": {"evidence_refs": ["deep_links[0]"]}, "dossier_dict": _MINIMAL_DOSSIER, "vuln_module": "exported_components"},
+        ctx,
+    )
+    assert result.success is True
+    assert result.data["template_id"] == "open_deep_link"
+    assert "android.intent.action.VIEW" in result.data["command"]
+    assert "https://example.com/open" in result.data["command"]

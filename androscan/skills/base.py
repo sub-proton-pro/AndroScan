@@ -29,8 +29,14 @@ class SkillContext:
 
 @dataclass
 class SkillResult:
-    """Result of executing a skill: success, structured data, human/LLM-readable text."""
+    """Result of executing a skill: success, structured data, human/LLM-readable text.
+
+    For exploit-tier skills, optional log_summary and spinner_text are used by
+    orchestration to write a short line to run.log and to drive spinner/UI text.
+    """
 
     success: bool
     data: Any = None  # skill-specific structured output
     text: str = ""   # human/LLM-readable summary
+    log_summary: Optional[str] = None  # short line for run.log (exploit steps)
+    spinner_text: Optional[str] = None  # spinner/UI label (exploit steps)

@@ -164,6 +164,10 @@ If a task requires a new dependency direction, document and justify it.
 
 Any code that depends on an **external tool** (e.g. apktool, jadx) **must check that the tool is available** before use (e.g. `shutil.which(cmd)` or equivalent). If the tool is missing, the code must return a clear result (e.g. `SkillResult` with `success=False` or a clear message in `text`/`data`) and must **not** raise a raw subprocess or OS error. This applies to skills and any other callers that invoke such tools. The goal is safe behavior in CI and on agents where the tool may not be installed.
 
+### Exploit verification step logging
+
+Exploit-tier skills that are part of the verification workflow should set **`log_summary`** and **`spinner_text`** on `SkillResult` so orchestration can write a short line to run.log and drive spinner/UI text (e.g. "Exploit command built: launch_activity for exported_activities[0]", "Building exploit command..."). See `docs/TASKS.md` Phase 5 scope and SkillResult in `androscan/skills/base.py`.
+
 ---
 
 ## 5. Modularity rules

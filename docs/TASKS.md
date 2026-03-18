@@ -47,6 +47,7 @@ Phase 3 delivers hypotheses; Phase 5 adds evidence that each finding can be trig
 - **Skills:** app_env_check (device selection, emulator check, app installed), build_exploit_command (template catalog; RAG stub), capture_signals (volatile parallel then non-volatile; network_capture stub), run_exploit_command, verify_exploit_result (LLM).
 - **Artifacts:** `apps/<app_id>/<run_ts>/exploit_verification/<vuln_module>/` (e.g. exported_components) with before/after signals, commands, screenshots.
 - **Vuln–skill–signal_profile:** Single JSON file (modules, profiles, signal_type_metadata with volatile/stub) to drive which signals each module captures.
+- **Run.log and spinner:** Each exploit verification step must emit a short line to run.log and relevant spinner text. Exploit-tier skills return optional `log_summary` and `spinner_text` on SkillResult; orchestration writes them via RunLogger (e.g. task_update(spinner_text), info(log_summary)).
 
 ### Out of scope (for Phase 5)
 - Phase 4 (CI, hardening) — parked.
@@ -65,7 +66,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 | 2 | Vuln–skill–signal_profile JSON | Done |
 | 3 | Exploit skill tier | Done |
 | 4 | app_env_check skill | Done |
-| 5 | build_exploit_command skill | Pending |
+| 5 | build_exploit_command skill | Done |
 | 6 | capture_signals skill | Pending |
 | 7 | run_exploit_command skill | Pending |
 | 8 | verify_exploit_result skill | Pending |
@@ -90,7 +91,7 @@ Execute in order; each step is a single-focus task verified before moving on.
 ## Priority Queue
 
 ### P1
-- Next: Task 5 (build_exploit_command skill).
+- Next: Task 6 (capture_signals skill).
 
 ---
 
