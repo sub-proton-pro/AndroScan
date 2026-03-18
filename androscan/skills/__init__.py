@@ -20,6 +20,7 @@ _SKILL_MODULES = [
     "androscan.skills.get_decompiled_class",
     "androscan.skills.get_decompiled_method",
     "androscan.skills.list_classes_in_package",
+    "androscan.skills.app_env_check",
 ]
 
 

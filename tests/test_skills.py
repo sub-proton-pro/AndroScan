@@ -96,9 +96,10 @@ def test_list_skills_by_tier():
 
 
 def test_list_exploit_skills():
-    """list_exploit_skills returns only tier=exploit; none registered yet."""
+    """list_exploit_skills returns only tier=exploit (e.g. app_env_check)."""
     skills = list_exploit_skills()
     assert isinstance(skills, list)
+    assert any(m.name == "app_env_check" for m in skills)
     for meta in skills:
         assert meta.tier == "exploit"
 
@@ -143,6 +144,46 @@ def test_execute_get_decompiled_method_no_apk_or_jadx(tmp_path):
     assert "[get_decompiled_method]" in result.text
     assert result.success is False
     assert "not found" in result.text or "not available" in result.text.lower()
+
+
+def test_app_env_check_requires_package(tmp_path):
+    """app_env_check returns failure when package is missing."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, apk_path="/a.apk")
+    result = execute("app_env_check", {}, ctx)
+    assert result.success is False
+    assert "[app_env_check]" in result.text
+    assert "package" in result.text.lower()
+
+
+def test_app_env_check_no_adb(tmp_path, monkeypatch):
+    """app_env_check returns clear failure when adb is not on PATH."""
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, apk_path="/a.apk")
+    result = execute("app_env_check", {"package": "com.example.app"}, ctx)
+    assert result.success is False
+    assert "[app_env_check]" in result.text
+    assert "adb" in result.text.lower()
+
+
+def test_app_env_check_no_devices(tmp_path, monkeypatch):
+    """app_env_check returns failure with device list when no devices attached."""
+    def fake_run(cmd, *args, **kwargs):
+        class R:
+            returncode = 0
+            stdout = "List of devices attached\n\n"
+            stderr = ""
+        return R()
+    monkeypatch.setattr("subprocess.run", fake_run)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, apk_path="/a.apk")
+    result = execute("app_env_check", {"package": "com.example.app"}, ctx)
+    assert result.success is False
+    assert "[app_env_check]" in result.text
+    assert result.data is not None
+    assert result.data.get("devices") == []
+    assert result.data.get("reason") == "no_devices"
 
 
 def test_extract_method_bodies():
