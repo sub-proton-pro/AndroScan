@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 
 from androscan.internal.skill_results_cache import lookup as cache_lookup, store as cache_store
 from androscan.skills.base import SkillContext, SkillMeta, SkillResult
+from androscan.skills.get_decompiled_class import resolve_component_ref
 
 # Registry: name -> (SkillMeta, execute_fn)
 _REGISTRY: dict[str, tuple[SkillMeta, Callable[[dict, SkillContext], SkillResult]]] = {}
@@ -91,7 +92,15 @@ def run_skills(
             apk_path=context.apk_path,
         )
 
-        cache_key = _skill_cache_key(skill_name, params)
+        # For get_decompiled_class, key cache by resolved class name so per-component
+        # analysis (e.g. exported_activities[0] in different contexts) gets correct entry.
+        if skill_name == "get_decompiled_class" and "component_ref" in params and dossier_dict:
+            resolved = resolve_component_ref(dossier_dict, params.get("component_ref") or "")
+            params_for_cache = {"class_name": resolved} if resolved else params
+        else:
+            params_for_cache = params
+
+        cache_key = _skill_cache_key(skill_name, params_for_cache)
 
         # In-memory cache (same run)
         if cache_key in mem:
@@ -100,7 +109,7 @@ def run_skills(
             continue
 
         # Disk cache
-        cached = cache_lookup(run_folder_root, app_id, skill_name, params)
+        cached = cache_lookup(run_folder_root, app_id, skill_name, params_for_cache)
         if cached:
             text = "[cached from run " + cached["run_folder"] + "] " + cached["result_text"]
             results.append((skill_name, SkillResult(success=True, data=None, text=text)))
@@ -110,7 +119,7 @@ def run_skills(
         result = execute(skill_name, params, ctx)
         if result.success:
             mem[cache_key] = result.text
-            cache_store(run_folder_root, app_id, run_folder_name, skill_name, params, result.text)
+            cache_store(run_folder_root, app_id, run_folder_name, skill_name, params_for_cache, result.text)
         results.append((skill_name, result))
     return results
 

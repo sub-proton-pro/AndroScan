@@ -47,6 +47,20 @@ def _is_dossier_path(ref: str) -> bool:
     return bool(ref and "[" in ref and ref.endswith("]"))
 
 
+def resolve_component_ref(dossier_dict: dict[str, Any], component_ref: str) -> Optional[str]:
+    """Resolve component_ref to a stable class name for cache keys.
+
+    If component_ref is a dossier path (e.g. exported_activities[0]), resolve via dossier.
+    Otherwise treat as class name and return stripped, or None if empty.
+    """
+    ref = (component_ref or "").strip()
+    if not ref:
+        return None
+    if _is_dossier_path(ref):
+        return _class_name_from_ref(dossier_dict, ref)
+    return ref
+
+
 def execute(params: dict, context: SkillContext) -> SkillResult:
     """Decompile the class for the given component_ref via jadx. component_ref may be a dossier path or full class name."""
     component_ref = (params.get("component_ref") or "").strip()
