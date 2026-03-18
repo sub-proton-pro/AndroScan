@@ -416,3 +416,78 @@ def test_capture_signals_list_exploit_includes_capture_signals():
     skills = list_exploit_skills()
     names = [m.name for m in skills]
     assert "capture_signals" in names
+
+
+# --- run_exploit_command ---
+
+def test_run_exploit_command_requires_params(tmp_path):
+    """run_exploit_command returns failure when device_serial or command missing."""
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    r = execute("run_exploit_command", {}, ctx)
+    assert r.success is False
+    assert "[run_exploit_command]" in r.text
+    r2 = execute("run_exploit_command", {"device_serial": "emulator-5554"}, ctx)
+    assert r2.success is False
+    assert "command" in r2.text.lower()
+
+
+def test_run_exploit_command_no_adb(tmp_path, monkeypatch):
+    """run_exploit_command returns clear failure when adb not on PATH."""
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "run_exploit_command",
+        {"device_serial": "emulator-5554", "command": "am start -n pkg/.Main"},
+        ctx,
+    )
+    assert result.success is False
+    assert "adb" in result.text.lower()
+
+
+def test_run_exploit_command_success(tmp_path, monkeypatch):
+    """run_exploit_command runs adb shell and returns success, stdout, stderr."""
+    def fake_run(cmd, *args, capture_output=True, text=True, timeout=30, **kwargs):
+        class R:
+            returncode = 0
+            stdout = "Starting: Intent { pkg=pkg }\n"
+            stderr = ""
+        return R()
+    monkeypatch.setattr("subprocess.run", fake_run)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "run_exploit_command",
+        {"device_serial": "emulator-5554", "command": "am start -n com.example.app/.SecretActivity"},
+        ctx,
+    )
+    assert result.success is True
+    assert result.data["success"] is True
+    assert result.data["returncode"] == 0
+    assert "Starting" in result.data["stdout"]
+    assert result.log_summary is not None
+    assert "Ran exploit command" in result.log_summary
+    assert result.spinner_text == "Running exploit command..."
+
+
+def test_run_exploit_command_exit_nonzero(tmp_path, monkeypatch):
+    """run_exploit_command returns success=False when shell command exits non-zero."""
+    def fake_run(cmd, *args, capture_output=True, text=True, timeout=30, **kwargs):
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = "Error: Activity not found"
+        return R()
+    monkeypatch.setattr("subprocess.run", fake_run)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path)
+    result = execute(
+        "run_exploit_command",
+        {"device_serial": "emulator-5554", "command": "am start -n bad/.Missing"},
+        ctx,
+    )
+    assert result.success is False
+    assert result.data["success"] is False
+    assert result.data["returncode"] == 1
+    assert "Activity not found" in result.data["stderr"]
