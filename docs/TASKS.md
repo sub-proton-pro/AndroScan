@@ -30,98 +30,66 @@ Do not start multiple unrelated tasks at once unless explicitly instructed.
 ## Active Task
 
 ### Task ID
-phase-3-vertical-slice
+phase-4-harden-extend
 
 ### Title
-Phase 3: First vertical slice (exported components)
+Phase 4: Harden and extend
 
 ### Objective
-Implement real extraction (manifest, exported components, permissions, deep links), real prompts and skills catalog, multi-turn LLM with real Ollama (or mock in tests), and report/run artifacts. One real APK should produce a dossier and hypotheses with valid evidence_refs.
+Add CI so pytest runs on every push/PR; improve error handling and user-facing messages where needed; keep STATE.md and TASKS.md current.
 
 ### Why this task matters
-Phase 2 skeleton is complete. This task delivers the first end-to-end security analysis: APK → dossier → LLM → report with evidence-backed findings.
+Phase 3 vertical slice is complete. This task ensures tests are run in CI, failures are caught early, and behaviour is documented.
 
 ### In scope
-- Real manifest parsing and dossier build from APK using **apktool** (decode APK, parse AndroidManifest.xml).
-- Real prompt templates (global context, skills catalog) per DESIGN_DOC.
-- Real Ollama client (HTTP) in LLM layer; keep mock for tests.
-- At least one real skill (e.g. get_decompiled_class via **jadx**) or keep stub for MVP.
-- evidence_ref validation against dossier.
-- Write report.json and optionally observations.json, scan_meta.json, scan.log under run folder.
-- Integration test: fixture APK + mock LLM → report with expected structure and valid evidence_refs.
+- CI workflow (e.g. GitHub Actions or similar) that runs `pytest` on every push/PR. No live Ollama or real APK required (mocks/fixtures only).
+- Error handling and user-facing messages for extraction and Ollama failures (per DESIGN_DOC §9 and AC (Ollama)); validate and fail cleanly where appropriate.
+- Config and timeouts already in place; document or tweak as needed.
+- STATE.md and TASKS.md updated (done as part of Phase 3 closure).
 
 ### Out of scope
-- Phase 4 (CI, full hardening).
-- Additional vulnerability modules.
-- Full observations.json schema if not needed for MVP.
+- New vulnerability modules.
+- Integration test with fixture APK (remains in backlog).
 
 ### Affected layers/modules
-- skills (extract_manifest, prepare_dossier real implementation; optional get_decompiled_class)
-- extraction (delegates to skills; no change to API)
-- llm (real client, real prompts)
-- internal/workflow, internal/report
-- modules/exported_components (wire into workflow)
-- tests
+- CI config (e.g. .github/workflows/)
+- llm (client error messages), skills/extraction (clear failure messages)
+- docs (STATE.md, TASKS.md)
 
 ### Expected deliverables
-- Real extraction and dossier from APK.
-- Real prompts and LLM client; multi-turn with skills.
-- Report and run artifacts in run folder.
-- Integration test with fixture APK.
-- Update STATE.md and TASKS.md when done.
+- CI runs pytest on push/PR; all 54+ tests pass without live Ollama.
+- Clear errors for Ollama unreachable, extraction failures, timeouts.
+- Docs reflect Phase 4 completion when done.
 
 ### Completion conditions
-- One real APK → dossier → (multi-turn) LLM → report with hypotheses and valid evidence_refs.
-- Tests pass including new integration test.
-- STATE.md reflects Phase 3 completion.
+- Tests pass locally and in CI.
+- STATE.md and TASKS.md updated when Phase 4 is complete.
 
-### Risks / edge cases / concerns
-- Manifest parsing must handle malformed APKs; validate and fail cleanly.
-- Keep tests runnable without live Ollama (mock).
-
-### Phase 3 implementation plan (order of work)
+### Phase 4 implementation plan (order of work)
 
 Execute in this order; each step is a logical sub-task that can be verified before moving on.
 
-**Sub-task status (update as soon as each is completed):**
+**Sub-task status:**
 
 | # | Sub-task | Status |
 |---|----------|--------|
-| 1 | Real extraction (skills) | Done (fixture APK test parked) |
-| 2 | Real Ollama client | Done |
-| 3 | Real prompts and skills catalog | Done |
-| 4 | evidence_ref validation | Done |
-| 5 | Run artifacts | Done |
+| 1 | CI: pytest on push/PR | Pending |
+| 2 | Error handling / user messages | Pending |
 
-1. **Real extraction (skills)** — [x] Done (fixture APK test parked)
-   - Implement **extract_manifest** and **prepare_dossier** skills with **apktool** (decode APK, parse decoded AndroidManifest.xml); build dossier from manifest (exported activities, services, receivers, providers, permissions, deep links). Extraction layer already delegates to these skills.
-   - Integration test with fixture APK (assert dossier shape + exported component/permission): **parked**; optional for later (see Backlog).
+1. **CI: pytest on push/PR** — [ ] Pending
+   - Add workflow (e.g. GitHub Actions) that installs deps and runs `pytest` from repo root. No Ollama, no real APK; use existing mocks/fixtures.
+   - Ensure all tests pass in CI environment.
 
-2. **Real Ollama client** — [x] Done
-   - Implement HTTP client that calls Ollama API (config.ollama_base_url); keep existing `complete()` interface so workflow is unchanged.
-   - Tests continue to use a mock (patch or inject) so CI does not require live Ollama.
-
-3. **Real prompts and skills catalog** — [x] Done
-   - Implement prompt templates per DESIGN_DOC: global context (role, task), skills catalog from `list_llm_skills()` (already wired in build_prompt), and per-turn user prompt with dossier and optional prior skill results.
-   - Optionally implement at least one real LLM skill (e.g. `get_decompiled_class` via jadx) or keep stub for MVP; ensure multi-turn loop can request and consume skill results.
-
-4. **evidence_ref validation** — [x] Done
-   - In workflow or report path: for each hypothesis, validate every `evidence_ref` against the dossier (e.g. resolve path like `exported_activities[0]` to actual dossier content). Drop or flag hypotheses with invalid refs.
-
-5. **Run artifacts** — [x] Done
-   - `report.json` with validated hypotheses; `run_meta.json` (run metadata) and `run.log` (task/LLM + [ERROR]/[WARNING]/[INFORMATIONAL]; INFORMATIONAL = skills requested by LLM, skills executed, data sent to LLM after skills) per run; `observations.json` at app_id level (persistent store for LLM/tool across runs). No separate scan.log (same as run.log).
-
-**Completion check:** One real APK → real dossier → (multi-turn) LLM → report with hypotheses and valid evidence_refs; all tests pass (mock LLM in CI).
+2. **Error handling / user messages** — [ ] Pending
+   - Review DESIGN_DOC §9 and Ollama AC: clear message when Ollama unreachable, friendly message on 404/timeout. Extraction: validate and fail with clear message for malformed APK or missing apktool/jadx if needed.
+   - Add or adjust tests for error paths where valuable.
 
 ---
 
 ## Priority Queue
 
 ### P1
-1. **Phase 4: Harden and extend** (after Phase 3)
-   - goal: evidence_ref validation, error handling, config; pytest suite; CI runs tests.
-   - dependencies: Phase 3 complete.
-   - done when: Tests pass locally and in CI; STATE.md and TASKS.md updated.
+- (Phase 4 is now the active task; queue cleared for next pick.)
 
 ---
 
@@ -161,6 +129,11 @@ Use for real future work, not vague ideas.
 ---
 
 ## Completed Tasks
+
+### Phase 3: First vertical slice (exported components)
+- outcome: Real extraction (apktool), real Ollama client, real prompts and skills catalog, evidence_ref validation, run artifacts (report.json, run_meta.json, run.log, observations.json), skill results cache (get_decompiled_class keyed by resolved class name). get_decompiled_class and get_decompiled_method real via jadx. 54 tests; mock LLM in CI.
+- notes: All five sub-tasks done. Integration test with fixture APK parked in backlog.
+- follow-up: Phase 4 (harden and extend, CI).
 
 ### 2026-03-13 Phase 2: Build skeleton
 - outcome: Repo layout, pyproject.toml, CLI (androscan.py with --apk, --task multi-valued, --output), config, dossier model, extraction stub, LLM stub (client, prompt builder, parser), run folder creation, stub skills, workflow with multi-turn loop, report.json writing. 14 tests (import, config, extraction, LLM, CLI parsing, workflow integration).
