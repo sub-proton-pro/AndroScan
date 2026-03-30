@@ -8,10 +8,11 @@ from androscan.skills.base import SkillContext, SkillMeta, SkillResult
 
 SKILL_META = SkillMeta(
     name="app_env_check",
-    description="Check that an emulator/device is available, is an emulator (ro.kernel.qemu=1), and the given package is installed. Use device_serial if multiple devices; otherwise returns device list for user to choose.",
+    description="Check that an emulator/device is available, is an emulator (ro.kernel.qemu=1), and the given package is installed. Optionally checks if app is running and in foreground, and brings it to foreground. Use device_serial if multiple devices; pass run_logger for run.log and spinner.",
     params_schema={
         "package": "Android package name (e.g. com.example.app)",
         "device_serial": "Optional. ADB device serial (e.g. emulator-5554). Required when multiple devices are attached.",
+        "run_logger": "Optional. RunLogger for run.log and spinner (task_update with \\r for overwrite).",
     },
     tier="exploit",
 )
@@ -115,8 +116,56 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
             text=f"[app_env_check] Package {package!r} is not installed on {serial}. Install the APK first.",
         )
 
+    run_logger = params.get("run_logger")
+
+    # Check if app is running (pidof <package>)
+    def _log_spinner(text: str) -> None:
+        if run_logger:
+            run_logger.task_update("\r" + text)
+
+    proc = _run_adb(serial, "shell", "pidof", package)
+    pid_out = (proc.stdout or "").strip()
+    app_running = bool(pid_out and proc.returncode == 0)
+    data["app_running"] = app_running
+    if run_logger:
+        run_logger.exploit_stage(f"Checking if app is running (pidof {package}): {'running (pid(s) ' + pid_out + ')' if app_running else 'not running'}.")
+        _log_spinner("App running: yes." if app_running else "App running: no.")
+
+    # Check if app is in foreground (dumpsys activity activities: mResumedActivity or mFocusedApp)
+    in_foreground = False
+    if app_running:
+        proc = _run_adb(serial, "shell", "dumpsys", "activity", "activities", timeout=15)
+        dumpsys_out = (proc.stdout or "") if proc.returncode == 0 else ""
+        for line in dumpsys_out.splitlines():
+            if ("mResumedActivity" in line or "mFocusedApp" in line) and package in line:
+                in_foreground = True
+                break
+    data["app_in_foreground"] = in_foreground
+    if run_logger:
+        run_logger.exploit_stage(f"Checking if app is in foreground (dumpsys activity): {'yes' if in_foreground else 'no'}.")
+        _log_spinner("App in foreground: yes." if in_foreground else "App in foreground: no.")
+
+    # If not in foreground, bring to foreground (monkey -p package -c LAUNCHER 1)
+    brought_to_foreground = False
+    if app_running and not in_foreground:
+        if run_logger:
+            run_logger.exploit_stage("Bringing app to foreground (monkey -c LAUNCHER 1)...")
+            _log_spinner("Bringing app to foreground...")
+        proc = _run_adb(serial, "shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1", timeout=10)
+        brought_to_foreground = proc.returncode == 0
+        data["brought_to_foreground"] = brought_to_foreground
+        if run_logger:
+            run_logger.exploit_stage(f"Bring to foreground: {'success' if brought_to_foreground else 'failed (exit ' + str(proc.returncode) + ')'}.")
+            _log_spinner("Foreground: done." if brought_to_foreground else "Foreground: failed.")
+    else:
+        data["brought_to_foreground"] = False
+
+    if run_logger:
+        _log_spinner("App env check OK.")
+
     return SkillResult(
         success=True,
         data=data,
-        text=f"[app_env_check] OK: {serial} (emulator), {package} installed.",
+        text=f"[app_env_check] OK: {serial} (emulator), {package} installed."
+        + (f" App running: {app_running}, in foreground: {in_foreground}, brought_to_foreground: {brought_to_foreground}" if run_logger else ""),
     )

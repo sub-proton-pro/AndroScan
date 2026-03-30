@@ -27,8 +27,9 @@ class RunLogger:
         self._ui_sink = ui_sink or _default_ui_sink
 
     def task_update(self, message: str) -> None:
-        """Current task (e.g. for spinner line). Always written to run.log."""
-        line = f"[task] {message}"
+        """Current task (e.g. for spinner line). Always written to run.log. Message may start with \\r for UI overwrite; \\r is stripped in run.log."""
+        clean = message.replace("\r", "")
+        line = f"[task] {clean}"
         self._append_log(line)
         self._ui_sink("task", message)
 
@@ -65,6 +66,11 @@ class RunLogger:
         """Log informational message. Written to run.log with [INFORMATIONAL] prefix."""
         self._append_log(f"[INFORMATIONAL] {message}")
         self._ui_sink("info", message)
+
+    def exploit_stage(self, message: str) -> None:
+        """Log during exploit verification (no [INFORMATIONAL] tag). Written to run.log as [exploit_verification] only."""
+        self._append_log(f"[exploit_verification] {message}")
+        self._ui_sink("exploit_stage", message)
 
     def component_findings(
         self,

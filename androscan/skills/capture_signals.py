@@ -46,9 +46,9 @@ def _capture_logcat(serial: str, _package: str, _context: SkillContext) -> str:
 
 
 def _capture_dumpsys_activity(serial: str, _package: str, _context: SkillContext) -> str:
-    proc = _run_adb(serial, "shell", "dumpsys", "activity")
+    proc = _run_adb(serial, "shell", "dumpsys", "activity", "top", timeout=20)
     if proc.returncode != 0:
-        return f"[dumpsys activity failed: exit {proc.returncode}]"
+        return f"[dumpsys activity top failed: exit {proc.returncode}]"
     return (proc.stdout or "")[-100000:]
 
 

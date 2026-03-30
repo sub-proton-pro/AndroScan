@@ -232,6 +232,76 @@ def test_app_env_check_no_devices(tmp_path, monkeypatch):
     assert result.data.get("reason") == "no_devices"
 
 
+def test_app_env_check_with_run_logger_and_foreground_check(tmp_path, monkeypatch):
+    """app_env_check with run_logger runs pidof/foreground checks and writes to run.log; data has app_running, app_in_foreground."""
+    from androscan.internal.run_log import RunLogger
+
+    call_count = [0]
+
+    def fake_run(cmd, *args, **kwargs):
+        call_count[0] += 1
+        # devices, getprop, pm path, pidof, dumpsys (optional monkey)
+        if "devices" in cmd:
+            class R:
+                returncode = 0
+                stdout = "List of devices attached\nemulator-5554\tdevice\n"
+                stderr = ""
+            return R()
+        if "getprop" in cmd:
+            class R:
+                returncode = 0
+                stdout = "1"
+                stderr = ""
+            return R()
+        if "pm" in cmd and "path" in cmd:
+            class R:
+                returncode = 0
+                stdout = "package:/data/app/com.example.app/base.apk"
+                stderr = ""
+            return R()
+        if "pidof" in cmd:
+            class R:
+                returncode = 0
+                stdout = "12345"
+                stderr = ""
+            return R()
+        if "dumpsys" in cmd:
+            class R:
+                returncode = 0
+                stdout = "mResumedActivity: ActivityRecord{com.example.app/.MainActivity}"
+                stderr = ""
+            return R()
+        if "monkey" in cmd:
+            class R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return R()
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    run_logger = RunLogger(tmp_path)
+    config = Config.default()
+    ctx = SkillContext(config=config, run_folder=tmp_path, apk_path="/a.apk")
+    result = execute(
+        "app_env_check",
+        {"package": "com.example.app", "device_serial": "emulator-5554", "run_logger": run_logger},
+        ctx,
+    )
+    assert result.success is True
+    assert result.data.get("app_running") is True
+    assert result.data.get("app_in_foreground") is True
+    assert result.data.get("brought_to_foreground") is False
+    log_content = (tmp_path / "run.log").read_text()
+    assert "[exploit_verification]" in log_content
+    assert "Checking if app is running" in log_content
+    assert "in foreground" in log_content
+
+
 def test_extract_method_bodies():
     """_extract_method_bodies extracts method signature + body from Java-like source."""
     from androscan.skills.get_decompiled_method import _extract_method_bodies

@@ -31,9 +31,11 @@ from androscan.internal.app_meta import extracted_apk_path, save_app_meta
 from androscan.internal.resolve_app_id import resolve_app_id
 from androscan.internal.run_folder import create_run_folder, run_folder_display_path
 from androscan.internal.run_log import RunLogger
+from androscan.internal.exploit_verification import run_exploit_verification
 from androscan.internal.workflow import run_workflow
 from androscan.llm import is_ollama_available
 from androscan.llm.client import OLLAMA_SETUP_TIP
+from androscan.llm.parser import Hypothesis
 
 
 def _section(title: str, rule: Optional[str] = None) -> None:
@@ -91,6 +93,44 @@ def _component_name_from_ref(dossier: Any, ref: str) -> Optional[str]:
     return None
 
 
+def _find_latest_report(app_id_root: Path) -> Optional[dict]:
+    """Find the most recent report.json in the app's run folders (sorted by name descending)."""
+    if not app_id_root.is_dir():
+        return None
+    candidates = sorted(
+        [d for d in app_id_root.iterdir() if d.is_dir() and (d / "report.json").exists()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    for run_dir in candidates:
+        rpt = run_dir / "report.json"
+        try:
+            data = json.loads(rpt.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("hypotheses"):
+                return data
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
+
+
+def _report_hypotheses_to_objects(report_data: dict) -> list:
+    """Convert hypotheses dicts from report.json to Hypothesis dataclass instances."""
+    out = []
+    for h in report_data.get("hypotheses") or []:
+        out.append(Hypothesis(
+            id=h.get("id", ""),
+            component_type=h.get("component_type", ""),
+            component_name=h.get("component_name", ""),
+            title=h.get("title", ""),
+            description=h.get("description", ""),
+            evidence_refs=list(h.get("evidence_refs") or []),
+            exploitability=h.get("exploitability", 1),
+            confidence=h.get("confidence", 0),
+            remediation_hint=h.get("remediation_hint", ""),
+        ))
+    return out
+
+
 def main() -> int:
     sigterm = getattr(signal, "SIGTERM", None)
     if sigterm is not None:
@@ -130,6 +170,12 @@ def _run() -> int:
         default=None,
         metavar="FILE",
         help="Path to global_config.yaml (default: cwd or config/global_config.yaml)",
+    )
+    parser.add_argument(
+        "--exploit_verification_test",
+        action="store_true",
+        default=False,
+        help="Skip LLM analysis; load hypotheses from the most recent report.json and run exploit verification only.",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -200,6 +246,101 @@ def _run() -> int:
         shutil.rmtree(temp_extraction, ignore_errors=True)
         if apk_hash:
             save_app_meta(app_id_root, apk_hash, dossier.to_dict(), apk_path)
+
+    # --exploit_verification_test: skip LLM, load hypotheses from latest report.json
+    if args.exploit_verification_test:
+        app_id_root = run_folder.parent
+        report_data = _find_latest_report(app_id_root)
+        if not report_data:
+            print(
+                bright_red(f"Error: no report.json with hypotheses found under {app_id_root}"),
+                file=sys.stderr,
+            )
+            print(grey("Run a full analysis first so that a report.json exists."), file=sys.stderr)
+            return 1
+        loaded_hyps = _report_hypotheses_to_objects(report_data)
+        if not loaded_hyps:
+            print(bright_red("Error: report.json contains no hypotheses."), file=sys.stderr)
+            return 1
+        print(green(f"  Loaded {len(loaded_hyps)} hypothesis(es) from latest report.json"))
+        print()
+        _section("Exploit Verification Test", config.section_rule)
+        vuln_module = tasks[0]
+
+        def _cli_sink_test(kind: str, payload: object) -> None:
+            if kind == "task":
+                _spinner_ref_test.update(str(payload))
+            elif kind == "error":
+                pause_active()
+                print(orange("[ERROR] " + str(payload)), file=sys.stderr)
+                resume_active()
+
+        run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink_test)
+        from androscan.skills import SkillContext, execute as execute_skill
+
+        ctx = SkillContext(config=config, run_folder=run_folder, dossier_dict=dossier.to_dict(), apk_path=apk_path)
+        with spinner("Exploit verification test...", done_message="Exploit verification test complete.") as _spinner_ref_test:
+            try:
+                verification_results = run_exploit_verification(
+                    loaded_hyps, dossier.to_dict(), run_folder, vuln_module, ctx, run_logger
+                )
+            except Exception as e:
+                run_logger.error(f"Exploit verification test failed: {e}")
+                print(f"Error: exploit verification test failed: {e}", file=sys.stderr)
+                return 1
+
+        report_params = {
+            "hypotheses": [
+                {
+                    "id": h.id,
+                    "component_type": h.component_type,
+                    "component_name": h.component_name,
+                    "title": h.title,
+                    "description": h.description,
+                    "evidence_refs": h.evidence_refs,
+                    "exploitability": h.exploitability,
+                    "confidence": h.confidence,
+                    "remediation_hint": h.remediation_hint,
+                }
+                for h in loaded_hyps
+            ],
+            "summary": "",
+            "verification_results": verification_results,
+        }
+        execute_skill("generate_report", report_params, ctx)
+
+        report_path = run_folder / "report.json"
+        report_data_new = None
+        if report_path.exists():
+            try:
+                report_data_new = json.loads(report_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+        package = dossier.apk_info.package
+        run_elapsed = datetime.now() - run_start
+        total_sec = max(0, run_elapsed.total_seconds())
+        hours = int(total_sec // 3600)
+        minutes = int((total_sec % 3600) // 60)
+        seconds = int(total_sec % 60)
+        duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        section_rule = config.section_rule or constants.SECTION_RULE
+        print(section_rule)
+        print("[*] Exploit verification test summary")
+        print(section_rule)
+        print(f"  Duration:  {duration_str}")
+        if report_data_new and report_data_new.get("hypotheses"):
+            for i, h in enumerate(report_data_new["hypotheses"], 1):
+                title = h.get("title", "(no title)")
+                verified = h.get("verified")
+                v_label = green("VERIFIED") if verified else (bright_red("NOT VERIFIED") if verified is False else grey("N/A"))
+                print(f"  {i}. {v_label} {title}")
+                reasoning = (h.get("verification_reasoning") or "").strip()
+                if reasoning:
+                    print(f"     Reasoning: {reasoning}")
+        print(f"\n  Full report:  {report_path}")
+        display_output = run_folder_display_path(run_folder)
+        print(f"  Output:       {display_output}")
+        return 0
 
     base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
     if not is_ollama_available(base_url):
