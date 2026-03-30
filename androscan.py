@@ -92,10 +92,10 @@ def _component_name_from_ref(dossier: Any, ref: str) -> Optional[str]:
     return None
 
 
-def _find_latest_hypotheses(app_id_root: Path) -> Optional[list]:
-    """Find the most recent hypotheses.json (pre-verification LLM output) in the app's run folders."""
+def _find_latest_hypotheses(app_id_root: Path) -> tuple[Optional[list], Optional[str]]:
+    """Find the most recent hypotheses.json in the app's run folders. Returns (data, run_folder_name)."""
     if not app_id_root.is_dir():
-        return None
+        return None, None
     candidates = sorted(
         [d for d in app_id_root.iterdir() if d.is_dir() and (d / "hypotheses.json").exists()],
         key=lambda d: d.name,
@@ -106,10 +106,10 @@ def _find_latest_hypotheses(app_id_root: Path) -> Optional[list]:
         try:
             data = json.loads(hp.read_text(encoding="utf-8"))
             if isinstance(data, list) and data:
-                return data
+                return data, run_dir.name
         except (json.JSONDecodeError, OSError):
             continue
-    return None
+    return None, None
 
 
 def _hypotheses_dicts_to_objects(hyp_list: list) -> list:
@@ -256,7 +256,7 @@ def _run() -> int:
     loaded_hyps: Optional[list] = None
     if ev_test_mode:
         app_id_root = run_folder.parent
-        hyp_list = _find_latest_hypotheses(app_id_root)
+        hyp_list, source_run = _find_latest_hypotheses(app_id_root)
         if not hyp_list:
             print(
                 bright_red(f"Error: no hypotheses.json found under {app_id_root}"),
@@ -268,7 +268,7 @@ def _run() -> int:
         if not loaded_hyps:
             print(bright_red("Error: hypotheses.json contains no valid hypotheses."), file=sys.stderr)
             return 1
-        print(green(f"  Loaded {len(loaded_hyps)} hypothesis(es) from latest hypotheses.json"))
+        print(green(f"  Loaded {len(loaded_hyps)} hypothesis(es) from run {source_run}"))
         print()
 
     base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
