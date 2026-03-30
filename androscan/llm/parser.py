@@ -16,6 +16,7 @@ class Hypothesis:
     exploitability: int
     confidence: int
     remediation_hint: str
+    exploit_params: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -55,6 +56,8 @@ def parse_response(raw: str) -> LLMResponse:
         try:
             # LLM often returns finding title in "name" when "title" is absent (use as fallback)
             title_val = h.get("title") or h.get("name") or ""
+            raw_ep = h.get("exploit_params")
+            exploit_params = raw_ep if isinstance(raw_ep, dict) else None
             out.hypotheses.append(
                 Hypothesis(
                     id=str(h.get("id", "")),
@@ -66,6 +69,7 @@ def parse_response(raw: str) -> LLMResponse:
                     exploitability=int(h.get("exploitability", 1)),
                     confidence=int(h.get("confidence", 1)),
                     remediation_hint=str(h.get("remediation_hint", "")),
+                    exploit_params=exploit_params,
                 )
             )
         except (TypeError, ValueError):

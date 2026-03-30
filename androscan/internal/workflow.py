@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 def _hypothesis_to_dict(h: Hypothesis) -> dict:
     """Serialize Hypothesis for consolidation prompt."""
-    return {
+    d: dict = {
         "id": h.id,
         "component_type": h.component_type,
         "component_name": h.component_name,
@@ -41,6 +41,9 @@ def _hypothesis_to_dict(h: Hypothesis) -> dict:
         "confidence": h.confidence,
         "remediation_hint": h.remediation_hint or "",
     }
+    if h.exploit_params:
+        d["exploit_params"] = h.exploit_params
+    return d
 
 
 def consolidate_hypotheses(
@@ -258,6 +261,7 @@ def run_workflow(
                                 exploitability=h.exploitability,
                                 confidence=h.confidence,
                                 remediation_hint=h.remediation_hint,
+                                exploit_params=h.exploit_params,
                             )
                             component_hyps.append(rewritten)
                             all_hypotheses.append(rewritten)
@@ -343,6 +347,7 @@ def run_workflow(
                         exploitability=h.exploitability,
                         confidence=h.confidence,
                         remediation_hint=h.remediation_hint,
+                        exploit_params=h.exploit_params,
                     )
                 )
         if run_logger and len(validated) < len(hypotheses):
@@ -351,20 +356,9 @@ def run_workflow(
         # Write hypotheses.json so --exploit_verification_test can reload it later
         hypotheses_path = run_folder / "hypotheses.json"
         try:
-            hypotheses_path.write_text(json.dumps([
-                {
-                    "id": h.id,
-                    "component_type": h.component_type,
-                    "component_name": h.component_name,
-                    "title": h.title,
-                    "description": h.description,
-                    "evidence_refs": h.evidence_refs,
-                    "exploitability": h.exploitability,
-                    "confidence": h.confidence,
-                    "remediation_hint": h.remediation_hint,
-                }
-                for h in validated
-            ], indent=2), encoding="utf-8")
+            hypotheses_path.write_text(json.dumps(
+                [_hypothesis_to_dict(h) for h in validated], indent=2,
+            ), encoding="utf-8")
         except OSError as e:
             if run_logger:
                 run_logger.warning(f"Failed to write hypotheses.json: {e}")
@@ -382,20 +376,7 @@ def run_workflow(
 
     summary = getattr(resp, "summary", None) or "" if resp else ""
     report_params = {
-        "hypotheses": [
-            {
-                "id": h.id,
-                "component_type": h.component_type,
-                "component_name": h.component_name,
-                "title": h.title,
-                "description": h.description,
-                "evidence_refs": h.evidence_refs,
-                "exploitability": h.exploitability,
-                "confidence": h.confidence,
-                "remediation_hint": h.remediation_hint,
-            }
-            for h in validated
-        ],
+        "hypotheses": [_hypothesis_to_dict(h) for h in validated],
         "summary": summary,
         "verification_results": verification_results,
     }

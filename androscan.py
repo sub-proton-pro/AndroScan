@@ -118,6 +118,7 @@ def _hypotheses_dicts_to_objects(hyp_list: list) -> list:
     for h in hyp_list:
         if not isinstance(h, dict):
             continue
+        raw_ep = h.get("exploit_params")
         out.append(Hypothesis(
             id=h.get("id", ""),
             component_type=h.get("component_type", ""),
@@ -128,6 +129,7 @@ def _hypotheses_dicts_to_objects(hyp_list: list) -> list:
             exploitability=h.get("exploitability", 1),
             confidence=h.get("confidence", 0),
             remediation_hint=h.get("remediation_hint", ""),
+            exploit_params=raw_ep if isinstance(raw_ep, dict) else None,
         ))
     return out
 

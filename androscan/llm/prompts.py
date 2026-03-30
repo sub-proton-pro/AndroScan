@@ -60,6 +60,7 @@ def build_component_prompt(
     parts = [
         f"Analyse this single exported component ({component_type}: {component_label}).",
         "Produce hypotheses with evidence_refs, or request skills if you need more data. Output valid JSON only; exploitability and confidence are integers 1-5.",
+        "Include exploit_params when the component needs specific intent extras, actions, or data URIs to trigger the vulnerability.",
         "",
         "## Dossier (single component, JSON)",
         json.dumps(slice_dict, indent=2),
@@ -90,7 +91,18 @@ def build_system_content() -> str:
         "How to request skills: Include in your response: skill_requests: [{ \"skill\": \"<name>\", \"params\": {...} }]. "
         "The tool will run them and re-prompt you with the results. When you have enough evidence, omit skill_requests and return hypotheses only. "
         "Always return valid JSON with optional 'skill_requests' and/or 'hypotheses'. "
-        "Use evidence_refs as dossier paths (e.g. exported_activities[0]). exploitability and confidence are integers 1-5."
+        "Use evidence_refs as dossier paths (e.g. exported_activities[0]). exploitability and confidence are integers 1-5.\n"
+        "\n"
+        "For each hypothesis, include an optional \"exploit_params\" object describing how to trigger the component. "
+        "This is used to build an ADB exploit command. The object may contain:\n"
+        "  - \"action\": intent action string (e.g. \"com.example.TRANSFER\")\n"
+        "  - \"category\": intent category string\n"
+        "  - \"data_uri\": data URI string for the intent\n"
+        "  - \"flags\": array of intent flag strings (e.g. [\"FLAG_ACTIVITY_NEW_TASK\"])\n"
+        "  - \"extras\": array of {\"key\": string, \"type\": \"string\"|\"int\"|\"long\"|\"float\"|\"bool\"|\"uri\", \"test_value\": ...}\n"
+        "  - \"grant_uri_permissions\": boolean\n"
+        "Only include exploit_params when the component requires specific parameters (actions, extras, data URIs) to trigger the vulnerability. "
+        "Omit it for components that can be exploited with a bare launch/start command."
     )
 
 
@@ -103,6 +115,7 @@ def build_prompt(
     parts = [
         "Here is the dossier" + (" and prior skill results below." if prior_skill_results else "."),
         "Produce hypotheses with evidence_refs, or request skills if you need more data. Output valid JSON only; exploitability and confidence are integers 1-5.",
+        "Include exploit_params when the component needs specific intent extras, actions, or data URIs to trigger the vulnerability.",
         "",
         "## Dossier (JSON)",
         json.dumps(dossier_dict, indent=2),
@@ -136,7 +149,7 @@ def build_consolidation_prompt(hypotheses: list[dict[str, Any]]) -> str:
         "2. For merged findings: write one clear title and one clear description that captures the issue.",
         "3. Keep evidence_refs, exploitability (1-5), and confidence (1-5). Use the highest exploitability when merging.",
         "4. Return valid JSON only, with a single key \"hypotheses\" and an array of finding objects.",
-        "5. Each object must have: id, component_type, component_name, title, description, evidence_refs (array of strings), exploitability, confidence, remediation_hint.",
+        "5. Each object must have: id, component_type, component_name, title, description, evidence_refs (array of strings), exploitability, confidence, remediation_hint. Preserve exploit_params if present.",
         "",
         "## Findings (JSON)",
         json.dumps(hypotheses, indent=2),
@@ -152,5 +165,5 @@ def build_consolidation_system_content() -> str:
         "You are a security report editor. Merge duplicate or overlapping findings into a single, clear finding. "
         "Return only valid JSON with key \"hypotheses\" and an array of objects. "
         "Each object: id (string), component_type, component_name, title, description, evidence_refs (array of strings), "
-        "exploitability (integer 1-5), confidence (integer 1-5), remediation_hint (string)."
+        "exploitability (integer 1-5), confidence (integer 1-5), remediation_hint (string). Preserve exploit_params if present."
     )
