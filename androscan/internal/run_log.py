@@ -67,6 +67,14 @@ class RunLogger:
         self._append_log(f"[INFORMATIONAL] {message}")
         self._ui_sink("info", message)
 
+    def exploit_header(self) -> None:
+        """Emit a section header for the exploit verification stage."""
+        self._append_log("")
+        self._append_log("=" * 60)
+        self._append_log("[*] Exploit Verification")
+        self._append_log("=" * 60)
+        self._ui_sink("exploit_header", None)
+
     def exploit_stage(self, message: str) -> None:
         """Log during exploit verification (no [INFORMATIONAL] tag). Written to run.log as [exploit_verification] only."""
         self._append_log(f"[exploit_verification] {message}")

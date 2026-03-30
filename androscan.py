@@ -297,6 +297,14 @@ def _run() -> int:
             pause_active()
             print(orange("[ERROR] " + str(payload)), file=sys.stderr)
             resume_active()
+        elif kind == "exploit_header":
+            pause_active()
+            section_rule = config.section_rule or constants.SECTION_RULE
+            print()
+            print(section_rule)
+            print("[*] Exploit Verification")
+            print(section_rule)
+            resume_active()
         elif kind == "exploit_stage":
             pause_active()
             print(blue(f"  [exploit] {payload}"))
