@@ -93,30 +93,32 @@ def _component_name_from_ref(dossier: Any, ref: str) -> Optional[str]:
     return None
 
 
-def _find_latest_report(app_id_root: Path) -> Optional[dict]:
-    """Find the most recent report.json in the app's run folders (sorted by name descending)."""
+def _find_latest_hypotheses(app_id_root: Path) -> Optional[list]:
+    """Find the most recent hypotheses.json (pre-verification LLM output) in the app's run folders."""
     if not app_id_root.is_dir():
         return None
     candidates = sorted(
-        [d for d in app_id_root.iterdir() if d.is_dir() and (d / "report.json").exists()],
+        [d for d in app_id_root.iterdir() if d.is_dir() and (d / "hypotheses.json").exists()],
         key=lambda d: d.name,
         reverse=True,
     )
     for run_dir in candidates:
-        rpt = run_dir / "report.json"
+        hp = run_dir / "hypotheses.json"
         try:
-            data = json.loads(rpt.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data.get("hypotheses"):
+            data = json.loads(hp.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
                 return data
         except (json.JSONDecodeError, OSError):
             continue
     return None
 
 
-def _report_hypotheses_to_objects(report_data: dict) -> list:
-    """Convert hypotheses dicts from report.json to Hypothesis dataclass instances."""
+def _hypotheses_dicts_to_objects(hyp_list: list) -> list:
+    """Convert hypothesis dicts from hypotheses.json to Hypothesis dataclass instances."""
     out = []
-    for h in report_data.get("hypotheses") or []:
+    for h in hyp_list:
+        if not isinstance(h, dict):
+            continue
         out.append(Hypothesis(
             id=h.get("id", ""),
             component_type=h.get("component_type", ""),
@@ -247,22 +249,22 @@ def _run() -> int:
         if apk_hash:
             save_app_meta(app_id_root, apk_hash, dossier.to_dict(), apk_path)
 
-    # --exploit_verification_test: skip LLM, load hypotheses from latest report.json
+    # --exploit_verification_test: skip LLM, load hypotheses from latest hypotheses.json
     if args.exploit_verification_test:
         app_id_root = run_folder.parent
-        report_data = _find_latest_report(app_id_root)
-        if not report_data:
+        hyp_list = _find_latest_hypotheses(app_id_root)
+        if not hyp_list:
             print(
-                bright_red(f"Error: no report.json with hypotheses found under {app_id_root}"),
+                bright_red(f"Error: no hypotheses.json found under {app_id_root}"),
                 file=sys.stderr,
             )
-            print(grey("Run a full analysis first so that a report.json exists."), file=sys.stderr)
+            print(grey("Run a full analysis first so that a hypotheses.json is generated."), file=sys.stderr)
             return 1
-        loaded_hyps = _report_hypotheses_to_objects(report_data)
+        loaded_hyps = _hypotheses_dicts_to_objects(hyp_list)
         if not loaded_hyps:
-            print(bright_red("Error: report.json contains no hypotheses."), file=sys.stderr)
+            print(bright_red("Error: hypotheses.json contains no valid hypotheses."), file=sys.stderr)
             return 1
-        print(green(f"  Loaded {len(loaded_hyps)} hypothesis(es) from latest report.json"))
+        print(green(f"  Loaded {len(loaded_hyps)} hypothesis(es) from latest hypotheses.json"))
         print()
         _section("Exploit Verification Test", config.section_rule)
         vuln_module = tasks[0]

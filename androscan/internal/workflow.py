@@ -1,5 +1,6 @@
 """Orchestration: pipeline skills -> dossier -> LLM (multi-turn) -> report skill."""
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
@@ -299,6 +300,26 @@ def run_workflow(
             )
     if run_logger and len(validated) < len(hypotheses):
         run_logger.warning(f"Dropped {len(hypotheses) - len(validated)} hypotheses with no valid evidence_refs after resolution")
+
+    # Write hypotheses.json (pure LLM output, before verification) so --exploit_verification_test can reload it
+    hypotheses_path = run_folder / "hypotheses.json"
+    try:
+        hypotheses_path.write_text(json.dumps([
+            {
+                "id": h.id,
+                "component_type": h.component_type,
+                "component_name": h.component_name,
+                "title": h.title,
+                "description": h.description,
+                "evidence_refs": h.evidence_refs,
+                "exploitability": h.exploitability,
+                "confidence": h.confidence,
+                "remediation_hint": h.remediation_hint,
+            }
+            for h in validated
+        ], indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
     # Exploit verification (Phase 5): run per-hypothesis steps, write under exploit_verification/<module>/
     verification_results: list = []
