@@ -128,14 +128,18 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
             data=data,
             text="[app_env_check] Device is not an emulator (ro.kernel.qemu != 1). Use an emulator for exploit verification.",
         )
+
+    run_logger = params.get("run_logger")
+    if run_logger:
+        run_logger.task_update(f"Emulated device found: {serial}")
+        run_logger.exploit_stage(f"Emulated device found: {serial}")
+
     if not app_installed:
         return SkillResult(
             success=False,
             data=data,
             text=f"[app_env_check] Package {package!r} is not installed on {serial}. Install the APK first.",
         )
-
-    run_logger = params.get("run_logger")
 
     # Check if app is running (pidof <package>)
     def _log_spinner(text: str) -> None:
