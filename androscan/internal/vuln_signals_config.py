@@ -17,8 +17,13 @@ def load_vuln_module_skills_signals() -> dict[str, Any]:
     if not _CONFIG_PATH.exists():
         _cached = {"modules": {}, "signal_type_metadata": {}}
         return _cached
-    with open(_CONFIG_PATH, encoding="utf-8") as f:
-        _cached = json.load(f)
+    try:
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
+            _cached = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        import sys
+        print(f"Warning: failed to load {_CONFIG_PATH}: {e}", file=sys.stderr)
+        _cached = {"modules": {}, "signal_type_metadata": {}}
     return _cached
 
 

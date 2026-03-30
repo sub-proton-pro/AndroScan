@@ -29,14 +29,14 @@ Do not start multiple unrelated tasks at once unless explicitly instructed.
 
 ## Active Task
 
-None. Phase 5 is complete. Pick from Priority Queue or Backlog.
+None. Phase 4 partial (error handling + docs cleanup) complete. CI remains parked. Pick from Priority Queue or Backlog.
 
 ---
 
 ## Priority Queue
 
 ### P1
-- Unpark Phase 4 (CI, hardening).
+- Phase 4 CI: pytest on every push/PR (remains parked).
 - Implement `content_provider_query` and `app_data_snapshot` signal captures for `exported_provider` profile (currently stub).
 - Add second vulnerability module.
 
@@ -49,10 +49,10 @@ None. Phase 5 is complete. Pick from Priority Queue or Backlog.
 
 ## Blocked Tasks
 
-### Phase 4: Harden and extend
+### Phase 4: CI setup
 - blocked by: prioritization decision.
-- why blocked: Parked during Phase 5; now unblocked. Ready to pick up.
-- unblock condition: Unblocked (Phase 5 complete).
+- why blocked: Error handling and docs cleanup done; CI (pytest on push/PR) remains parked.
+- unblock condition: Decision to prioritize CI setup.
 
 Format:
 
@@ -86,6 +86,11 @@ Use for real future work, not vague ideas.
 ---
 
 ## Completed Tasks
+
+### 2026-03-30 Phase 4 partial: Error handling + docs cleanup
+- outcome: Broader error handling across config, LLM client, ADB skills, workflow, and CLI. Config: explicit --config fails on missing/invalid file; type coercion with clear errors. LLM: resp.json() wrapped; empty content retried; non-404 HTTP errors show body detail; is_ollama_available returns diagnostic detail. ADB: TimeoutExpired caught in all subprocess calls (app_env_check, run_exploit_command, capture_signals). Workflow: generate_report result checked; disk errors on meta/observations caught; LLM parse failures logged. CLI: top-level exception handler; report read warnings. Misc: skills registry import errors logged; vuln_signals_config corrupted JSON caught; cache store disk errors caught; generate_report disk errors handled. Docs: DESIGN_DOC, ARCHITECTURE, DECISIONS, PROJECT_BRIEF, README, KNOWN_ISSUES, AI_ENGINEERING_CONSTITUTION updated for Phase 5, three-tier skills, and stale references fixed.
+- notes: CI (pytest on push/PR) remains parked.
+- follow-up: CI setup; provider signal stubs; second vulnerability module.
 
 ### 2026-03-30 Phase 5: Exploit verification
 - outcome: Exploit verification on emulator + ADB. 5 exploit-tier skills (app_env_check, build_exploit_command, capture_signals, run_exploit_command, verify_exploit_result). Template catalog for 5 component profiles (exported_activity, exported_service, exported_receiver, exported_provider, deep_link). Vuln–skill–signal profile JSON. Before/after signal capture (volatile then non-volatile). LLM-based verification. Report generated after verification with verified flag, reasoning, and artifact refs. Artifacts per hypothesis under exploit_verification/<module>/<hyp_id>/. All 10 sub-tasks complete.

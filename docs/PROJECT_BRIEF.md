@@ -2,7 +2,7 @@
 
 ## Project name
 
-[Replace with actual project name]
+AndroScan
 
 Example working name: Modular Mobile Security Analysis Platform
 
@@ -97,6 +97,7 @@ Examples of future capabilities may include:
 - evidence collection and normalization
 - report generation in different formats
 - LLM-assisted interpretation or summarization
+- optional exploit verification on an emulator (ADB) with verified vs. unverified status reflected in reports
 - policy-based filtering or severity handling
 - auditability and provenance of results
 
@@ -168,10 +169,7 @@ The project is successful when:
 
 ## Current phase
 
-[Replace with actual current phase]
-
-Suggested example:
-- Phase: platform bootstrap + first feature implementation
+Phase 5 (exploit verification) complete; Phase 4 (CI, hardening) unparked.
 
 ---
 

@@ -64,7 +64,7 @@ Maintain and update when relevant:
 - ARCHITECTURE.md
 - SAFETY_AND_SECURITY.md
 - TEST_STRATEGY.md
-- ADRs in docs/adr/
+- decision log in `docs/DECISIONS.md`
 - feature specs / acceptance criteria
 
 ## 8. Definition of done

@@ -105,18 +105,22 @@ def test_complete_raises_friendly_message_on_404():
 
 
 def test_is_ollama_available_true_when_200():
-    """is_ollama_available returns True when GET /api/tags returns 200."""
+    """is_ollama_available returns (True, '') when GET /api/tags returns 200."""
     from androscan.llm.client import is_ollama_available
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     with patch("androscan.llm.client.requests.get", return_value=mock_resp):
-        assert is_ollama_available("http://localhost:11434") is True
+        ok, detail = is_ollama_available("http://localhost:11434")
+        assert ok is True
+        assert detail == ""
 
 
 def test_is_ollama_available_false_on_connection_error():
-    """is_ollama_available returns False on connection error."""
+    """is_ollama_available returns (False, detail) on connection error."""
     from androscan.llm.client import is_ollama_available
 
     with patch("androscan.llm.client.requests.get", side_effect=requests.ConnectionError):
-        assert is_ollama_available("http://localhost:11434") is False
+        ok, detail = is_ollama_available("http://localhost:11434")
+        assert ok is False
+        assert "Connection refused" in detail

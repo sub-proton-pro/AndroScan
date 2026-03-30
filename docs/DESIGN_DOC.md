@@ -8,7 +8,7 @@ Its purpose is to capture:
 - repository structure and module boundaries
 - component dossier and LLM input/output schemas
 - prompt design and skills-based analysis flow
-- implementation roadmap (Phases 1–4)
+- implementation roadmap (Phases 1–5)
 - risks and mitigations
 - the first end-to-end vertical slice
 
@@ -62,6 +62,7 @@ APK path (CLI)
   → [Dossier] build structured component dossier (+ decompiled snippets when needed)
   → [LLM] multi-turn: dossier + global context (skills) → LLM → optional skill_requests → run skills → re-prompt
   → [Reasoning] LLM returns exploit hypotheses (exploitability/confidence 1–5, evidence_refs)
+  → [Exploit verification] emulator + ADB; orchestration runs exploit-tier skills per hypothesis (not advertised in the LLM catalog)
   → [Report] normalize to shared finding model → write under apps/<app_id>/<run_ts>/
 ```
 
@@ -106,7 +107,7 @@ AndroScan/
       __init__.py
       # Orchestration, domain, finding model
       report/                  # Report generation (writes to apps/<app_id>/<run_ts>/)
-    skills/                    # First-class skills layer: pipeline + LLM-requestable skills
+    skills/                    # First-class skills layer: pipeline + llm + exploit tiers
       base.py                  # SkillMeta, SkillContext, SkillResult
       extract_manifest.py      # pipeline
       prepare_dossier.py        # pipeline
@@ -114,6 +115,11 @@ AndroScan/
       get_decompiled_class.py   # llm
       get_decompiled_method.py  # llm
       list_classes_in_package.py # llm
+      app_env_check.py         # exploit
+      build_exploit_command.py # exploit
+      capture_signals.py       # exploit
+      run_exploit_command.py   # exploit
+      verify_exploit_result.py # exploit
     extraction/                # APK unpack, manifest (delegates to skills)
     llm/                       # Ollama, prompts, schema, multi-turn
     modules/                   # Vulnerability check modules
@@ -264,7 +270,7 @@ Response is JSON with two optional top-level keys:
 
 ## 7. Prompt design and skills
 
-Skills use a two-tier model: **pipeline** (orchestration only: extract_manifest, prepare_dossier, generate_report) and **llm** (advertised in the prompt: get_decompiled_class, get_decompiled_method, list_classes_in_package). The prompt builder uses the registry’s `list_llm_skills()` for the catalog.
+Skills use a three-tier model: **pipeline** (orchestration only: extract_manifest, prepare_dossier, generate_report), **llm** (advertised in the prompt: get_decompiled_class, get_decompiled_method, list_classes_in_package), and **exploit** (orchestration during Phase 5: app_env_check, build_exploit_command, capture_signals, run_exploit_command, verify_exploit_result). **Exploit-tier skills are not included in the LLM prompt catalog**; only `list_llm_skills()` feeds the catalog.
 
 ### 7.1 Global context (provided every turn)
 
@@ -319,7 +325,7 @@ Skills use a two-tier model: **pipeline** (orchestration only: extract_manifest,
 
 4. **evidence_ref validation** — Validate each hypothesis’s evidence_refs against dossier paths; drop or flag invalid refs before writing report.
 
-5. **Run artifacts** — Write report.json with validated hypotheses; add optionally observations.json, scan_meta.json, scan.log under run folder.
+5. **Run artifacts** — Write report.json with validated hypotheses; add optionally observations.json, run_meta.json, run.log under run folder.
 
 **Acceptance:** One real APK → dossier → multi-turn LLM → report with 1–5 hypotheses and valid evidence_refs; all tests pass with mock LLM in CI.
 
@@ -333,7 +339,7 @@ Skills use a two-tier model: **pipeline** (orchestration only: extract_manifest,
 
 - **Workflow order:** Analysis → Hypotheses → **Exploit verification** → Report generation. Report is produced only after verification so it can include verified/unverified status and artifact refs.
 - **Exploit verification step:** Use emulator + ADB: device selection (adb devices -l; user chooses if multiple), emulator check (getprop ro.kernel.qemu), app installed (pm path); build exploit command from template catalog (or RAG later); capture signals (volatile in parallel, then non-volatile; network_capture stub); run command; LLM verifies success from before/after signals.
-- **Artifacts:** `apps/<app_id>/<run_ts>/exploit_verification/<vuln_module>/` (e.g. exported_components) with before/after screenshots, logcat, commands, and verification result. Each vuln module has its own subfolder.
+- **Artifacts:** `apps/<app_id>/<run_ts>/exploit_verification/<vuln_module>/<hyp_id>/` (e.g. exported_components) with before/after screenshots, logcat, commands, and verification result. Each vuln module has its own subfolder; each hypothesis has a per-hypothesis directory.
 - **Skills (exploit tier):** app_env_check, build_exploit_command, capture_signals, run_exploit_command, verify_exploit_result. Vuln–skill–signal_profile matrix (JSON) defines which signal types each module captures.
 
 ---
@@ -363,7 +369,7 @@ Skills use a two-tier model: **pipeline** (orchestration only: extract_manifest,
 2. Extraction: unpack APK; parse manifest; build dossier (exported activities, services, receivers, providers, deep links, permissions).
 3. LLM: Send dossier + global context (skills). Multi-turn: if LLM returns skill_requests, run skills (e.g. get_decompiled_class), append results, re-prompt until hypotheses are returned or max turns.
 4. Validate hypotheses (evidence_refs, 1–5 exploitability/confidence); normalize to finding model.
-5. Write report and run artifacts (observations.json, scan.log, scan_meta.json, report.json) under `apps/<app_id>/<run_ts>/`.
+5. Write report and run artifacts (observations.json, run.log, run_meta.json, report.json) under `apps/<app_id>/<run_ts>/`.
 6. Tests: Integration test with fixture APK and mock LLM response; assert report contains expected finding shape and valid evidence_refs.
 
 ---

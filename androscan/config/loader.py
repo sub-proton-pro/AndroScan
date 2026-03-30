@@ -5,6 +5,7 @@ Env vars override file. Pass config file path via --config or use default search
 """
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -55,16 +56,44 @@ class Config:
         return self.section_rule_char * self.section_rule_length
 
 
-def _load_yaml(path: Path) -> dict[str, Any]:
-    """Load YAML file; return empty dict if missing or invalid."""
+def _load_yaml(path: Path, explicit: bool = False) -> dict[str, Any]:
+    """Load YAML file; return empty dict if missing (auto-discovered) or raise if explicit and broken."""
     if not path.exists():
+        if explicit:
+            raise FileNotFoundError(f"Config file not found: {path}")
         return {}
     try:
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return data if isinstance(data, dict) else {}
-    except (yaml.YAMLError, OSError):
+    except yaml.YAMLError as e:
+        if explicit:
+            raise ValueError(f"Invalid YAML in config file {path}: {e}") from e
         return {}
+    except OSError as e:
+        if explicit:
+            raise OSError(f"Cannot read config file {path}: {e}") from e
+        return {}
+
+
+def _safe_int(value: Any, default: int, name: str) -> int:
+    """Coerce value to int with a clear error on failure."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        raise ValueError(f"Config key '{name}' must be an integer, got: {value!r}") from None
+
+
+def _safe_float(value: Any, default: float, name: str) -> float:
+    """Coerce value to float with a clear error on failure."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        raise ValueError(f"Config key '{name}' must be a number, got: {value!r}") from None
 
 
 def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
@@ -75,18 +104,18 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     workflow = config_dict.get("workflow") or {}
     output = config_dict.get("output") or {}
     out["ollama_base_url"] = (ollama.get("base_url") or "").strip().rstrip("/") or "http://localhost:11434"
-    out["ollama_timeout_sec"] = int(ollama.get("timeout_sec", 150)) if ollama.get("timeout_sec") is not None else 150
+    out["ollama_timeout_sec"] = _safe_int(ollama.get("timeout_sec"), 150, "ollama.timeout_sec")
     out["ollama_model"] = ollama.get("model") or "qwen3.5:35b"
-    out["ollama_temperature"] = float(ollama.get("temperature", 0.2)) if ollama.get("temperature") is not None else 0.2
-    out["ollama_num_predict"] = int(ollama.get("num_predict", constants.OLLAMA_NUM_PREDICT_DEFAULT)) if ollama.get("num_predict") is not None else constants.OLLAMA_NUM_PREDICT_DEFAULT
+    out["ollama_temperature"] = _safe_float(ollama.get("temperature"), 0.2, "ollama.temperature")
+    out["ollama_num_predict"] = _safe_int(ollama.get("num_predict"), constants.OLLAMA_NUM_PREDICT_DEFAULT, "ollama.num_predict")
     out["run_folder_root"] = paths.get("run_folder_root") or "apps"
-    out["max_turns"] = workflow.get("max_turns") if workflow.get("max_turns") is not None else constants.MAX_TURNS_DEFAULT
-    out["max_hypotheses_per_report"] = workflow.get("max_hypotheses_per_report") or constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT
+    out["max_turns"] = _safe_int(workflow.get("max_turns"), constants.MAX_TURNS_DEFAULT, "workflow.max_turns")
+    out["max_hypotheses_per_report"] = _safe_int(workflow.get("max_hypotheses_per_report"), constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT, "workflow.max_hypotheses_per_report")
     out["per_component_analysis"] = bool(workflow.get("per_component_analysis") if workflow.get("per_component_analysis") is not None else constants.PER_COMPONENT_ANALYSIS_DEFAULT)
     out["apktool_cmd"] = paths.get("apktool_cmd") or constants.APKTOOL_CMD_DEFAULT
     out["jadx_cmd"] = paths.get("jadx_cmd") or constants.JADX_CMD_DEFAULT
     out["section_rule_char"] = output.get("section_rule_char") or constants.SECTION_RULE_CHAR
-    out["section_rule_length"] = int(output.get("section_rule_length", constants.SECTION_RULE_LENGTH))
+    out["section_rule_length"] = _safe_int(output.get("section_rule_length"), constants.SECTION_RULE_LENGTH, "output.section_rule_length")
     return out
 
 
@@ -102,7 +131,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
     yaml_data: dict[str, Any] = {}
 
     if config_path:
-        yaml_data = _load_yaml(Path(config_path))
+        yaml_data = _load_yaml(Path(config_path), explicit=True)
     else:
         cwd = Path.cwd()
         for candidate in [cwd / "global_config.yaml", cwd / "config" / "global_config.yaml"]:
@@ -119,7 +148,10 @@ def load_config(config_path: Optional[str] = None) -> Config:
         try:
             merged["ollama_timeout_sec"] = max(1, int(os.environ["ANDROSCAN_OLLAMA_TIMEOUT"]))
         except ValueError:
-            pass
+            print(
+                f"Warning: ANDROSCAN_OLLAMA_TIMEOUT={os.environ['ANDROSCAN_OLLAMA_TIMEOUT']!r} is not a valid integer; using default.",
+                file=sys.stderr,
+            )
     if os.environ.get("ANDROSCAN_RUN_FOLDER"):
         merged["run_folder_root"] = os.environ["ANDROSCAN_RUN_FOLDER"]
 

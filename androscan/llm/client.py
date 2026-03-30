@@ -19,15 +19,22 @@ class CompleteResult:
     metadata: dict[str, Any]
 
 
-def is_ollama_available(base_url: str, timeout: int = 5) -> bool:
-    """Return True if Ollama is reachable at base_url (GET /api/tags). Use short timeout for pre-flight."""
+def is_ollama_available(base_url: str, timeout: int = 5) -> tuple[bool, str]:
+    """Check if Ollama is reachable at base_url (GET /api/tags).
+
+    Returns (ok, detail) where detail is empty on success or a diagnostic message on failure.
+    """
     url = (base_url or "").strip().rstrip("/") or "http://localhost:11434"
     tags_url = f"{url}/api/tags"
     try:
         resp = requests.get(tags_url, timeout=timeout)
-        return resp.status_code == 200
-    except (requests.ConnectionError, requests.Timeout):
-        return False
+        if resp.status_code == 200:
+            return True, ""
+        return False, f"HTTP {resp.status_code} from {tags_url}"
+    except requests.ConnectionError:
+        return False, f"Connection refused at {url}"
+    except requests.Timeout:
+        return False, f"Timeout connecting to {url}"
 
 
 def _build_messages(system_content: Optional[str], user_content: str) -> list[dict[str, Any]]:
@@ -56,7 +63,18 @@ def _parse_http_error(e: requests.HTTPError, base_url: str, payload: dict) -> No
             f"Ollama API endpoint not found at {base_url}. "
             f"Ensure Ollama is running and the URL is correct (e.g. http://localhost:11434). {OLLAMA_SETUP_TIP}"
         ) from None
-    raise RuntimeError(f"Ollama API error: {e}. {OLLAMA_SETUP_TIP}") from e
+    status = e.response.status_code if e.response is not None else "unknown"
+    detail = ""
+    if e.response is not None:
+        try:
+            body = e.response.json()
+            detail = (body.get("error") or "").strip()
+        except Exception:
+            detail = (e.response.text or "")[:200].strip()
+    msg = f"Ollama API error (HTTP {status})"
+    if detail:
+        msg += f": {detail}"
+    raise RuntimeError(f"{msg}. {OLLAMA_SETUP_TIP}") from e
 
 
 def _do_request(
@@ -72,7 +90,14 @@ def _do_request(
         return _stream_request(url, payload, timeout, on_token, on_thinking)
     resp = requests.post(url, json=payload, timeout=timeout)
     resp.raise_for_status()
-    data = resp.json()
+    try:
+        data = resp.json()
+    except (ValueError, json.JSONDecodeError):
+        body_preview = (resp.text or "")[:300]
+        raise RuntimeError(
+            f"Ollama returned non-JSON response (HTTP {resp.status_code}). "
+            f"Body preview: {body_preview!r}"
+        ) from None
     msg = data.get("message") or {}
     content = (msg.get("content") or "").strip()
     thinking = (msg.get("thinking") or "").strip()
@@ -190,7 +215,7 @@ def complete(
         done_reason = result.metadata.get("done_reason")
         content = result.content
         truncated = done_reason == "length"
-        empty_content = not content and done_reason != "stop"
+        empty_content = not content
         if truncated or empty_content:
             if num_predict_idx + 1 < len(OLLAMA_NUM_PREDICT_TIERS):
                 next_np = OLLAMA_NUM_PREDICT_TIERS[num_predict_idx + 1]

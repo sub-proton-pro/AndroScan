@@ -31,7 +31,6 @@ from androscan.internal.app_meta import extracted_apk_path, save_app_meta
 from androscan.internal.resolve_app_id import resolve_app_id
 from androscan.internal.run_folder import create_run_folder, run_folder_display_path
 from androscan.internal.run_log import RunLogger
-from androscan.internal.exploit_verification import run_exploit_verification
 from androscan.internal.workflow import run_workflow
 from androscan.llm import is_ollama_available
 from androscan.llm.client import OLLAMA_SETUP_TIP
@@ -146,6 +145,9 @@ def main() -> int:
     except ShutdownRequested:
         print("Shutdown requested.", file=sys.stderr)
         return 143
+    except Exception as e:
+        print(f"Internal error: {e}", file=sys.stderr)
+        return 1
 
 
 def _run() -> int:
@@ -249,8 +251,10 @@ def _run() -> int:
         if apk_hash:
             save_app_meta(app_id_root, apk_hash, dossier.to_dict(), apk_path)
 
-    # --exploit_verification_test: skip LLM, load hypotheses from latest hypotheses.json
-    if args.exploit_verification_test:
+    # --exploit_verification_test: load hypotheses from latest run, then use unified workflow
+    ev_test_mode = args.exploit_verification_test
+    loaded_hyps: Optional[list] = None
+    if ev_test_mode:
         app_id_root = run_folder.parent
         hyp_list = _find_latest_hypotheses(app_id_root)
         if not hyp_list:
@@ -266,91 +270,17 @@ def _run() -> int:
             return 1
         print(green(f"  Loaded {len(loaded_hyps)} hypothesis(es) from latest hypotheses.json"))
         print()
-        _section("Exploit Verification Test", config.section_rule)
-        vuln_module = tasks[0]
-
-        def _cli_sink_test(kind: str, payload: object) -> None:
-            if kind == "task":
-                _spinner_ref_test.update(str(payload))
-            elif kind == "error":
-                pause_active()
-                print(orange("[ERROR] " + str(payload)), file=sys.stderr)
-                resume_active()
-
-        run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink_test)
-        from androscan.skills import SkillContext, execute as execute_skill
-
-        ctx = SkillContext(config=config, run_folder=run_folder, dossier_dict=dossier.to_dict(), apk_path=apk_path)
-        with spinner("Exploit verification test...", done_message="Exploit verification test complete.") as _spinner_ref_test:
-            try:
-                verification_results = run_exploit_verification(
-                    loaded_hyps, dossier.to_dict(), run_folder, vuln_module, ctx, run_logger
-                )
-            except Exception as e:
-                run_logger.error(f"Exploit verification test failed: {e}")
-                print(f"Error: exploit verification test failed: {e}", file=sys.stderr)
-                return 1
-
-        report_params = {
-            "hypotheses": [
-                {
-                    "id": h.id,
-                    "component_type": h.component_type,
-                    "component_name": h.component_name,
-                    "title": h.title,
-                    "description": h.description,
-                    "evidence_refs": h.evidence_refs,
-                    "exploitability": h.exploitability,
-                    "confidence": h.confidence,
-                    "remediation_hint": h.remediation_hint,
-                }
-                for h in loaded_hyps
-            ],
-            "summary": "",
-            "verification_results": verification_results,
-        }
-        execute_skill("generate_report", report_params, ctx)
-
-        report_path = run_folder / "report.json"
-        report_data_new = None
-        if report_path.exists():
-            try:
-                report_data_new = json.loads(report_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
-        package = dossier.apk_info.package
-        run_elapsed = datetime.now() - run_start
-        total_sec = max(0, run_elapsed.total_seconds())
-        hours = int(total_sec // 3600)
-        minutes = int((total_sec % 3600) // 60)
-        seconds = int(total_sec % 60)
-        duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        section_rule = config.section_rule or constants.SECTION_RULE
-        print(section_rule)
-        print("[*] Exploit verification test summary")
-        print(section_rule)
-        print(f"  Duration:  {duration_str}")
-        if report_data_new and report_data_new.get("hypotheses"):
-            for i, h in enumerate(report_data_new["hypotheses"], 1):
-                title = h.get("title", "(no title)")
-                verified = h.get("verified")
-                v_label = green("VERIFIED") if verified else (bright_red("NOT VERIFIED") if verified is False else grey("N/A"))
-                print(f"  {i}. {v_label} {title}")
-                reasoning = (h.get("verification_reasoning") or "").strip()
-                if reasoning:
-                    print(f"     Reasoning: {reasoning}")
-        print(f"\n  Full report:  {report_path}")
-        display_output = run_folder_display_path(run_folder)
-        print(f"  Output:       {display_output}")
-        return 0
 
     base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
-    if not is_ollama_available(base_url):
-        print(orange("Ollama not reachable at " + base_url + "."), file=sys.stderr)
+    ollama_ok, ollama_detail = is_ollama_available(base_url)
+    if not ollama_ok:
+        detail_suffix = f" ({ollama_detail})" if ollama_detail else ""
+        print(orange(f"Ollama not reachable at {base_url}.{detail_suffix}"), file=sys.stderr)
         print(grey(OLLAMA_SETUP_TIP), file=sys.stderr)
         return 1
 
-    _section("Analysis", config.section_rule)
+    section_title = "Exploit Verification Test" if ev_test_mode else "Analysis"
+    _section(section_title, config.section_rule)
     print(f"  Running:  {tasks_str}")
     print()
 
@@ -364,6 +294,10 @@ def _run() -> int:
         elif kind == "error":
             pause_active()
             print(orange("[ERROR] " + str(payload)), file=sys.stderr)
+            resume_active()
+        elif kind == "exploit_stage":
+            pause_active()
+            print(blue(f"  [exploit] {payload}"))
             resume_active()
         elif kind == "component_findings":
             pause_active()
@@ -384,10 +318,17 @@ def _run() -> int:
                         print()
             resume_active()
 
+    spinner_start = "Exploit verification test..." if ev_test_mode else "Analysis starting..."
+    spinner_done = "Exploit verification test complete." if ev_test_mode else "Analysis complete."
     run_logger = RunLogger(run_folder, verbosity=verbosity, ui_sink=_cli_sink)
-    with spinner("Analysis starting...", done_message="Analysis complete.") as _spinner_ref:
+    with spinner(spinner_start, done_message=spinner_done) as _spinner_ref:
         try:
-            run_workflow(apk_path, tasks, run_folder, config, run_logger=run_logger)
+            run_workflow(
+                apk_path, tasks, run_folder, config,
+                run_logger=run_logger,
+                exploit_verification_test_mode=ev_test_mode,
+                preloaded_hypotheses=loaded_hyps,
+            )
         except Exception as e:
             run_logger.error(f"Workflow failed: {e}")
             print(f"Error: workflow failed: {e}", file=sys.stderr)
@@ -398,8 +339,8 @@ def _run() -> int:
     if report_path.exists():
         try:
             report_data = json.loads(report_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            print(orange(f"Warning: could not read {report_path}: {e}"), file=sys.stderr)
 
     package = dossier.apk_info.package
     section_rule = config.section_rule or constants.SECTION_RULE
@@ -409,7 +350,8 @@ def _run() -> int:
     minutes = int((total_sec % 3600) // 60)
     seconds = int(total_sec % 60)
     duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    run_summary_lines = [section_rule, "[*] Run summary", section_rule, f"  Duration:  {duration_str}", ""]
+    summary_title = "[*] Exploit verification test summary" if ev_test_mode else "[*] Run summary"
+    run_summary_lines = [section_rule, summary_title, section_rule, f"  Duration:  {duration_str}", ""]
     run_summary_lines_display = list(run_summary_lines)
     if report_data and report_data.get("hypotheses"):
         hypotheses = report_data["hypotheses"]
@@ -444,6 +386,16 @@ def _run() -> int:
             if desc:
                 run_summary_lines.append(f"     Description: {desc}")
                 run_summary_lines_display.append(f"     Description: {desc}")
+            verified = h.get("verified")
+            if verified is not None:
+                v_label_plain = "VERIFIED" if verified else "NOT VERIFIED"
+                v_label_color = green("VERIFIED") if verified else bright_red("NOT VERIFIED")
+                run_summary_lines.append(f"     Verdict: {v_label_plain}")
+                run_summary_lines_display.append(f"     Verdict: {v_label_color}")
+                reasoning = (h.get("verification_reasoning") or "").strip()
+                if reasoning:
+                    run_summary_lines.append(f"     Reasoning: {reasoning}")
+                    run_summary_lines_display.append(f"     Reasoning: {reasoning}")
             run_summary_lines.append("")
             run_summary_lines_display.append("")
         run_summary_lines.append(f"  Full report:  {report_path}")

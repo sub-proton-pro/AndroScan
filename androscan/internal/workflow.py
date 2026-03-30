@@ -70,6 +70,10 @@ def consolidate_hypotheses(
             stream=True,
             run_logger=run_logger,
         )
+    except Exception as e:
+        if run_logger:
+            run_logger.warning(f"Consolidation LLM call failed ({e}); using original hypotheses.")
+        return hypotheses
     finally:
         if run_logger:
             run_logger.llm_busy(False)
@@ -92,13 +96,21 @@ def run_workflow(
     run_folder: Path,
     config: Optional[Config] = None,
     run_logger: Optional["RunLogger"] = None,
+    exploit_verification_test_mode: bool = False,
+    preloaded_hypotheses: Optional[List[Hypothesis]] = None,
 ) -> None:
-    """Run the analysis workflow: pipeline skills (extract_manifest, prepare_dossier), multi-turn LLM, generate_report.
+    """Run the analysis workflow.
+
+    Normal mode: pipeline skills (extract_manifest, prepare_dossier), multi-turn LLM, exploit verification, generate_report.
+    exploit_verification_test_mode: skip extraction and LLM analysis; use preloaded_hypotheses directly
+    and run exploit verification + report generation.
 
     - tasks: list of task names (e.g. ["exported_components"]); stub uses first only.
     - run_folder: path to apps/<app_id>/<run_ts>/ where artifacts are written.
     - config: optional Config; if None, load_config() is called.
     - run_logger: optional RunLogger for task updates, llm_busy, and thinking log.
+    - exploit_verification_test_mode: if True, skip extraction/LLM, use preloaded_hypotheses.
+    - preloaded_hypotheses: pre-validated hypotheses to use in test mode.
     """
     if config is None:
         config = load_config()
@@ -107,60 +119,160 @@ def run_workflow(
     ctx = SkillContext(config=config, run_folder=run_folder, apk_path=apk_path)
     app_id_root = run_folder.parent
 
-    dossier_dict = None
-    try:
-        if Path(apk_path).exists():
-            current_hash = compute_apk_sha256(apk_path)
+    # In test mode, skip extraction and LLM analysis entirely
+    if exploit_verification_test_mode and preloaded_hypotheses is not None:
+        if run_logger:
+            run_logger.task_update(f"Exploit verification test mode: {len(preloaded_hypotheses)} hypothesis(es) loaded.")
+        dossier_dict = None
+        try:
             meta = load_app_meta(app_id_root)
-            if meta and meta.get("apk_sha256") == current_hash and meta.get("dossier"):
+            if meta and meta.get("dossier"):
                 dossier_dict = meta["dossier"]
-                if run_logger:
-                    run_logger.task_update("Using cached dossier...")
-    except (OSError, TypeError):
-        pass
+        except (OSError, TypeError):
+            pass
+        if not dossier_dict:
+            from androscan.internal.resolve_app_id import resolve_app_id as _resolve
+            try:
+                _, dossier_obj, _, _ = _resolve(apk_path, config)
+                dossier_dict = dossier_obj.to_dict()
+            except Exception:
+                dossier_dict = {}
+        ctx.dossier_dict = dossier_dict
+        validated = list(preloaded_hypotheses)
+        resp = None
+    else:
+        dossier_dict = None
+        try:
+            if Path(apk_path).exists():
+                current_hash = compute_apk_sha256(apk_path)
+                meta = load_app_meta(app_id_root)
+                if meta and meta.get("apk_sha256") == current_hash and meta.get("dossier"):
+                    dossier_dict = meta["dossier"]
+                    if run_logger:
+                        run_logger.task_update("Using cached dossier...")
+        except (OSError, TypeError):
+            pass
 
-    if dossier_dict is None:
-        if run_logger:
-            run_logger.task_update("Extracting manifest...")
-        manifest_result = execute("extract_manifest", {}, ctx)
-        if not manifest_result.success:
-            raise RuntimeError(f"extract_manifest failed: {manifest_result.text}")
-        if run_logger:
-            run_logger.task_update("Building dossier...")
-        dossier_result = execute("prepare_dossier", {"manifest": manifest_result.data}, ctx)
-        if not dossier_result.success:
-            raise RuntimeError(f"prepare_dossier failed: {dossier_result.text}")
-        dossier_dict = dossier_result.data
-        if manifest_result.data.get("apk_sha256"):
-            save_app_meta(app_id_root, manifest_result.data["apk_sha256"], dossier_dict, apk_path)
-
-    ctx.dossier_dict = dossier_dict
-
-    prior_skill_results: list[str] = []
-    skill_result_memory_cache: dict[str, str] = {}
-    hypotheses: list[Hypothesis] = []
-    resp = None
-    max_turns = config.max_turns
-
-    if getattr(config, "per_component_analysis", False):
-        # Per-component: one prompt per exported component, then aggregate and consolidate (stub).
-        all_hypotheses: list[Hypothesis] = []
-        for slice_dict, component_type, label, list_key, full_index in iter_dossier_components(dossier_dict):
+        if dossier_dict is None:
             if run_logger:
-                run_logger.write_raw("\n---------- Component: " + component_type + " - " + label + " ----------\n")
-            comp_prior: list[str] = []
+                run_logger.task_update("Extracting manifest...")
+            manifest_result = execute("extract_manifest", {}, ctx)
+            if not manifest_result.success:
+                raise RuntimeError(f"extract_manifest failed: {manifest_result.text}")
+            if run_logger:
+                run_logger.task_update("Building dossier...")
+            dossier_result = execute("prepare_dossier", {"manifest": manifest_result.data}, ctx)
+            if not dossier_result.success:
+                raise RuntimeError(f"prepare_dossier failed: {dossier_result.text}")
+            dossier_dict = dossier_result.data
+            if manifest_result.data.get("apk_sha256"):
+                try:
+                    save_app_meta(app_id_root, manifest_result.data["apk_sha256"], dossier_dict, apk_path)
+                except OSError as e:
+                    if run_logger:
+                        run_logger.warning(f"Failed to save app_meta.json: {e}")
+
+        ctx.dossier_dict = dossier_dict
+
+        prior_skill_results: list[str] = []
+        skill_result_memory_cache: dict[str, str] = {}
+        hypotheses: list[Hypothesis] = []
+        resp = None
+        max_turns = config.max_turns
+
+        if getattr(config, "per_component_analysis", False):
+            # Per-component: one prompt per exported component, then aggregate and consolidate.
+            all_hypotheses: list[Hypothesis] = []
+            for slice_dict, component_type, label, list_key, full_index in iter_dossier_components(dossier_dict):
+                if run_logger:
+                    run_logger.write_raw("\n---------- Component: " + component_type + " - " + label + " ----------\n")
+                comp_prior: list[str] = []
+                turn = 0
+                comp_resp = None
+                while turn < max_turns:
+                    turn += 1
+                    prompt = build_component_prompt(
+                        slice_dict, component_type, label,
+                        comp_prior if comp_prior else None,
+                        list_llm_skills(),
+                    )
+                    if run_logger:
+                        run_logger.info("Prompt sent to LLM:\n" + prompt)
+                        run_logger.task_update(f"LLM analysing {component_type}: {label}...")
+                        run_logger.llm_busy(True)
+                    try:
+                        result = complete(
+                            prompt,
+                            config=config,
+                            system_content=build_system_content(),
+                            stream=True,
+                            run_logger=run_logger,
+                        )
+                    finally:
+                        if run_logger:
+                            run_logger.llm_busy(False)
+                    if run_logger and result.thinking:
+                        run_logger.llm_thinking(result.thinking)
+                    comp_resp = parse_response(result.content)
+
+                    if not comp_resp.skill_requests and not comp_resp.hypotheses and result.content:
+                        if run_logger:
+                            preview = result.content[:200] + "..." if len(result.content) > 200 else result.content
+                            run_logger.warning(f"LLM response could not be parsed (no skill_requests or hypotheses): {preview}")
+
+                    if comp_resp.skill_requests:
+                        if run_logger:
+                            run_logger.task_update("Running requested skills...")
+                            skill_descs = []
+                            for req in comp_resp.skill_requests:
+                                name = getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?")
+                                params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
+                                skill_descs.append(f"{name}({params})")
+                            run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
+                        results = run_skills(
+                            comp_resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
+                        )
+                        if run_logger:
+                            for name, res in results:
+                                if not res.success:
+                                    run_logger.error(f"{name}: {res.text}")
+                            executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in comp_resp.skill_requests]
+                            run_logger.info("Skills executed by tool: " + ", ".join(executed))
+                        comp_prior.extend(r.text for _, r in results)
+                        continue
+
+                    if comp_resp.hypotheses:
+                        slice_ref = f"{list_key}[0]"
+                        full_ref = f"{list_key}[{full_index}]"
+                        component_hyps: list[Hypothesis] = []
+                        for h in comp_resp.hypotheses:
+                            refs = list(h.evidence_refs or [])
+                            refs = [full_ref if r.strip() == slice_ref else r for r in refs]
+                            rewritten = Hypothesis(
+                                id=h.id,
+                                component_type=h.component_type,
+                                component_name=h.component_name,
+                                title=h.title,
+                                description=h.description,
+                                evidence_refs=refs,
+                                exploitability=h.exploitability,
+                                confidence=h.confidence,
+                                remediation_hint=h.remediation_hint,
+                            )
+                            component_hyps.append(rewritten)
+                            all_hypotheses.append(rewritten)
+                        if run_logger and component_hyps:
+                            run_logger.component_findings(component_type, label, component_hyps)
+                        break
+            hypotheses = consolidate_hypotheses(all_hypotheses, config, run_logger)
+        else:
+            # Single-shot: one prompt with full dossier.
             turn = 0
-            comp_resp = None
             while turn < max_turns:
                 turn += 1
-                prompt = build_component_prompt(
-                    slice_dict, component_type, label,
-                    comp_prior if comp_prior else None,
-                    list_llm_skills(),
-                )
+                prompt = build_prompt(dossier_dict, prior_skill_results if prior_skill_results else None, list_llm_skills())
                 if run_logger:
-                    run_logger.info("Prompt sent to LLM:\n" + prompt)
-                    run_logger.task_update(f"LLM analysing {component_type}: {label}...")
+                    run_logger.task_update("LLM is analysing exported components...")
                     run_logger.llm_busy(True)
                 try:
                     result = complete(
@@ -175,153 +287,90 @@ def run_workflow(
                         run_logger.llm_busy(False)
                 if run_logger and result.thinking:
                     run_logger.llm_thinking(result.thinking)
-                comp_resp = parse_response(result.content)
+                raw = result.content
+                resp = parse_response(raw)
 
-                if comp_resp.skill_requests:
+                if not resp.skill_requests and not resp.hypotheses and raw:
+                    if run_logger:
+                        preview = raw[:200] + "..." if len(raw) > 200 else raw
+                        run_logger.warning(f"LLM response could not be parsed (no skill_requests or hypotheses): {preview}")
+
+                if resp.skill_requests:
                     if run_logger:
                         run_logger.task_update("Running requested skills...")
                         skill_descs = []
-                        for req in comp_resp.skill_requests:
+                        for req in resp.skill_requests:
                             name = getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?")
                             params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
                             skill_descs.append(f"{name}({params})")
                         run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
                     results = run_skills(
-                        comp_resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
+                        resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
                     )
                     if run_logger:
                         for name, res in results:
                             if not res.success:
                                 run_logger.error(f"{name}: {res.text}")
-                        executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in comp_resp.skill_requests]
+                        executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in resp.skill_requests]
                         run_logger.info("Skills executed by tool: " + ", ".join(executed))
-                    comp_prior.extend(r.text for _, r in results)
+                        result_texts = [r.text for _, r in results]
+                        next_prompt = build_prompt(dossier_dict, prior_skill_results + result_texts, list_llm_skills())
+                        run_logger.info("Data sent to LLM after executing requested skills:\n" + next_prompt)
+                    prior_skill_results.extend(r.text for _, r in results)
                     continue
 
-                if comp_resp.hypotheses:
-                    # Rewrite evidence_refs from slice (e.g. exported_activities[0]) to full dossier index.
-                    slice_ref = f"{list_key}[0]"
-                    full_ref = f"{list_key}[{full_index}]"
-                    component_hyps: list[Hypothesis] = []
-                    for h in comp_resp.hypotheses:
-                        refs = list(h.evidence_refs or [])
-                        refs = [full_ref if r.strip() == slice_ref else r for r in refs]
-                        rewritten = Hypothesis(
-                            id=h.id,
-                            component_type=h.component_type,
-                            component_name=h.component_name,
-                            title=h.title,
-                            description=h.description,
-                            evidence_refs=refs,
-                            exploitability=h.exploitability,
-                            confidence=h.confidence,
-                            remediation_hint=h.remediation_hint,
-                        )
-                        component_hyps.append(rewritten)
-                        all_hypotheses.append(rewritten)
-                    if run_logger and component_hyps:
-                        run_logger.component_findings(component_type, label, component_hyps)
+                if resp.hypotheses:
+                    hypotheses = resp.hypotheses
                     break
-        hypotheses = consolidate_hypotheses(all_hypotheses, config, run_logger)
-    else:
-        # Single-shot: one prompt with full dossier.
-        turn = 0
-        while turn < max_turns:
-            turn += 1
-            prompt = build_prompt(dossier_dict, prior_skill_results if prior_skill_results else None, list_llm_skills())
+
+        # Normalize and resolve evidence_refs
+        validated = []
+        for h in hypotheses:
+            resolved_refs = []
+            for ref in h.evidence_refs or []:
+                resolved = resolve_ref(dossier_dict, ref)
+                if resolved and validate_ref(dossier_dict, resolved) and resolved not in resolved_refs:
+                    resolved_refs.append(resolved)
+            if resolved_refs:
+                validated.append(
+                    Hypothesis(
+                        id=h.id,
+                        component_type=h.component_type,
+                        component_name=h.component_name,
+                        title=h.title,
+                        description=h.description,
+                        evidence_refs=resolved_refs,
+                        exploitability=h.exploitability,
+                        confidence=h.confidence,
+                        remediation_hint=h.remediation_hint,
+                    )
+                )
+        if run_logger and len(validated) < len(hypotheses):
+            run_logger.warning(f"Dropped {len(hypotheses) - len(validated)} hypotheses with no valid evidence_refs after resolution")
+
+        # Write hypotheses.json so --exploit_verification_test can reload it later
+        hypotheses_path = run_folder / "hypotheses.json"
+        try:
+            hypotheses_path.write_text(json.dumps([
+                {
+                    "id": h.id,
+                    "component_type": h.component_type,
+                    "component_name": h.component_name,
+                    "title": h.title,
+                    "description": h.description,
+                    "evidence_refs": h.evidence_refs,
+                    "exploitability": h.exploitability,
+                    "confidence": h.confidence,
+                    "remediation_hint": h.remediation_hint,
+                }
+                for h in validated
+            ], indent=2), encoding="utf-8")
+        except OSError as e:
             if run_logger:
-                run_logger.task_update("LLM is analysing exported components...")
-                run_logger.llm_busy(True)
-            try:
-                result = complete(
-                    prompt,
-                    config=config,
-                    system_content=build_system_content(),
-                    stream=True,
-                    run_logger=run_logger,
-                )
-            finally:
-                if run_logger:
-                    run_logger.llm_busy(False)
-            if run_logger and result.thinking:
-                run_logger.llm_thinking(result.thinking)
-            raw = result.content
-            resp = parse_response(raw)
+                run_logger.warning(f"Failed to write hypotheses.json: {e}")
 
-            if resp.skill_requests:
-                if run_logger:
-                    run_logger.task_update("Running requested skills...")
-                    skill_descs = []
-                    for req in resp.skill_requests:
-                        name = getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?")
-                        params = getattr(req, "params", None) or (req.get("params") if isinstance(req, dict) else {}) or {}
-                        skill_descs.append(f"{name}({params})")
-                    run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
-                results = run_skills(
-                    resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
-                )
-                if run_logger:
-                    for name, res in results:
-                        if not res.success:
-                            run_logger.error(f"{name}: {res.text}")
-                    executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in resp.skill_requests]
-                    run_logger.info("Skills executed by tool: " + ", ".join(executed))
-                    result_texts = [r.text for _, r in results]
-                    next_prompt = build_prompt(dossier_dict, prior_skill_results + result_texts, list_llm_skills())
-                    run_logger.info("Data sent to LLM after executing requested skills:\n" + next_prompt)
-                prior_skill_results.extend(r.text for _, r in results)
-                continue
+    # --- Common path: exploit verification, report, run_meta, observations ---
 
-            if resp.hypotheses:
-                hypotheses = resp.hypotheses
-                break
-
-    # Normalize and resolve evidence_refs; keep hypothesis if at least one ref validates (avoid dropping true positives)
-    validated = []
-    for h in hypotheses:
-        resolved_refs = []
-        for ref in h.evidence_refs or []:
-            resolved = resolve_ref(dossier_dict, ref)
-            if resolved and validate_ref(dossier_dict, resolved) and resolved not in resolved_refs:
-                resolved_refs.append(resolved)
-        if resolved_refs:
-            validated.append(
-                Hypothesis(
-                    id=h.id,
-                    component_type=h.component_type,
-                    component_name=h.component_name,
-                    title=h.title,
-                    description=h.description,
-                    evidence_refs=resolved_refs,
-                    exploitability=h.exploitability,
-                    confidence=h.confidence,
-                    remediation_hint=h.remediation_hint,
-                )
-            )
-    if run_logger and len(validated) < len(hypotheses):
-        run_logger.warning(f"Dropped {len(hypotheses) - len(validated)} hypotheses with no valid evidence_refs after resolution")
-
-    # Write hypotheses.json (pure LLM output, before verification) so --exploit_verification_test can reload it
-    hypotheses_path = run_folder / "hypotheses.json"
-    try:
-        hypotheses_path.write_text(json.dumps([
-            {
-                "id": h.id,
-                "component_type": h.component_type,
-                "component_name": h.component_name,
-                "title": h.title,
-                "description": h.description,
-                "evidence_refs": h.evidence_refs,
-                "exploitability": h.exploitability,
-                "confidence": h.confidence,
-                "remediation_hint": h.remediation_hint,
-            }
-            for h in validated
-        ], indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-    # Exploit verification (Phase 5): run per-hypothesis steps, write under exploit_verification/<module>/
     verification_results: list = []
     if validated and tasks:
         vuln_module = tasks[0]
@@ -350,12 +399,21 @@ def run_workflow(
         "summary": summary,
         "verification_results": verification_results,
     }
-    execute("generate_report", report_params, ctx)
+    report_result = execute("generate_report", report_params, ctx)
+    if not report_result.success and run_logger:
+        run_logger.error(f"generate_report failed: {report_result.text}")
     finished_at = datetime.now()
-    write_run_meta(run_folder, apk_path, started_at, finished_at, hypotheses_count=len(validated))
-    # Persistent observations store (app_id level) for future runs
+    try:
+        write_run_meta(run_folder, apk_path, started_at, finished_at, hypotheses_count=len(validated))
+    except OSError as e:
+        if run_logger:
+            run_logger.warning(f"Failed to write run_meta.json: {e}")
     run_folder_root = run_folder.parent.parent
     app_id = run_folder.parent.name
     run_ts = run_folder.name
     observation_text = (summary or "").strip() or f"Run completed with {len(validated)} hypotheses."
-    append_observations(run_folder_root, app_id, [{"run_ts": run_ts, "source": "run", "text": observation_text}])
+    try:
+        append_observations(run_folder_root, app_id, [{"run_ts": run_ts, "source": "run", "text": observation_text}])
+    except OSError as e:
+        if run_logger:
+            run_logger.warning(f"Failed to write observations.json: {e}")

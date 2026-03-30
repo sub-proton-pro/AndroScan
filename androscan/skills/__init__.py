@@ -2,6 +2,7 @@
 
 import json
 import importlib
+import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -37,8 +38,8 @@ def discover() -> None:
             execute_fn = getattr(mod, "execute", None)
             if meta is not None and execute_fn is not None and isinstance(meta, SkillMeta):
                 register(meta, execute_fn)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: failed to load skill module {mod_name}: {e}", file=sys.stderr)
 
 
 def register(meta: SkillMeta, execute_fn: Callable[[dict, SkillContext], SkillResult]) -> None:

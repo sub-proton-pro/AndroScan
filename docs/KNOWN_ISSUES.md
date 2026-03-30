@@ -163,21 +163,21 @@ Use the following format for new entries:
 
 ---
 
-### ISSUE-004: LLM usage patterns may be underdefined until first real LLM-backed feature exists
+### ISSUE-004: LLM usage patterns may still evolve beyond the current analysis + verification flows
 - status: Open
 - impact: Medium
 - area: LLM layer / security / contracts
 - introduced / observed: [replace date]
 - summary:
-  The architecture reserves a dedicated LLM layer, but exact usage patterns, contracts, and failure behavior may remain underdefined until a real feature uses it.
+  Multi-turn dossier analysis and Phase 5 verification use the LLM layer with structured prompts and parsing, but new features may introduce additional call sites, contracts, or failure modes that are not yet fully standardized.
 - why it matters:
-  Without concrete usage, contributors may improvise inconsistent patterns when the first LLM-assisted feature is added.
+  Without explicit patterns for each new use case, contributors may improvise inconsistent handling of prompts, validation, and errors.
 - current workaround:
-  Keep all future LLM access centralized and require explicit contract/validation design before usage expands.
+  Keep LLM access centralized in the LLM layer; extend contracts and validation deliberately when adding new model-driven behavior.
 - recommended fix:
-  Define the first canonical LLM-backed workflow and document its contracts, validation rules, and provenance behavior.
+  Document and test each major LLM workflow (analysis loop, verification, any future flows) with clear contracts, validation rules, and provenance behavior.
 - related tasks:
-  - first LLM-assisted feature design
+  - LLM contract docs for new workflows as they are added
 - related docs:
   - `docs/ARCHITECTURE.md`
   - `docs/SAFETY_AND_SECURITY.md`
@@ -222,7 +222,7 @@ Use the following format for new entries:
 - related tasks:
   - doc hygiene tasks
 - related docs:
-  - `docs/AGENT_PROTOCOL.md`
+  - `AGENT_PROTOCOL.md`
   - `docs/STATE.md`
   - `docs/TASKS.md`
   - `docs/CONVENTIONS.md`

@@ -30,30 +30,44 @@ STUB_MESSAGE = "[stub] Signal type not implemented; placeholder for verification
 
 def _run_adb(serial: str, *args: str, timeout: int = 15, binary: bool = False) -> subprocess.CompletedProcess:
     cmd = ["adb", "-s", serial] + list(args)
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=not binary,
-        timeout=timeout,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=not binary,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise
+    except OSError as e:
+        raise RuntimeError(f"adb command failed: {e}") from e
 
 
 def _capture_logcat(serial: str, _package: str, _context: SkillContext) -> str:
-    proc = _run_adb(serial, "shell", "logcat", "-d", "-t", "300")
+    try:
+        proc = _run_adb(serial, "shell", "logcat", "-d", "-t", "300")
+    except subprocess.TimeoutExpired:
+        return "[logcat timed out]"
     if proc.returncode != 0:
         return f"[logcat failed: exit {proc.returncode}]"
-    return (proc.stdout or "")[-50000:]  # limit size
+    return (proc.stdout or "")[-50000:]
 
 
 def _capture_dumpsys_activity(serial: str, _package: str, _context: SkillContext) -> str:
-    proc = _run_adb(serial, "shell", "dumpsys", "activity", "top", timeout=20)
+    try:
+        proc = _run_adb(serial, "shell", "dumpsys", "activity", "top", timeout=20)
+    except subprocess.TimeoutExpired:
+        return "[dumpsys activity top timed out]"
     if proc.returncode != 0:
         return f"[dumpsys activity top failed: exit {proc.returncode}]"
     return (proc.stdout or "")[-100000:]
 
 
 def _capture_dumpsys_window(serial: str, _package: str, _context: SkillContext) -> str:
-    proc = _run_adb(serial, "shell", "dumpsys", "window")
+    try:
+        proc = _run_adb(serial, "shell", "dumpsys", "window")
+    except subprocess.TimeoutExpired:
+        return "[dumpsys window timed out]"
     if proc.returncode != 0:
         return f"[dumpsys window failed: exit {proc.returncode}]"
     return (proc.stdout or "")[-50000:]
@@ -63,7 +77,10 @@ def _capture_screenshot(serial: str, _package: str, context: SkillContext, file_
     run_folder = Path(context.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
     out_path = run_folder / f"{file_prefix}_screenshot.png"
-    proc = _run_adb(serial, "exec-out", "screencap", "-p", timeout=10, binary=True)
+    try:
+        proc = _run_adb(serial, "exec-out", "screencap", "-p", timeout=10, binary=True)
+    except subprocess.TimeoutExpired:
+        return "[screencap timed out]"
     if proc.returncode != 0:
         return f"[screencap failed: exit {proc.returncode}]"
     try:

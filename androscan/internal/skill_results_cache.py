@@ -87,7 +87,10 @@ def store(
         "params": params or {},
         "result_text": result_text,
     }
-    path.write_text(
-        json.dumps({"by_key": by_key, "next_serial": next_serial}, indent=2),
-        encoding="utf-8",
-    )
+    try:
+        path.write_text(
+            json.dumps({"by_key": by_key, "next_serial": next_serial}, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass

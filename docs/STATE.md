@@ -10,7 +10,7 @@ This file should be updated whenever a task materially changes what exists, what
 
 ## Summary
 
-Current status: **Phase 5 (exploit verification) complete.** Phases 1–3 delivered real extraction (apktool), real Ollama client, real prompts and skills catalog, evidence_ref validation, and run artifacts. Phase 5 added exploit verification on emulator + ADB: device env check, exploit command build/run from template catalog, before/after signal capture (volatile then non-volatile), LLM-based verification, and report generation after verification. Phase 4 (harden and extend, CI) remains parked.
+Current status: **Phase 5 (exploit verification) complete. Phase 4 partial (error handling + docs cleanup) complete; CI remains parked.** Phases 1–3 delivered real extraction (apktool), real Ollama client, real prompts and skills catalog, evidence_ref validation, and run artifacts. Phase 5 added exploit verification on emulator + ADB. Phase 4 partial added broader error handling (config, LLM client, ADB skills, workflow, CLI) and updated all docs for Phase 5 / three-tier skills.
 
 ---
 
@@ -38,7 +38,7 @@ Current status: **Phase 5 (exploit verification) complete.** Phases 1–3 delive
 - Modules: `exported_components` workflow is wired; task dispatch supports multiple --task values; first module is the only one implemented.
 
 ### Not yet implemented
-- Phase 4: CI (pytest on every push/PR), additional hardening and error handling — parked.
+- Phase 4 CI: pytest on every push/PR — parked.
 - `exported_provider` signal captures: `content_provider_query` and `app_data_snapshot` signal types fall through to stub in `capture_signals.py`; `logcat` and the exploit command template (`query_provider`) are real.
 - Integration test with fixture APK (extraction + dossier shape) — parked in backlog.
 
@@ -61,9 +61,8 @@ Current status: **Phase 5 (exploit verification) complete.** Phases 1–3 delive
 
 ## What is incomplete or unverified
 
-- CI does not yet run tests on every push/PR (Phase 4).
+- CI does not yet run tests on every push/PR (Phase 4 CI parked).
 - Integration test with fixture APK (assert dossier shape from extraction) is parked; optional for later.
-- CLI validates APK path existence; malformed APKs may produce unclear extraction errors until Phase 4 hardening.
 
 ---
 
@@ -79,7 +78,7 @@ Current status: **Phase 5 (exploit verification) complete.** Phases 1–3 delive
 
 ## Known gaps / technical debt
 
-- Phase 4: CI (pytest on push/PR), broader error handling and user-facing messages for extraction/Ollama failures.
+- Phase 4 CI: pytest on push/PR — parked.
 - `exported_provider` capture_signals: `content_provider_query` and `app_data_snapshot` are stub (fall through to STUB_MESSAGE); logcat and exploit command are real.
 - Run folder artifacts are in place; optional fixture-APK integration test is in backlog.
 
@@ -100,6 +99,7 @@ No known blockers at this time.
 
 ## Recent completed work
 
+- 2026-03-30 Phase 4 partial: error handling (config explicit --config validation, YAML type coercion; LLM client resp.json() wrapping, empty content retry, HTTP error detail; ADB TimeoutExpired in all skills; workflow generate_report check, disk error safety, parse failure logging; CLI top-level exception handler, report read warnings; skills registry import logging; vuln_signals_config and cache store error handling). Docs cleanup: DESIGN_DOC, ARCHITECTURE, DECISIONS, PROJECT_BRIEF, README, KNOWN_ISSUES, AI_ENGINEERING_CONSTITUTION updated for Phase 5 and three-tier skills.
 - 2026-03-30 Phase 5 exploit verification: app_env_check, build_exploit_command (template catalog for 5 profiles), capture_signals (volatile then non-volatile, per vuln_module_skills_signals.json), run_exploit_command, verify_exploit_result (LLM). Orchestration in exploit_verification.py; report generated after verification with verified/unverified status. Artifacts per hypothesis under exploit_verification/<module>/<hyp_id>/. All 10 sub-tasks complete.
 - Phase 3 vertical slice: real extraction (apktool), real Ollama client, real prompts and skills catalog, evidence_ref validation, run artifacts, skill results cache (with resolved class name for get_decompiled_class). 54 tests.
 - 2026-03 Skills refactor: skills layer (androscan/skills/) with three-tier model (pipeline, llm, exploit); workflow composes pipeline and LLM skills; extraction delegates to skills; Dossier.from_dict().
@@ -109,7 +109,7 @@ No known blockers at this time.
 
 ## Next expected milestone
 
-Unpark Phase 4 (CI, hardening) or pick from backlog (second vulnerability module, provider signal stubs, integration test with fixture APK).
+Phase 4 CI (pytest on push/PR) or pick from backlog (second vulnerability module, provider signal stubs, integration test with fixture APK).
 
 ---
 

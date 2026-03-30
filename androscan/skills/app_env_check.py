@@ -23,14 +23,21 @@ def _run_adb(serial: str | None, *args: str, timeout: int = 10) -> subprocess.Co
     if serial:
         cmd.extend(["-s", serial])
     cmd.extend(args)
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise subprocess.TimeoutExpired(cmd, timeout) from None
 
 
-def _list_devices() -> list[dict[str, str]]:
-    """Return list of {serial, state} for devices in 'device' state."""
-    proc = _run_adb(None, "devices", "-l")
+def _list_devices() -> tuple[list[dict[str, str]], str]:
+    """Return (devices, error_detail). error_detail is non-empty if adb failed."""
+    try:
+        proc = _run_adb(None, "devices", "-l")
+    except subprocess.TimeoutExpired:
+        return [], "adb devices timed out"
     if proc.returncode != 0:
-        return []
+        stderr = (proc.stderr or "").strip()[:200]
+        return [], f"adb devices failed (exit {proc.returncode}): {stderr}"
     devices = []
     for line in (proc.stdout or "").strip().splitlines():
         if not line.strip() or line.startswith("List of"):
@@ -40,7 +47,7 @@ def _list_devices() -> list[dict[str, str]]:
             serial, state = parts[0], parts[1]
             if state == "device":
                 devices.append({"serial": serial, "state": state})
-    return devices
+    return devices, ""
 
 
 def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
@@ -60,7 +67,13 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
         )
     device_serial = (params.get("device_serial") or "").strip() or None
 
-    devices = _list_devices()
+    devices, adb_error = _list_devices()
+    if not devices and adb_error:
+        return SkillResult(
+            success=False,
+            data={"devices": [], "reason": "adb_failed", "detail": adb_error},
+            text=f"[app_env_check] {adb_error}",
+        )
     if not devices:
         return SkillResult(
             success=False,
@@ -85,11 +98,17 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
             text=f"[app_env_check] Device {device_serial!r} not in attached list.",
         )
 
-    proc = _run_adb(serial, "shell", "getprop", "ro.kernel.qemu")
+    try:
+        proc = _run_adb(serial, "shell", "getprop", "ro.kernel.qemu")
+    except subprocess.TimeoutExpired:
+        return SkillResult(success=False, data=None, text="[app_env_check] Timed out checking if device is an emulator (getprop).")
     qemu_out = (proc.stdout or "").strip() if proc.returncode == 0 else ""
     is_emulator = qemu_out == "1"
 
-    proc = _run_adb(serial, "shell", "pm", "path", package)
+    try:
+        proc = _run_adb(serial, "shell", "pm", "path", package)
+    except subprocess.TimeoutExpired:
+        return SkillResult(success=False, data=None, text=f"[app_env_check] Timed out checking if {package!r} is installed (pm path).")
     pm_out = (proc.stdout or "").strip() if proc.returncode == 0 else ""
     app_installed = "package:" in pm_out
     app_path = pm_out.replace("package:", "").strip() if app_installed else None
@@ -123,9 +142,12 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
         if run_logger:
             run_logger.task_update("\r" + text)
 
-    proc = _run_adb(serial, "shell", "pidof", package)
-    pid_out = (proc.stdout or "").strip()
-    app_running = bool(pid_out and proc.returncode == 0)
+    try:
+        proc = _run_adb(serial, "shell", "pidof", package)
+    except subprocess.TimeoutExpired:
+        proc = None
+    pid_out = (proc.stdout or "").strip() if proc and proc.returncode == 0 else ""
+    app_running = bool(pid_out)
     data["app_running"] = app_running
     if run_logger:
         run_logger.exploit_stage(f"Checking if app is running (pidof {package}): {'running (pid(s) ' + pid_out + ')' if app_running else 'not running'}.")
@@ -134,8 +156,11 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
     # Check if app is in foreground (dumpsys activity activities: mResumedActivity or mFocusedApp)
     in_foreground = False
     if app_running:
-        proc = _run_adb(serial, "shell", "dumpsys", "activity", "activities", timeout=15)
-        dumpsys_out = (proc.stdout or "") if proc.returncode == 0 else ""
+        try:
+            proc = _run_adb(serial, "shell", "dumpsys", "activity", "activities", timeout=15)
+        except subprocess.TimeoutExpired:
+            proc = None
+        dumpsys_out = (proc.stdout or "") if proc and proc.returncode == 0 else ""
         for line in dumpsys_out.splitlines():
             if ("mResumedActivity" in line or "mFocusedApp" in line) and package in line:
                 in_foreground = True
@@ -151,8 +176,11 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
         if run_logger:
             run_logger.exploit_stage("Bringing app to foreground (monkey -c LAUNCHER 1)...")
             _log_spinner("Bringing app to foreground...")
-        proc = _run_adb(serial, "shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1", timeout=10)
-        brought_to_foreground = proc.returncode == 0
+        try:
+            proc = _run_adb(serial, "shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1", timeout=10)
+        except subprocess.TimeoutExpired:
+            proc = None
+        brought_to_foreground = proc is not None and proc.returncode == 0
         data["brought_to_foreground"] = brought_to_foreground
         if run_logger:
             run_logger.exploit_stage(f"Bring to foreground: {'success' if brought_to_foreground else 'failed (exit ' + str(proc.returncode) + ')'}.")

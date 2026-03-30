@@ -58,5 +58,8 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
         "hypotheses": report_hypotheses,
     }
     report_path = context.run_folder / "report.json"
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    try:
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    except OSError as e:
+        return SkillResult(success=False, data=None, text=f"[generate_report] Failed to write {report_path}: {e}")
     return SkillResult(success=True, data=report_path, text=f"Report written to {report_path}")

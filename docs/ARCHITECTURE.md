@@ -118,6 +118,7 @@ Responsibilities:
 - track execution context and run state
 - coordinate calls to shared use cases, checks, and integrations
 - enforce workflow-level guardrails or sequencing policies
+- after LLM-produced hypotheses, drive optional exploit verification (emulator/ADB, exploit-tier skills) before final reporting where the product requires it
 
 Non-responsibilities:
 - detailed vulnerability semantics
@@ -141,11 +142,12 @@ The skills layer provides discrete, reusable capabilities that orchestration and
 Examples:
 - pipeline skills: extract_manifest, prepare_dossier, generate_report
 - LLM-requestable skills: get_decompiled_class, get_decompiled_method, list_classes_in_package
+- exploit-tier skills (orchestration only; not in the LLM catalog): app_env_check, build_exploit_command, capture_signals, run_exploit_command, verify_exploit_result
 
 Responsibilities:
 - define the skill contract (SkillMeta, SkillContext, SkillResult)
 - register and discover skills; execute by name
-- expose only LLM-requestable skills to the prompt catalog (list_llm_skills)
+- expose only LLM-requestable (**llm** tier) skills to the prompt catalog (`list_llm_skills`); **exploit**-tier skills are never advertised to the model
 - isolate tool-specific behavior (e.g. apktool, jadx) inside skill implementations
 
 Non-responsibilities:
@@ -155,7 +157,7 @@ Non-responsibilities:
 
 Rules:
 - each skill is a single file exporting SKILL_META and execute(params, context)
-- pipeline skills are not advertised to the LLM; LLM skills are
+- tier is one of `"pipeline"`, `"llm"`, or `"exploit"`; pipeline and exploit skills are not advertised to the LLM; only **llm** tier is
 - vulnerability modules may call execute() or run_skills() as needed
 
 ---
@@ -372,7 +374,7 @@ A new output mode should usually involve:
 
 A new skill should usually involve:
 - a new file in `androscan/skills/` exporting SKILL_META and execute(params, context)
-- tier = "pipeline" (orchestration-only) or "llm" (advertised in prompt)
+- tier = `"pipeline"` (orchestration-only), `"llm"` (advertised in prompt), or `"exploit"` (orchestration during verification; not in prompt catalog)
 - add the module name to the registry’s discover list in `androscan/skills/__init__.py`
 - unit test for the skill
 
