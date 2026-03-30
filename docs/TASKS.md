@@ -29,78 +29,30 @@ Do not start multiple unrelated tasks at once unless explicitly instructed.
 
 ## Active Task
 
-### Task ID
-phase-5-exploit-verification
-
-### Title
-Phase 5: Exploit verification
-
-### Objective
-Verify that reported vulnerabilities are actually exploitable on an emulator: device selection, app env check, build/run exploit commands, capture signals (volatile then non-volatile), LLM verification; then generate report after verification.
-
-### Why this task matters
-Phase 3 delivers hypotheses; Phase 5 adds evidence that each finding can be triggered on a live device (emulator + ADB). Report is generated only after exploit verification so it reflects verified/unverified status.
-
-### Scope
-- **Workflow order:** Analysis → Hypotheses → Exploit verification → Report generation (report after verification).
-- **Exploit tier:** Skills used during exploit verification (e.g. `tier="exploit"`) separate from analysis LLM skills.
-- **Skills:** app_env_check (device selection, emulator check, app installed), build_exploit_command (template catalog; RAG stub), capture_signals (volatile parallel then non-volatile; network_capture stub), run_exploit_command, verify_exploit_result (LLM).
-- **Artifacts:** `apps/<app_id>/<run_ts>/exploit_verification/<vuln_module>/` (e.g. exported_components) with before/after signals, commands, screenshots.
-- **Vuln–skill–signal_profile:** Single JSON file (modules, profiles, signal_type_metadata with volatile/stub) to drive which signals each module captures.
-- **Run.log and spinner:** Each exploit verification step must emit a short line to run.log and relevant spinner text. Exploit-tier skills return optional `log_summary` and `spinner_text` on SkillResult; orchestration writes them via RunLogger (e.g. task_update(spinner_text), info(log_summary)).
-
-### Out of scope (for Phase 5)
-- Phase 4 (CI, hardening) — parked.
-- RAG (LanceDB) for exploit templates — later task or backlog; build_exploit_command uses in-code catalog until then.
-- Integration test with fixture APK (remains in backlog).
-
-### Phase 5 implementation plan (one task at a time)
-
-Execute in order; each step is a single-focus task verified before moving on.
-
-**Sub-task status:**
-
-| # | Task | Status |
-|---|------|--------|
-| 1 | Docs: park Phase 4, add Phase 5 active with this list | Done |
-| 2 | Vuln–skill–signal_profile JSON | Done |
-| 3 | Exploit skill tier | Done |
-| 4 | app_env_check skill | Done |
-| 5 | build_exploit_command skill | Done |
-| 6 | capture_signals skill | Done |
-| 7 | run_exploit_command skill | Done |
-| 8 | verify_exploit_result skill | Done |
-| 9 | Exploit verification orchestration | Done |
-| 10 | Report after verification | Done |
-
-| # | Task | Deliverable | Depends on |
-|---|------|-------------|------------|
-| 1 | **Docs** | Park Phase 4; add Phase 5 as active with this task list; update STATE.md | — |
-| 2 | **Vuln–skill–signal_profile JSON** | Single JSON file (modules, profiles, signal_type_metadata with volatile/stub) | — |
-| 3 | **Exploit skill tier** | Add tier="exploit" to contract and registry; list by tier | — |
-| 4 | **app_env_check skill** | Skill: adb devices -l, getprop ro.kernel.qemu, pm path; device selection | 3 |
-| 5 | **build_exploit_command skill** | In-code template catalog; resolve hypothesis + dossier → command; RAG stub | 2, 3 |
-| 6 | **capture_signals skill** | Volatile (parallel) then non-volatile; read JSON; network_capture stub | 2, 3 |
-| 7 | **run_exploit_command skill** | adb -s shell; return success, stdout, stderr | 3 |
-| 8 | **verify_exploit_result skill** | LLM call with before/after signals; return verified + reasoning | 3 |
-| 9 | **Exploit verification orchestration** | Workflow: after validated hypotheses, run exploit steps; write under exploit_verification/<module>/ | 4–8 |
-| 10 | **Report after verification** | generate_report accepts verification results; report.json includes verified flag / artifact refs | 9 |
+None. Phase 5 is complete. Pick from Priority Queue or Backlog.
 
 ---
 
 ## Priority Queue
 
 ### P1
-- Phase 5 complete. Next: Phase 4 (unpark) or backlog.
+- Unpark Phase 4 (CI, hardening).
+- Implement `content_provider_query` and `app_data_snapshot` signal captures for `exported_provider` profile (currently stub).
+- Add second vulnerability module.
+
+### P2
+- Integration test with fixture APK.
+- JSON output renderer.
+- Richer evidence provenance tracking.
 
 ---
 
 ## Blocked Tasks
 
 ### Phase 4: Harden and extend
-- blocked by: decision to park Phase 5 first.
-- why blocked: Parked; unblock when ready.
-- unblock condition: Resume Phase 4 when exploit verification work is paused or complete.
+- blocked by: prioritization decision.
+- why blocked: Parked during Phase 5; now unblocked. Ready to pick up.
+- unblock condition: Unblocked (Phase 5 complete).
 
 Format:
 
@@ -134,6 +86,11 @@ Use for real future work, not vague ideas.
 ---
 
 ## Completed Tasks
+
+### 2026-03-30 Phase 5: Exploit verification
+- outcome: Exploit verification on emulator + ADB. 5 exploit-tier skills (app_env_check, build_exploit_command, capture_signals, run_exploit_command, verify_exploit_result). Template catalog for 5 component profiles (exported_activity, exported_service, exported_receiver, exported_provider, deep_link). Vuln–skill–signal profile JSON. Before/after signal capture (volatile then non-volatile). LLM-based verification. Report generated after verification with verified flag, reasoning, and artifact refs. Artifacts per hypothesis under exploit_verification/<module>/<hyp_id>/. All 10 sub-tasks complete.
+- notes: `exported_provider` has 2 stub signal types (content_provider_query, app_data_snapshot); logcat and exploit command are real. RAG for exploit templates deferred to backlog.
+- follow-up: Unpark Phase 4 (CI, hardening) or pick from backlog (provider stubs, second vulnerability module).
 
 ### Phase 3: First vertical slice (exported components)
 - outcome: Real extraction (apktool), real Ollama client, real prompts and skills catalog, evidence_ref validation, run artifacts (report.json, run_meta.json, run.log, observations.json), skill results cache (get_decompiled_class keyed by resolved class name). get_decompiled_class and get_decompiled_method real via jadx. 54 tests; mock LLM in CI.
