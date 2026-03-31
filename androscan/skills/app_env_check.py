@@ -141,23 +141,52 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
             text=f"[app_env_check] Package {package!r} is not installed on {serial}. Install the APK first.",
         )
 
-    # Check if app is running (pidof <package>)
     def _log_spinner(text: str) -> None:
         if run_logger:
             run_logger.task_update("\r" + text)
 
-    try:
-        proc = _run_adb(serial, "shell", "pidof", package)
-    except subprocess.TimeoutExpired:
-        proc = None
-    pid_out = (proc.stdout or "").strip() if proc and proc.returncode == 0 else ""
-    app_running = bool(pid_out)
+    def _check_running() -> tuple[bool, str]:
+        try:
+            proc = _run_adb(serial, "shell", "pidof", package)
+        except subprocess.TimeoutExpired:
+            return False, ""
+        pid_out = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        return bool(pid_out), pid_out
+
+    def _launch_app() -> bool:
+        try:
+            proc = _run_adb(serial, "shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1", timeout=10)
+        except subprocess.TimeoutExpired:
+            return False
+        return proc is not None and proc.returncode == 0
+
+    # Check if app is running
+    app_running, pid_out = _check_running()
     data["app_running"] = app_running
     if run_logger:
         run_logger.exploit_stage(f"Checking if app is running (pidof {package}): {'running (pid(s) ' + pid_out + ')' if app_running else 'not running'}.")
         _log_spinner("App running: yes." if app_running else "App running: no.")
 
-    # Check if app is in foreground (dumpsys activity activities: mResumedActivity or mFocusedApp)
+    # If not running, launch it
+    if not app_running:
+        if run_logger:
+            run_logger.exploit_stage(f"App not running. Launching {package}...")
+            _log_spinner(f"Launching {package}...")
+        launched = _launch_app()
+        if run_logger:
+            run_logger.exploit_stage(f"Launch attempt: {'success' if launched else 'failed'}.")
+        if launched:
+            import time
+            time.sleep(2)
+            app_running, pid_out = _check_running()
+            data["app_running"] = app_running
+            if run_logger:
+                run_logger.exploit_stage(f"App running after launch: {'yes (pid(s) ' + pid_out + ')' if app_running else 'no'}.")
+                _log_spinner("App launched." if app_running else "App failed to start.")
+        if not app_running and run_logger:
+            run_logger.warning(f"[app_env_check] Could not launch {package}. Proceeding anyway (some exploits may still work).")
+
+    # Check if app is in foreground
     in_foreground = False
     if app_running:
         try:
@@ -174,20 +203,16 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
         run_logger.exploit_stage(f"Checking if app is in foreground (dumpsys activity): {'yes' if in_foreground else 'no'}.")
         _log_spinner("App in foreground: yes." if in_foreground else "App in foreground: no.")
 
-    # If not in foreground, bring to foreground (monkey -p package -c LAUNCHER 1)
+    # If running but not in foreground, bring to foreground
     brought_to_foreground = False
     if app_running and not in_foreground:
         if run_logger:
-            run_logger.exploit_stage("Bringing app to foreground (monkey -c LAUNCHER 1)...")
+            run_logger.exploit_stage("Bringing app to foreground...")
             _log_spinner("Bringing app to foreground...")
-        try:
-            proc = _run_adb(serial, "shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1", timeout=10)
-        except subprocess.TimeoutExpired:
-            proc = None
-        brought_to_foreground = proc is not None and proc.returncode == 0
+        brought_to_foreground = _launch_app()
         data["brought_to_foreground"] = brought_to_foreground
         if run_logger:
-            run_logger.exploit_stage(f"Bring to foreground: {'success' if brought_to_foreground else 'failed (exit ' + str(proc.returncode) + ')'}.")
+            run_logger.exploit_stage(f"Bring to foreground: {'success' if brought_to_foreground else 'failed'}.")
             _log_spinner("Foreground: done." if brought_to_foreground else "Foreground: failed.")
     else:
         data["brought_to_foreground"] = False
