@@ -15,7 +15,7 @@
           "volatile": ["screenshot"]
         },
         "exported_service": {
-          "signal_types": ["logcat", "dumpsys_activity"],
+          "signal_types": ["logcat", "dumpsys_activity", "app_data_snapshot"],
           "template_intents": ["start_service"],
           "volatile": []
         },

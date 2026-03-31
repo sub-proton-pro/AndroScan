@@ -90,6 +90,72 @@ def _capture_screenshot(serial: str, _package: str, context: SkillContext, file_
         return f"[screenshot write failed: {e}]"
 
 
+def _capture_app_data_snapshot(serial: str, package: str, _context: SkillContext) -> str:
+    """Snapshot app data: SharedPreferences XML contents + files/ directory listing.
+
+    Uses direct /data/data/ path (works on rooted emulators, which is all we target).
+    Falls back to run-as for debuggable apps if direct path fails.
+    """
+    data_root = f"/data/data/{package}"
+    parts: list[str] = []
+
+    # 1) SharedPreferences: cat all XML files
+    parts.append("=== shared_prefs ===")
+    try:
+        ls_proc = _run_adb(serial, "shell", "ls", f"{data_root}/shared_prefs/", timeout=5)
+    except subprocess.TimeoutExpired:
+        ls_proc = None
+    if ls_proc and ls_proc.returncode == 0 and ls_proc.stdout and ls_proc.stdout.strip():
+        for fname in ls_proc.stdout.strip().splitlines():
+            fname = fname.strip()
+            if not fname.endswith(".xml"):
+                continue
+            parts.append(f"\n--- {fname} ---")
+            try:
+                cat_proc = _run_adb(serial, "shell", "cat", f"{data_root}/shared_prefs/{fname}", timeout=10)
+            except subprocess.TimeoutExpired:
+                parts.append("[timed out reading file]")
+                continue
+            if cat_proc.returncode == 0 and cat_proc.stdout:
+                parts.append(cat_proc.stdout.strip()[-20000:])
+            else:
+                parts.append(f"[read failed: exit {cat_proc.returncode}]")
+    else:
+        # Fallback: try run-as for debuggable apps
+        try:
+            fallback = _run_adb(serial, "shell", "run-as", package, "cat", "shared_prefs/*.xml", timeout=10)
+        except subprocess.TimeoutExpired:
+            fallback = None
+        if fallback and fallback.returncode == 0 and fallback.stdout and fallback.stdout.strip():
+            parts.append(fallback.stdout.strip()[-20000:])
+        else:
+            parts.append("(no shared_prefs found or not accessible)")
+
+    # 2) files/ directory listing
+    parts.append("\n=== files/ listing ===")
+    try:
+        files_proc = _run_adb(serial, "shell", "ls", "-lR", f"{data_root}/files/", timeout=10)
+    except subprocess.TimeoutExpired:
+        files_proc = None
+    if files_proc and files_proc.returncode == 0 and files_proc.stdout and files_proc.stdout.strip():
+        parts.append(files_proc.stdout.strip()[-20000:])
+    else:
+        parts.append("(no files/ directory or not accessible)")
+
+    # 3) databases/ listing (names + sizes, not full dumps)
+    parts.append("\n=== databases/ listing ===")
+    try:
+        db_proc = _run_adb(serial, "shell", "ls", "-l", f"{data_root}/databases/", timeout=5)
+    except subprocess.TimeoutExpired:
+        db_proc = None
+    if db_proc and db_proc.returncode == 0 and db_proc.stdout and db_proc.stdout.strip():
+        parts.append(db_proc.stdout.strip()[-5000:])
+    else:
+        parts.append("(no databases/ directory or not accessible)")
+
+    return "\n".join(parts)
+
+
 def _capture_signal(
     signal_type: str,
     serial: str,
@@ -108,6 +174,8 @@ def _capture_signal(
         return _capture_dumpsys_window(serial, package, context)
     if signal_type == "screenshot":
         return _capture_screenshot(serial, package, context, file_prefix)
+    if signal_type == "app_data_snapshot":
+        return _capture_app_data_snapshot(serial, package, context)
     return STUB_MESSAGE
 
 
