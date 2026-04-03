@@ -2,10 +2,12 @@
 """AndroScan CLI: LLM-native Android pentesting tool.
 
 Usage:
-  python androscan.py --apk <path> [--task <name> ...] [--output <dir>] [--config <file>]
+  python androscan.py --apk <path> [--task <name> ...] [--output <dir>] [--config <file>] [--model <name>]
+  python androscan.py --list-models [--config <file>]
 """
 
 import argparse
+import dataclasses
 import json
 import shutil
 import signal
@@ -13,6 +15,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+import requests
 
 
 class ShutdownRequested(Exception):
@@ -134,6 +138,46 @@ def _hypotheses_dicts_to_objects(hyp_list: list) -> list:
     return out
 
 
+def _list_models(config: Any) -> int:
+    """Query Ollama /api/tags and print locally available models."""
+    base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
+    tags_url = f"{base_url}/api/tags"
+    try:
+        resp = requests.get(tags_url, timeout=10)
+        resp.raise_for_status()
+    except requests.ConnectionError:
+        print(orange(f"Ollama not reachable at {base_url}."), file=sys.stderr)
+        print(grey(OLLAMA_SETUP_TIP), file=sys.stderr)
+        return 1
+    except requests.Timeout:
+        print(orange(f"Timeout connecting to {base_url}."), file=sys.stderr)
+        return 1
+    except requests.HTTPError as e:
+        print(orange(f"Ollama returned HTTP {e.response.status_code}."), file=sys.stderr)
+        return 1
+
+    models = resp.json().get("models", [])
+    if not models:
+        print("No models found in Ollama.")
+        return 0
+
+    active_model = config.ollama_model
+    print(f"{'Model':<40} {'Size':>10}  {'Modified'}")
+    print("─" * 70)
+    for m in models:
+        name = m.get("name", "?")
+        size_bytes = m.get("size", 0)
+        size_gb = size_bytes / (1024 ** 3)
+        modified = (m.get("modified_at") or "?")[:19]
+        marker = "  ← active" if name == active_model else ""
+        print(f"{name:<40} {size_gb:>8.1f} GB  {modified}{marker}")
+
+    print()
+    print(grey(f"Active model (from config): {active_model}"))
+    print(grey("Override with: --model <name>"))
+    return 0
+
+
 def main() -> int:
     sigterm = getattr(signal, "SIGTERM", None)
     if sigterm is not None:
@@ -156,7 +200,7 @@ def _run() -> int:
     parser = argparse.ArgumentParser(
         description="AndroScan: analyze APK for exported component exploitability (LLM-assisted)."
     )
-    parser.add_argument("--apk", required=True, help="Path to the APK file")
+    parser.add_argument("--apk", default=None, help="Path to the APK file")
     parser.add_argument(
         "--task",
         action="append",
@@ -178,6 +222,18 @@ def _run() -> int:
         help="Path to global_config.yaml (default: cwd or config/global_config.yaml)",
     )
     parser.add_argument(
+        "--model",
+        default=None,
+        metavar="NAME",
+        help="Ollama model to use (e.g. 'qwen3.5:35b'). Overrides config file setting.",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        default=False,
+        help="List locally available Ollama models and exit.",
+    )
+    parser.add_argument(
         "--exploit_verification_test",
         action="store_true",
         default=False,
@@ -193,6 +249,16 @@ def _run() -> int:
     verbosity = max(1, args.verbose)
 
     config = load_config(args.config)
+
+    if args.list_models:
+        return _list_models(config)
+
+    if not args.apk:
+        parser.error("--apk is required (unless using --list-models)")
+
+    if args.model:
+        config = dataclasses.replace(config, ollama_model=args.model)
+
     apk_path = args.apk
     tasks = args.tasks if args.tasks else ["exported_components"]
 
@@ -211,6 +277,7 @@ def _run() -> int:
     _section("Run started", config.section_rule)
     print(f"  Started:  {started}")
     print(f"  APK:      {apk_path}")
+    print(f"  Model:    {config.ollama_model}")
     print(f"  Tasks:    {tasks_str}")
     print()
 

@@ -40,3 +40,38 @@ class SkillResult:
     text: str = ""   # human/LLM-readable summary
     log_summary: Optional[str] = None  # short line for run.log (exploit steps)
     spinner_text: Optional[str] = None  # spinner/UI label (exploit steps)
+
+
+def resolve_short_class_name(short_name: str, dossier_dict: Optional[dict[str, Any]]) -> Optional[str]:
+    """Try to resolve a short (unqualified) class name to a fully qualified one using the dossier.
+
+    Searches exported components for a name ending with the short name,
+    then falls back to prepending the package from apk_info.
+    Returns None if resolution is not possible.
+    """
+    if not short_name or "." in short_name:
+        return short_name or None
+    if not dossier_dict:
+        return None
+
+    component_lists = [
+        ("exported_activities", "name"),
+        ("exported_services", "name"),
+        ("exported_receivers", "name"),
+        ("exported_providers", "name"),
+        ("deep_links", "component"),
+    ]
+    for list_key, attr_name in component_lists:
+        for item in dossier_dict.get(list_key) or []:
+            fqcn = (item.get(attr_name) or "") if isinstance(item, dict) else ""
+            if fqcn.endswith(f".{short_name}"):
+                return fqcn
+
+    package = ""
+    apk_info = dossier_dict.get("apk_info")
+    if isinstance(apk_info, dict):
+        package = (apk_info.get("package") or "").strip()
+    if package:
+        return f"{package}.{short_name}"
+
+    return None

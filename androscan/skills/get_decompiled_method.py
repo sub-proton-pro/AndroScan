@@ -6,13 +6,13 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from androscan.skills.base import SkillContext, SkillMeta, SkillResult
+from androscan.skills.base import SkillContext, SkillMeta, SkillResult, resolve_short_class_name
 
 SKILL_META = SkillMeta(
     name="get_decompiled_method",
-    description="Body of a specific method in a class. Use class_name from dossier or prior decompilation.",
+    description="Body of a specific method in a class. Prefer fully qualified class name (e.g. com.example.app.MyActivity); short names are auto-resolved via the dossier.",
     params_schema={
-        "class_name": "fully qualified class name",
+        "class_name": "fully qualified class name (e.g. com.example.app.MyActivity). Short names resolved automatically.",
         "method_name": "method name (e.g. onCreate, onReceive)",
     },
     tier="llm",
@@ -90,6 +90,11 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
             data=None,
             text="[get_decompiled_method] method_name is required.",
         )
+
+    if "." not in class_name:
+        resolved = resolve_short_class_name(class_name, context.dossier_dict)
+        if resolved:
+            class_name = resolved
 
     apk_path = (context.apk_path or "").strip()
     if not apk_path:

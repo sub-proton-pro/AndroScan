@@ -125,7 +125,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
     config_path: explicit path to YAML file. If None, search:
       - cwd / global_config.yaml
       - cwd / config / global_config.yaml
-    Env: ANDROSCAN_OLLAMA_URL, ANDROSCAN_OLLAMA_TIMEOUT, ANDROSCAN_RUN_FOLDER, etc.
+    Env: ANDROSCAN_OLLAMA_URL, ANDROSCAN_OLLAMA_TIMEOUT, ANDROSCAN_OLLAMA_MODEL, ANDROSCAN_RUN_FOLDER.
     """
     defaults = Config.default()
     yaml_data: dict[str, Any] = {}
@@ -152,6 +152,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 f"Warning: ANDROSCAN_OLLAMA_TIMEOUT={os.environ['ANDROSCAN_OLLAMA_TIMEOUT']!r} is not a valid integer; using default.",
                 file=sys.stderr,
             )
+    if os.environ.get("ANDROSCAN_OLLAMA_MODEL"):
+        merged["ollama_model"] = os.environ["ANDROSCAN_OLLAMA_MODEL"].strip()
     if os.environ.get("ANDROSCAN_RUN_FOLDER"):
         merged["run_folder_root"] = os.environ["ANDROSCAN_RUN_FOLDER"]
 

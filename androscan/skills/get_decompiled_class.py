@@ -6,12 +6,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from androscan.skills.base import SkillContext, SkillMeta, SkillResult
+from androscan.skills.base import SkillContext, SkillMeta, SkillResult, resolve_short_class_name
 
 SKILL_META = SkillMeta(
     name="get_decompiled_class",
-    description="Decompiled Java/Kotlin source for a class. Accepts dossier path (e.g. exported_activities[0]) or full class name (e.g. com.example.WeakBankLab).",
-    params_schema={"component_ref": "dossier path e.g. exported_activities[0], or full class name e.g. com.example.MyClass"},
+    description="Decompiled Java/Kotlin source for a class. Accepts dossier path (e.g. exported_activities[0]) or class name (e.g. com.example.WeakBankLab). Short names auto-resolved.",
+    params_schema={"component_ref": "dossier path e.g. exported_activities[0], or fully qualified class name (e.g. com.example.MyClass). Short names resolved automatically."},
     tier="llm",
 )
 
@@ -84,6 +84,8 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
         class_name = _class_name_from_ref(dossier_dict, component_ref)
     else:
         class_name = component_ref if component_ref else None
+        if class_name and "." not in class_name:
+            class_name = resolve_short_class_name(class_name, dossier_dict) or class_name
     if not class_name:
         return SkillResult(
             success=False,
