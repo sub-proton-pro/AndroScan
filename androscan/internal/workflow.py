@@ -365,6 +365,12 @@ def run_workflow(
 
     # --- Common path: exploit verification, report, run_meta, observations ---
 
+    # Auto-assign unique IDs to hypotheses that lack them so that
+    # generate_report can map verification results back correctly.
+    for idx, h in enumerate(validated):
+        if not (h.id or "").strip():
+            h.id = f"HYP-{idx}"
+
     verification_results: list = []
     if validated and tasks:
         vuln_module = tasks[0]

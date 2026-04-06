@@ -37,13 +37,19 @@ def is_ollama_available(base_url: str, timeout: int = 5) -> tuple[bool, str]:
         return False, f"Timeout connecting to {url}"
 
 
-def _build_messages(system_content: Optional[str], user_content: str) -> list[dict[str, Any]]:
+def _build_messages(
+    system_content: Optional[str],
+    user_content: str,
+    images: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    msgs: list[dict[str, Any]] = []
     if system_content:
-        return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
-        ]
-    return [{"role": "user", "content": user_content}]
+        msgs.append({"role": "system", "content": system_content})
+    user_msg: dict[str, Any] = {"role": "user", "content": user_content}
+    if images:
+        user_msg["images"] = images
+    msgs.append(user_msg)
+    return msgs
 
 
 def _parse_http_error(e: requests.HTTPError, base_url: str, payload: dict) -> None:
@@ -162,9 +168,13 @@ def complete(
     on_token: Optional[Callable[[str], None]] = None,
     on_thinking: Optional[Callable[[str], None]] = None,
     run_logger: Optional[Any] = None,
+    images: Optional[list[str]] = None,
     **kwargs: Any,
 ) -> CompleteResult:
-    """Call Ollama /api/chat. Uses timeout and num_predict retry tiers. Returns content, thinking, metadata."""
+    """Call Ollama /api/chat. Uses timeout and num_predict retry tiers. Returns content, thinking, metadata.
+
+    images: optional list of base64-encoded image strings for multimodal models.
+    """
     _ = kwargs
     if config is None:
         config = load_config()
@@ -176,7 +186,7 @@ def complete(
 
     timeout_idx = 0
     num_predict_idx = 0
-    messages = _build_messages(system_content, prompt)
+    messages = _build_messages(system_content, prompt, images=images)
 
     while True:
         timeout = OLLAMA_TIMEOUT_TIERS[timeout_idx]
