@@ -8,6 +8,7 @@ from androscan.llm.prompts import (
     build_consolidation_system_content,
     build_prompt,
     build_system_content,
+    classify_dossier_components,
     iter_dossier_components,
 )
 
@@ -19,6 +20,7 @@ __all__ = [
     "build_consolidation_prompt",
     "build_consolidation_system_content",
     "build_system_content",
+    "classify_dossier_components",
     "iter_dossier_components",
     "is_ollama_available",
     "parse_response",

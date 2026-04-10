@@ -17,6 +17,7 @@ from androscan.llm import (
     build_consolidation_system_content,
     build_prompt,
     build_system_content,
+    classify_dossier_components,
     complete,
     iter_dossier_components,
     parse_response,
@@ -122,6 +123,9 @@ def run_workflow(
     ctx = SkillContext(config=config, run_folder=run_folder, apk_path=apk_path)
     app_id_root = run_folder.parent
 
+    lib_summary: list[dict[str, str]] = []
+    lib_skipped: list[dict[str, str]] = []
+
     # In test mode, skip extraction and LLM analysis entirely
     if exploit_verification_test_mode and preloaded_hypotheses is not None:
         if run_logger:
@@ -177,6 +181,28 @@ def run_workflow(
 
         ctx.dossier_dict = dossier_dict
 
+        # Risk-based component classification
+        analysis_dossier, lib_summary, lib_skipped = classify_dossier_components(dossier_dict)
+        _total_original = sum(
+            len(dossier_dict.get(k) or [])
+            for k in ("exported_activities", "exported_services",
+                      "exported_receivers", "exported_providers", "deep_links")
+        )
+        _total_full = sum(
+            len(analysis_dossier.get(k) or [])
+            for k in ("exported_activities", "exported_services",
+                      "exported_receivers", "exported_providers", "deep_links")
+        )
+        if run_logger:
+            run_logger.info(
+                f"Component classification: {_total_original} total -> "
+                f"{_total_full} FULL, {len(lib_summary)} SUMMARY, {len(lib_skipped)} SKIP"
+            )
+            for entry in lib_summary:
+                run_logger.info(f"  [SUMMARY] {entry['type']}: {entry['name']} -- {entry['reason']}")
+            for entry in lib_skipped:
+                run_logger.info(f"  [SKIP]    {entry['type']}: {entry['name']} -- {entry['reason']}")
+
         prior_skill_results: list[str] = []
         skill_result_memory_cache: dict[str, str] = {}
         hypotheses: list[Hypothesis] = []
@@ -186,7 +212,7 @@ def run_workflow(
         if getattr(config, "per_component_analysis", False):
             # Per-component: one prompt per exported component, then aggregate and consolidate.
             all_hypotheses: list[Hypothesis] = []
-            for slice_dict, component_type, label, list_key, full_index in iter_dossier_components(dossier_dict):
+            for slice_dict, component_type, label, list_key, full_index in iter_dossier_components(analysis_dossier):
                 if run_logger:
                     run_logger.write_raw("\n---------- Component: " + component_type + " - " + label + " ----------\n")
                 comp_prior: list[str] = []
@@ -233,7 +259,7 @@ def run_workflow(
                                 skill_descs.append(f"{name}({params})")
                             run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
                         results = run_skills(
-                            comp_resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
+                            comp_resp.skill_requests, slice_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
                         )
                         if run_logger:
                             for name, res in results:
@@ -274,7 +300,7 @@ def run_workflow(
             turn = 0
             while turn < max_turns:
                 turn += 1
-                prompt = build_prompt(dossier_dict, prior_skill_results if prior_skill_results else None, list_llm_skills())
+                prompt = build_prompt(analysis_dossier, prior_skill_results if prior_skill_results else None, list_llm_skills())
                 if run_logger:
                     run_logger.task_update("LLM is analysing exported components...")
                     run_logger.llm_busy(True)
@@ -309,7 +335,7 @@ def run_workflow(
                             skill_descs.append(f"{name}({params})")
                         run_logger.info("Skills requested by LLM: " + ", ".join(skill_descs))
                     results = run_skills(
-                        resp.skill_requests, dossier_dict, run_folder, ctx, memory_cache=skill_result_memory_cache
+                        resp.skill_requests, analysis_dossier, run_folder, ctx, memory_cache=skill_result_memory_cache
                     )
                     if run_logger:
                         for name, res in results:
@@ -318,7 +344,7 @@ def run_workflow(
                         executed = [getattr(req, "skill", None) or (req.get("skill") if isinstance(req, dict) else "?") for req in resp.skill_requests]
                         run_logger.info("Skills executed by tool: " + ", ".join(executed))
                         result_texts = [r.text for _, r in results]
-                        next_prompt = build_prompt(dossier_dict, prior_skill_results + result_texts, list_llm_skills())
+                        next_prompt = build_prompt(analysis_dossier, prior_skill_results + result_texts, list_llm_skills())
                         run_logger.info("Data sent to LLM after executing requested skills:\n" + next_prompt)
                     prior_skill_results.extend(r.text for _, r in results)
                     continue
@@ -327,13 +353,14 @@ def run_workflow(
                     hypotheses = resp.hypotheses
                     break
 
-        # Normalize and resolve evidence_refs
+        # Normalize and resolve evidence_refs against the filtered dossier
+        # (indices match what the LLM saw in analysis_dossier)
         validated = []
         for h in hypotheses:
             resolved_refs = []
             for ref in h.evidence_refs or []:
-                resolved = resolve_ref(dossier_dict, ref)
-                if resolved and validate_ref(dossier_dict, resolved) and resolved not in resolved_refs:
+                resolved = resolve_ref(analysis_dossier, ref)
+                if resolved and validate_ref(analysis_dossier, resolved) and resolved not in resolved_refs:
                     resolved_refs.append(resolved)
             if resolved_refs:
                 validated.append(
@@ -385,6 +412,8 @@ def run_workflow(
         "hypotheses": [_hypothesis_to_dict(h) for h in validated],
         "summary": summary,
         "verification_results": verification_results,
+        "library_summary": lib_summary,
+        "library_skipped": lib_skipped,
     }
     report_result = execute("generate_report", report_params, ctx)
     if not report_result.success and run_logger:

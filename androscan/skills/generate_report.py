@@ -21,7 +21,9 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
     hypotheses = params.get("hypotheses") or []
     summary = params.get("summary") or ""
     verification_results = params.get("verification_results") or []
-    # Map hypothesis_id -> { verified, reasoning, artifact_dir }
+    library_summary = params.get("library_summary") or []
+    library_skipped = params.get("library_skipped") or []
+
     verification_by_id = {
         v.get("hypothesis_id"): v
         for v in verification_results
@@ -53,10 +55,15 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
             entry["verification_artifact_dir"] = None
         report_hypotheses.append(entry)
 
-    report = {
+    report: dict = {
         "summary": summary,
         "hypotheses": report_hypotheses,
     }
+    if library_summary:
+        report["library_components_noted"] = library_summary
+    if library_skipped:
+        report["library_components_skipped"] = library_skipped
+
     report_path = context.run_folder / "report.json"
     try:
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")

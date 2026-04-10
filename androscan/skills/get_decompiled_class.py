@@ -6,7 +6,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-from androscan.skills.base import SkillContext, SkillMeta, SkillResult, resolve_short_class_name
+from androscan.skills.base import (
+    SkillContext,
+    SkillMeta,
+    SkillResult,
+    generate_class_name_alternatives,
+    resolve_short_class_name,
+)
 
 SKILL_META = SkillMeta(
     name="get_decompiled_class",
@@ -61,6 +67,38 @@ def resolve_component_ref(dossier_dict: dict[str, Any], component_ref: str) -> O
     return ref
 
 
+def _run_jadx(jadx_cmd: str, class_name: str, apk_file: Path) -> tuple[bool, str]:
+    """Run jadx --single-class and return (success, content_or_error)."""
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".java", delete=False) as f:
+            out_file = Path(f.name)
+        try:
+            proc = subprocess.run(
+                [
+                    jadx_cmd,
+                    "--single-class", class_name,
+                    "--single-class-output", str(out_file),
+                    str(apk_file),
+                ],
+                capture_output=True,
+                timeout=120,
+                text=True,
+            )
+            if proc.returncode != 0:
+                stderr = (proc.stderr or proc.stdout or "").strip()
+                return False, stderr or "unknown error"
+            if not out_file.exists():
+                return False, "jadx did not produce output"
+            content = out_file.read_text(encoding="utf-8", errors="replace")
+            return True, content
+        finally:
+            out_file.unlink(missing_ok=True)
+    except subprocess.TimeoutExpired:
+        return False, "jadx timed out"
+    except OSError as e:
+        return False, str(e)
+
+
 def execute(params: dict, context: SkillContext) -> SkillResult:
     """Decompile the class for the given component_ref via jadx. component_ref may be a dossier path or full class name."""
     component_ref = (params.get("component_ref") or "").strip()
@@ -93,39 +131,20 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
             text=f"[get_decompiled_class] Invalid or unresolved component_ref: {component_ref!r}",
         )
 
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".java", delete=False) as f:
-            out_file = Path(f.name)
-        try:
-            proc = subprocess.run(
-                [
-                    jadx_cmd,
-                    "--single-class", class_name,
-                    "--single-class-output", str(out_file),
-                    str(apk_file),
-                ],
-                capture_output=True,
-                timeout=120,
-                text=True,
-            )
-            if proc.returncode != 0:
-                stderr = (proc.stderr or proc.stdout or "").strip()
-                return SkillResult(
-                    success=False,
-                    data=None,
-                    text=f"[get_decompiled_class] jadx failed for {class_name}: {stderr or 'unknown error'}",
-                )
-            if not out_file.exists():
-                return SkillResult(
-                    success=False,
-                    data=None,
-                    text=f"[get_decompiled_class] jadx did not produce output for {class_name}.",
-                )
-            content = out_file.read_text(encoding="utf-8", errors="replace")
-            return SkillResult(success=True, data=content, text=content)
-        finally:
-            out_file.unlink(missing_ok=True)
-    except subprocess.TimeoutExpired:
-        return SkillResult(success=False, data=None, text="[get_decompiled_class] jadx timed out.")
-    except OSError as e:
-        return SkillResult(success=False, data=None, text=f"[get_decompiled_class] {e}.")
+    success, content = _run_jadx(jadx_cmd, class_name, apk_file)
+    if success:
+        return SkillResult(success=True, data=content, text=content)
+
+    run_folder = Path(context.run_folder) if context.run_folder else None
+    alternatives = generate_class_name_alternatives(class_name, dossier_dict, run_folder)
+    for alt_name in alternatives:
+        alt_success, alt_content = _run_jadx(jadx_cmd, alt_name, apk_file)
+        if alt_success:
+            hint = f"[get_decompiled_class] Note: '{class_name}' not found; resolved to '{alt_name}'.\n"
+            return SkillResult(success=True, data=alt_content, text=hint + alt_content)
+
+    return SkillResult(
+        success=False,
+        data=None,
+        text=f"[get_decompiled_class] jadx failed for {class_name}: {content}",
+    )

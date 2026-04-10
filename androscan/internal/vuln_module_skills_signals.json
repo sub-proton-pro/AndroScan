@@ -16,7 +16,7 @@
         },
         "exported_service": {
           "signal_types": ["logcat", "dumpsys_activity", "app_data_snapshot"],
-          "template_intents": ["start_service"],
+          "template_intents": ["start_service", "start_foreground_service"],
           "volatile": []
         },
         "exported_receiver": {
