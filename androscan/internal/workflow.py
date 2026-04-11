@@ -181,6 +181,18 @@ def run_workflow(
 
         ctx.dossier_dict = dossier_dict
 
+        if run_logger:
+            _n_act = len(dossier_dict.get("exported_activities") or [])
+            _n_svc = len(dossier_dict.get("exported_services") or [])
+            _n_rcv = len(dossier_dict.get("exported_receivers") or [])
+            _n_prv = len(dossier_dict.get("exported_providers") or [])
+            _n_dl = len(dossier_dict.get("deep_links") or [])
+            run_logger.info(
+                f"Dossier loaded: {_n_act} activities, {_n_svc} services, "
+                f"{_n_rcv} receivers, {_n_prv} providers, {_n_dl} deep links "
+                f"({_n_act + _n_svc + _n_rcv + _n_prv + _n_dl} exported components total)"
+            )
+
         # Risk-based component classification
         analysis_dossier, lib_summary, lib_skipped = classify_dossier_components(dossier_dict)
         _total_original = sum(
