@@ -12,27 +12,32 @@
         "exported_activity": {
           "signal_types": ["screenshot", "logcat", "dumpsys_activity", "window_stack"],
           "template_intents": ["launch_activity"],
-          "volatile": ["screenshot"]
+          "volatile": ["screenshot"],
+          "logcat_system_tags": ["ActivityManager", "ActivityTaskManager", "AndroidRuntime", "WindowManager", "Process"]
         },
         "exported_service": {
           "signal_types": ["logcat", "dumpsys_activity", "app_data_snapshot"],
           "template_intents": ["start_service", "start_foreground_service"],
-          "volatile": []
+          "volatile": [],
+          "logcat_system_tags": ["ActivityManager", "ActivityTaskManager", "AndroidRuntime", "Bundle", "Process"]
         },
         "exported_receiver": {
           "signal_types": ["logcat"],
           "template_intents": ["broadcast"],
-          "volatile": []
+          "volatile": [],
+          "logcat_system_tags": ["ActivityManager", "ActivityTaskManager", "AndroidRuntime", "BroadcastQueue", "Process"]
         },
         "deep_link": {
           "signal_types": ["screenshot", "logcat", "dumpsys_activity"],
           "template_intents": ["open_deep_link"],
-          "volatile": ["screenshot"]
+          "volatile": ["screenshot"],
+          "logcat_system_tags": ["ActivityManager", "ActivityTaskManager", "AndroidRuntime", "WindowManager", "Process"]
         },
         "exported_provider": {
           "signal_types": ["logcat", "content_provider_query", "app_data_snapshot"],
           "template_intents": ["query_provider"],
-          "volatile": []
+          "volatile": [],
+          "logcat_system_tags": ["ActivityManager", "ActivityTaskManager", "AndroidRuntime", "Process"]
         }
       }
     }

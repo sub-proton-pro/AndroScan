@@ -47,3 +47,10 @@ def get_module_skills(module_name: str) -> list[str]:
     modules = data.get("modules") or {}
     mod = modules.get(module_name) or {}
     return list(mod.get("skills") or [])
+
+
+def get_logcat_system_tags(module_name: str, profile_name: str) -> list[str]:
+    """Return logcat_system_tags for a specific profile, or empty list."""
+    profiles = get_module_profiles(module_name)
+    profile = profiles.get(profile_name) or {}
+    return list(profile.get("logcat_system_tags") or [])
