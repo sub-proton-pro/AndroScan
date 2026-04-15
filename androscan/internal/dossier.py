@@ -61,6 +61,8 @@ class ExportedProvider:
     read_permission: Optional[str] = None
     write_permission: Optional[str] = None
     grant_uri_permissions: bool = False
+    all_authorities: list[str] = field(default_factory=list)
+    path_permissions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -137,6 +139,8 @@ class Dossier:
                 read_permission=p.get("read_permission"),
                 write_permission=p.get("write_permission"),
                 grant_uri_permissions=bool(p.get("grant_uri_permissions", False)),
+                all_authorities=list(p.get("all_authorities") or []),
+                path_permissions=list(p.get("path_permissions") or []),
             )
 
         def _parse_deep_link(dl: dict) -> DeepLink:
@@ -206,6 +210,8 @@ class Dossier:
                     "read_permission": p.read_permission,
                     "write_permission": p.write_permission,
                     "grant_uri_permissions": p.grant_uri_permissions,
+                    **({"all_authorities": p.all_authorities} if p.all_authorities else {}),
+                    **({"path_permissions": p.path_permissions} if p.path_permissions else {}),
                 }
                 for p in self.exported_providers
             ],

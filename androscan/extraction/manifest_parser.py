@@ -70,10 +70,33 @@ def _parse_component(
         "intent_filters": intent_filters,
     }
     if tag == "provider":
-        out["authority"] = _attr(el, "authority")
+        raw_authority = _attr(el, "authorities") or _attr(el, "authority")
+        authorities = [a.strip() for a in raw_authority.split(";") if a.strip()]
+        out["authority"] = authorities[0] if authorities else ""
+        if len(authorities) > 1:
+            out["all_authorities"] = authorities
         out["read_permission"] = _attr(el, "readPermission") or None
         out["write_permission"] = _attr(el, "writePermission") or None
         out["grant_uri_permissions"] = _attr_bool(el, "grantUriPermissions")
+        path_perms: list[dict[str, Any]] = []
+        for child in el:
+            ctag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if ctag == "path-permission":
+                pp: dict[str, Any] = {}
+                for attr_name in ("path", "pathPrefix", "pathPattern"):
+                    val = _attr(child, attr_name)
+                    if val:
+                        pp[attr_name] = val
+                rp = _attr(child, "readPermission")
+                wp = _attr(child, "writePermission")
+                if rp:
+                    pp["readPermission"] = rp
+                if wp:
+                    pp["writePermission"] = wp
+                if pp:
+                    path_perms.append(pp)
+        if path_perms:
+            out["path_permissions"] = path_perms
     return out
 
 
@@ -201,7 +224,7 @@ def build_dossier_dict_from_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
         }
 
     def to_provider(p: dict) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "name": p.get("name", ""),
             "exported": bool(p.get("exported", False)),
             "authority": p.get("authority", ""),
@@ -209,6 +232,11 @@ def build_dossier_dict_from_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
             "write_permission": p.get("write_permission"),
             "grant_uri_permissions": bool(p.get("grant_uri_permissions", False)),
         }
+        if p.get("all_authorities"):
+            out["all_authorities"] = list(p["all_authorities"])
+        if p.get("path_permissions"):
+            out["path_permissions"] = list(p["path_permissions"])
+        return out
 
     exported_activities = [to_activity(a) for a in (parsed.get("activities") or []) if a.get("exported")]
     exported_services = [to_service(s) for s in (parsed.get("services") or []) if s.get("exported")]

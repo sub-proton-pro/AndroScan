@@ -96,13 +96,24 @@ def _component_name_from_ref(dossier: Any, ref: str) -> Optional[str]:
     return None
 
 
+def _parse_run_folder_time(name: str) -> float:
+    """Parse run folder name (DD-mon-YY_HH-MM-SS) into a timestamp for sorting."""
+    from datetime import datetime as _dt
+    for fmt in ("%d-%b-%y_%H-%M-%S", "%d-%b-%Y_%H-%M-%S"):
+        try:
+            return _dt.strptime(name, fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
 def _find_latest_hypotheses(app_id_root: Path) -> tuple[Optional[list], Optional[str]]:
     """Find the most recent hypotheses.json in the app's run folders. Returns (data, run_folder_name)."""
     if not app_id_root.is_dir():
         return None, None
     candidates = sorted(
         [d for d in app_id_root.iterdir() if d.is_dir() and (d / "hypotheses.json").exists()],
-        key=lambda d: d.name,
+        key=lambda d: _parse_run_folder_time(d.name),
         reverse=True,
     )
     for run_dir in candidates:

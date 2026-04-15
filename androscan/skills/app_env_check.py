@@ -1,16 +1,20 @@
 """Exploit-verification skill: check device(s), emulator, and app installed via adb."""
 
+import hashlib
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from androscan.skills.base import SkillContext, SkillMeta, SkillResult
 
 SKILL_META = SkillMeta(
     name="app_env_check",
-    description="Check that an emulator/device is available, is an emulator (ro.kernel.qemu=1), and the given package is installed. Optionally checks if app is running and in foreground, and brings it to foreground. Use device_serial if multiple devices; pass run_logger for run.log and spinner.",
+    description="Check that an emulator/device is available, is an emulator (ro.kernel.qemu=1), and the given package is installed. Compares the scanned APK hash against the installed APK and reinstalls if they differ. Optionally checks if app is running and in foreground, and brings it to foreground.",
     params_schema={
         "package": "Android package name (e.g. com.example.app)",
+        "apk_path": "Optional. Path to the APK file being scanned. Used to compare against the installed version and reinstall if needed.",
         "device_serial": "Optional. ADB device serial (e.g. emulator-5554). Required when multiple devices are attached.",
         "run_logger": "Optional. RunLogger for run.log and spinner (task_update with \\r for overwrite).",
     },
@@ -48,6 +52,77 @@ def _list_devices() -> tuple[list[dict[str, str]], str]:
             if state == "device":
                 devices.append({"serial": serial, "state": state})
     return devices, ""
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _get_installed_apk_hash(serial: str | None, package: str) -> tuple[str, str]:
+    """Pull the installed APK to a temp file and compute its SHA256.
+
+    Returns (hash, error). On success error is empty.
+    """
+    try:
+        proc = _run_adb(serial, "shell", "pm", "path", package, timeout=10)
+    except subprocess.TimeoutExpired:
+        return "", "pm path timed out"
+    pm_out = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+    if "package:" not in pm_out:
+        return "", "package not installed"
+    device_apk_path = pm_out.split("package:")[-1].strip()
+    tmp = tempfile.NamedTemporaryFile(suffix=".apk", delete=False)
+    tmp.close()
+    try:
+        pull = _run_adb(serial, "pull", device_apk_path, tmp.name, timeout=60)
+        if pull.returncode != 0:
+            return "", f"adb pull failed: {(pull.stderr or '').strip()[:200]}"
+        return _sha256_file(tmp.name), ""
+    except subprocess.TimeoutExpired:
+        return "", "adb pull timed out"
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+def _install_apk(serial: str | None, apk_path: str, run_logger: Any = None) -> tuple[bool, str]:
+    """Install an APK onto the device, handling filenames with spaces.
+
+    Returns (success, detail).
+    """
+    p = Path(apk_path)
+    needs_rename = " " in p.name or not p.name.endswith(".apk")
+    tmp_path: str | None = None
+
+    try:
+        if needs_rename:
+            safe_name = p.stem.replace(" ", "_")
+            if not safe_name.endswith(".apk"):
+                safe_name += ".apk"
+            tmp = tempfile.NamedTemporaryFile(suffix=".apk", prefix=safe_name + "_", delete=False)
+            tmp.close()
+            tmp_path = tmp.name
+            shutil.copy2(apk_path, tmp_path)
+            install_path = tmp_path
+        else:
+            install_path = apk_path
+
+        proc = _run_adb(serial, "install", "-r", install_path, timeout=120)
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        if proc.returncode == 0 and "Success" in stdout:
+            return True, "installed"
+        return False, f"adb install failed (exit {proc.returncode}): {stderr or stdout}"[:300]
+    except subprocess.TimeoutExpired:
+        return False, "adb install timed out"
+    except OSError as e:
+        return False, f"file error: {e}"
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
@@ -134,12 +209,68 @@ def execute(params: dict[str, Any], context: SkillContext) -> SkillResult:
         run_logger.task_update(f"Emulated device found: {serial}")
         run_logger.exploit_stage(f"Emulated device found: {serial}")
 
+    apk_path = (params.get("apk_path") or "").strip() or None
+    if apk_path is None and context.apk_path:
+        apk_path = context.apk_path
+
+    # If app is not installed but we have the APK, install it
     if not app_installed:
-        return SkillResult(
-            success=False,
-            data=data,
-            text=f"[app_env_check] Package {package!r} is not installed on {serial}. Install the APK first.",
-        )
+        if apk_path and Path(apk_path).is_file():
+            if run_logger:
+                run_logger.exploit_stage(f"Package {package!r} not installed. Installing from scanned APK...")
+                run_logger.task_update(f"Installing {package}...")
+            ok, detail = _install_apk(serial, apk_path, run_logger)
+            if ok:
+                app_installed = True
+                data["app_installed"] = True
+                data["apk_freshly_installed"] = True
+                if run_logger:
+                    run_logger.exploit_stage(f"APK installed successfully.")
+            else:
+                if run_logger:
+                    run_logger.exploit_stage(f"APK install failed: {detail}")
+                return SkillResult(
+                    success=False,
+                    data=data,
+                    text=f"[app_env_check] Package {package!r} not installed and install failed: {detail}",
+                )
+        else:
+            return SkillResult(
+                success=False,
+                data=data,
+                text=f"[app_env_check] Package {package!r} is not installed on {serial}. Install the APK first.",
+            )
+
+    # Compare scanned APK against installed APK and reinstall if they differ
+    if app_installed and apk_path and Path(apk_path).is_file() and not data.get("apk_freshly_installed"):
+        if run_logger:
+            run_logger.task_update("Comparing scanned APK against installed version...")
+        try:
+            scanned_hash = _sha256_file(apk_path)
+            installed_hash, hash_err = _get_installed_apk_hash(serial, package)
+            if hash_err:
+                if run_logger:
+                    run_logger.exploit_stage(f"Could not compare APK hashes ({hash_err}), proceeding with installed version.")
+            elif scanned_hash != installed_hash:
+                if run_logger:
+                    run_logger.exploit_stage(
+                        f"APK mismatch detected: scanned APK differs from installed version. Reinstalling..."
+                    )
+                    run_logger.task_update(f"Reinstalling {package} (version mismatch)...")
+                ok, detail = _install_apk(serial, apk_path, run_logger)
+                if ok:
+                    data["apk_reinstalled"] = True
+                    if run_logger:
+                        run_logger.exploit_stage("APK reinstalled successfully to match scanned version.")
+                else:
+                    if run_logger:
+                        run_logger.warning(f"[app_env_check] APK reinstall failed: {detail}. Proceeding with old version.")
+            else:
+                if run_logger:
+                    run_logger.exploit_stage("Installed APK matches scanned APK (hash verified).")
+        except OSError as e:
+            if run_logger:
+                run_logger.exploit_stage(f"Could not verify APK hash: {e}")
 
     def _log_spinner(text: str) -> None:
         if run_logger:

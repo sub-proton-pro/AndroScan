@@ -156,6 +156,40 @@ def _capture_app_data_snapshot(serial: str, package: str, _context: SkillContext
     return "\n".join(parts)
 
 
+def _capture_content_provider_query(serial: str, _package: str, context: SkillContext) -> str:
+    """Query all exported ContentProvider authorities and return results."""
+    dossier = getattr(context, "dossier_dict", None) or {}
+    providers = dossier.get("exported_providers") or []
+    if not providers:
+        return "(no exported providers in dossier)"
+
+    parts: list[str] = []
+    for prov in providers:
+        authority = (prov.get("authority") or "").strip()
+        if not authority:
+            continue
+        for auth in authority.split(";"):
+            auth = auth.strip()
+            if not auth:
+                continue
+            uri = f"content://{auth}"
+            try:
+                proc = _run_adb(serial, "shell", "content", "query", "--uri", uri, timeout=10)
+            except subprocess.TimeoutExpired:
+                parts.append(f"=== {uri} ===\n[query timed out]")
+                continue
+            output = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            if proc.returncode != 0:
+                parts.append(f"=== {uri} ===\n[error: exit {proc.returncode}] {stderr}")
+            elif not output:
+                parts.append(f"=== {uri} ===\n[empty result set]")
+            else:
+                parts.append(f"=== {uri} ===\n{output[:20000]}")
+
+    return "\n\n".join(parts) if parts else "(no provider authorities found)"
+
+
 def _capture_signal(
     signal_type: str,
     serial: str,
@@ -176,6 +210,8 @@ def _capture_signal(
         return _capture_screenshot(serial, package, context, file_prefix)
     if signal_type == "app_data_snapshot":
         return _capture_app_data_snapshot(serial, package, context)
+    if signal_type == "content_provider_query":
+        return _capture_content_provider_query(serial, package, context)
     return STUB_MESSAGE
 
 
