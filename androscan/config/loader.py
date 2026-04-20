@@ -15,6 +15,34 @@ import yaml
 from androscan import constants
 
 
+CLOUD_PROVIDERS = {
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "key_env": "GEMINI_API_KEY",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "key_env": "OPENAI_API_KEY",
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "key_env": "GROQ_API_KEY",
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "key_env": "DEEPSEEK_API_KEY",
+    },
+    "together": {
+        "base_url": "https://api.together.xyz/v1",
+        "key_env": "TOGETHERAI_API_KEY",
+    },
+    "mistral": {
+        "base_url": "https://api.mistral.ai/v1",
+        "key_env": "MISTRAL_API_KEY",
+    },
+}
+
+
 @dataclass(frozen=True)
 class Config:
     """Runtime configuration. Load via load_config()."""
@@ -24,6 +52,10 @@ class Config:
     ollama_model: str
     ollama_temperature: float
     ollama_num_predict: int
+    llm_provider: str  # "ollama" or cloud provider name from CLOUD_PROVIDERS
+    cloud_model: str
+    cloud_api_key: str
+    cloud_temperature: float
     run_folder_root: str
     max_turns: int
     max_hypotheses_per_report: int
@@ -41,6 +73,10 @@ class Config:
             ollama_model="qwen3.5:35b",
             ollama_temperature=0.2,
             ollama_num_predict=constants.OLLAMA_NUM_PREDICT_DEFAULT,
+            llm_provider="ollama",
+            cloud_model="",
+            cloud_api_key="",
+            cloud_temperature=0.2,
             run_folder_root="apps",
             max_turns=constants.MAX_TURNS_DEFAULT,
             max_hypotheses_per_report=constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT,
@@ -50,6 +86,30 @@ class Config:
             section_rule_char=constants.SECTION_RULE_CHAR,
             section_rule_length=constants.SECTION_RULE_LENGTH,
         )
+
+    @property
+    def is_cloud(self) -> bool:
+        return self.llm_provider != "ollama"
+
+    @property
+    def active_model(self) -> str:
+        """Return the model name for the active provider."""
+        if self.is_cloud:
+            return self.cloud_model or "(not set)"
+        return self.ollama_model
+
+    def resolve_cloud_api_key(self) -> str:
+        """Return cloud API key from config or environment."""
+        if self.cloud_api_key:
+            return self.cloud_api_key
+        provider_info = CLOUD_PROVIDERS.get(self.llm_provider, {})
+        env_var = provider_info.get("key_env", "")
+        return os.environ.get(env_var, "") if env_var else ""
+
+    def resolve_cloud_base_url(self) -> str:
+        """Return the OpenAI-compatible base URL for the cloud provider."""
+        provider_info = CLOUD_PROVIDERS.get(self.llm_provider, {})
+        return provider_info.get("base_url", "")
 
     @property
     def section_rule(self) -> str:
@@ -100,6 +160,7 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     """Extract flat keys from nested YAML for Config. Uses constants as defaults."""
     out: dict[str, Any] = {}
     ollama = config_dict.get("ollama") or {}
+    llm = config_dict.get("llm") or {}
     paths = config_dict.get("paths") or {}
     workflow = config_dict.get("workflow") or {}
     output = config_dict.get("output") or {}
@@ -108,6 +169,10 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["ollama_model"] = ollama.get("model") or "qwen3.5:35b"
     out["ollama_temperature"] = _safe_float(ollama.get("temperature"), 0.2, "ollama.temperature")
     out["ollama_num_predict"] = _safe_int(ollama.get("num_predict"), constants.OLLAMA_NUM_PREDICT_DEFAULT, "ollama.num_predict")
+    out["llm_provider"] = (llm.get("provider") or "ollama").strip().lower()
+    out["cloud_model"] = (llm.get("cloud_model") or "").strip()
+    out["cloud_api_key"] = (llm.get("cloud_api_key") or "").strip()
+    out["cloud_temperature"] = _safe_float(llm.get("cloud_temperature"), 0.2, "llm.cloud_temperature")
     out["run_folder_root"] = paths.get("run_folder_root") or "apps"
     out["max_turns"] = _safe_int(workflow.get("max_turns"), constants.MAX_TURNS_DEFAULT, "workflow.max_turns")
     out["max_hypotheses_per_report"] = _safe_int(workflow.get("max_hypotheses_per_report"), constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT, "workflow.max_hypotheses_per_report")
@@ -156,6 +221,10 @@ def load_config(config_path: Optional[str] = None) -> Config:
         merged["ollama_model"] = os.environ["ANDROSCAN_OLLAMA_MODEL"].strip()
     if os.environ.get("ANDROSCAN_RUN_FOLDER"):
         merged["run_folder_root"] = os.environ["ANDROSCAN_RUN_FOLDER"]
+    if os.environ.get("ANDROSCAN_LLM_PROVIDER"):
+        merged["llm_provider"] = os.environ["ANDROSCAN_LLM_PROVIDER"].strip().lower()
+    if os.environ.get("ANDROSCAN_CLOUD_MODEL"):
+        merged["cloud_model"] = os.environ["ANDROSCAN_CLOUD_MODEL"].strip()
 
     return Config(
         ollama_base_url=merged["ollama_base_url"],
@@ -163,6 +232,10 @@ def load_config(config_path: Optional[str] = None) -> Config:
         ollama_model=merged["ollama_model"],
         ollama_temperature=merged["ollama_temperature"],
         ollama_num_predict=max(1, merged["ollama_num_predict"]),
+        llm_provider=merged["llm_provider"],
+        cloud_model=merged["cloud_model"],
+        cloud_api_key=merged["cloud_api_key"],
+        cloud_temperature=merged["cloud_temperature"],
         run_folder_root=merged["run_folder_root"],
         max_turns=max(1, merged["max_turns"]),
         max_hypotheses_per_report=max(0, merged["max_hypotheses_per_report"]),
