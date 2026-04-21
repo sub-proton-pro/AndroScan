@@ -36,6 +36,7 @@ from androscan.internal.resolve_app_id import resolve_app_id
 from androscan.internal.run_folder import create_run_folder, run_folder_display_path
 from androscan.internal.run_log import RunLogger
 from androscan.internal.workflow import run_workflow
+from androscan.config import CLOUD_PROVIDERS
 from androscan.llm import is_ollama_available
 from androscan.llm.client import OLLAMA_SETUP_TIP
 from androscan.llm.parser import Hypothesis
@@ -236,7 +237,19 @@ def _run() -> int:
         "--model",
         default=None,
         metavar="NAME",
-        help="Ollama model to use (e.g. 'qwen3.5:35b'). Overrides config file setting.",
+        help="Model to use. For Ollama: 'qwen3.5:35b'. For cloud: 'gemini-2.5-flash', 'gpt-4o', etc.",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        metavar="NAME",
+        help=f"LLM provider: 'ollama' (default, local) or cloud: {', '.join(sorted(CLOUD_PROVIDERS.keys()))}.",
+    )
+    parser.add_argument(
+        "--cloud-api-key",
+        default=None,
+        metavar="KEY",
+        help="API key for cloud provider (prefer env vars like GEMINI_API_KEY instead).",
     )
     parser.add_argument(
         "--list-models",
@@ -267,8 +280,16 @@ def _run() -> int:
     if not args.apk:
         parser.error("--apk is required (unless using --list-models)")
 
+    if args.provider:
+        provider = args.provider.strip().lower()
+        config = dataclasses.replace(config, llm_provider=provider)
+    if args.cloud_api_key:
+        config = dataclasses.replace(config, cloud_api_key=args.cloud_api_key.strip())
     if args.model:
-        config = dataclasses.replace(config, ollama_model=args.model)
+        if config.is_cloud:
+            config = dataclasses.replace(config, cloud_model=args.model)
+        else:
+            config = dataclasses.replace(config, ollama_model=args.model)
 
     apk_path = args.apk
     tasks = args.tasks if args.tasks else ["exported_components"]
@@ -288,7 +309,9 @@ def _run() -> int:
     _section("Run started", config.section_rule)
     print(f"  Started:  {started}")
     print(f"  APK:      {apk_path}")
-    print(f"  Model:    {config.ollama_model}")
+    provider_label = config.llm_provider if config.is_cloud else "ollama (local)"
+    print(f"  Provider: {provider_label}")
+    print(f"  Model:    {config.active_model}")
     print(f"  Tasks:    {tasks_str}")
     print()
 
@@ -351,13 +374,26 @@ def _run() -> int:
         print(green(f"  Loaded {len(loaded_hyps)} hypothesis(es) from run {source_run}"))
         print()
 
-    base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
-    ollama_ok, ollama_detail = is_ollama_available(base_url)
-    if not ollama_ok:
-        detail_suffix = f" ({ollama_detail})" if ollama_detail else ""
-        print(orange(f"Ollama not reachable at {base_url}.{detail_suffix}"), file=sys.stderr)
-        print(grey(OLLAMA_SETUP_TIP), file=sys.stderr)
-        return 1
+    if config.is_cloud:
+        api_key = config.resolve_cloud_api_key()
+        if not api_key:
+            from androscan.config import CLOUD_PROVIDERS as _cp
+            key_env = _cp.get(config.llm_provider, {}).get("key_env", "???")
+            print(orange(f"No API key for cloud provider '{config.llm_provider}'."), file=sys.stderr)
+            print(grey(f"Set env var {key_env} or use --cloud-api-key <key>."), file=sys.stderr)
+            return 1
+        if not config.cloud_model:
+            print(orange("No cloud model specified."), file=sys.stderr)
+            print(grey("Use --model <name> (e.g. --model gemini-2.5-flash)."), file=sys.stderr)
+            return 1
+    else:
+        base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
+        ollama_ok, ollama_detail = is_ollama_available(base_url)
+        if not ollama_ok:
+            detail_suffix = f" ({ollama_detail})" if ollama_detail else ""
+            print(orange(f"Ollama not reachable at {base_url}.{detail_suffix}"), file=sys.stderr)
+            print(grey(OLLAMA_SETUP_TIP), file=sys.stderr)
+            return 1
 
     section_title = "Exploit Verification Test" if ev_test_mode else "Analysis"
     _section(section_title, config.section_rule)

@@ -435,7 +435,7 @@ def test_build_exploit_command_provider_success(tmp_path):
     )
     assert result.success is True
     assert result.data["template_id"] == "query_provider"
-    assert "content read --uri content://com.example.app.provider/" in result.data["command"]
+    assert "content query --uri content://com.example.app.provider" in result.data["command"]
 
 
 def test_build_exploit_command_deep_link_success(tmp_path):
