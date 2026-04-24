@@ -279,25 +279,26 @@ Use the following format for new entries:
 
 Use this section for limitations that are currently acceptable and not immediate defects.
 
-Example categories:
-- no web UI yet
-- CLI-first presentation mode only
-- persistence intentionally deferred
-- first feature uses simplified orchestration
-- report rendering supports one format only
-
 Keep these explicit so they are not mistaken for bugs or forgotten assumptions.
 
-### Example entry format
-
-### LIMIT-XXX: [Title]
+### LIMIT-001: Web UI requires a frontend build for static assets
 - status: Accepted Limitation
-- reason:
-- impact:
-- revisit when:
+- reason: Phase 6 serves the React bundle from `androscan/web/static/` after `npm run build` in `androscan/web/frontend/`. That directory is **gitignored**; without a local build, `GET /` returns JSON instructions (503-style) while **REST and WebSockets still work**.
+- impact: Low for API-only use; operators run one npm build for full UI.
+- revisit when: optional checked-in production bundle or install hook is added.
 - related docs:
+  - `docs/STATE.md`
+  - `androscan/web/frontend/README.md`
+  - `docs/DECISIONS.md` DEC-015
 
-Replace this section with real project-specific accepted limitations over time.
+### LIMIT-002: No static call graph or Frida in-repo yet
+- status: Accepted Limitation
+- reason: Phases 8–9 specify Smali-based graphs and Frida adapter; work not started.
+- impact: Medium for “interactive RE” vision only; static APK + LLM + ADB verification path remains the supported workflow.
+- revisit when: Phase 8 / Phase 9 implementation begins.
+- related docs:
+  - `docs/DESIGN_DOC.md` (Phases 8–9)
+  - `docs/DECISIONS.md` DEC-016, DEC-017
 
 ---
 

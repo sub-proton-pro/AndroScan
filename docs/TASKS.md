@@ -29,7 +29,109 @@ Do not start multiple unrelated tasks at once unless explicitly instructed.
 
 ## Active Task
 
-None. Phase 4 partial (error handling + docs cleanup) complete. CI remains parked. Pick from Priority Queue or Backlog.
+None. Phase 4 partial complete; CI remains parked. **Phase 6 (RE Workbench shell)** is implemented in code (`androscan/web/`, CLI `--serve`); Phases **7–9** remain as specified below. Pick from Priority Queue or continue RE roadmap.
+
+---
+
+## Interactive RE Workbench (Phases 6–9)
+
+Planned work: web-based interactive reverse engineering on top of the existing CLI pipeline — emulator mirror, click-to-code, static call graph from Smali, Frida tracing/hooking. **Stack (target):** FastAPI + WebSocket backend, React + Vite + TypeScript frontend, Monaco Editor, Cytoscape.js.
+
+### Sub-task status (implementation)
+
+| Phase | Title                         | Status   |
+|-------|-------------------------------|----------|
+| 6     | Web UI shell + mirror         | MVP done (FastAPI + React build; `adb screencap` mirror + logcat WS + tap API; scrcpy / UI log filters = follow-up). **UX step 1 done:** tabbed shell with `react-resizable-panels` + per-tab `ChatDock`. **UX step 2 done:** triage endpoints + chat back-end with guardrails + Reports tab refresh (Markdown findings, per-card triage actions, chat wired to `/api/chat`). **UX step 3 done:** `androscan/rag/` (chunker + embed providers + SQLite vector index + cosine top-k), `/api/rag/{app_id}/{status,rebuild,query}`, auto-build on decompile completion, `search_decompiled_sources` LLM skill, Inspect-tab chat enrichment; click-to-code (`POST /api/inspect/map`) + persistent decompile cache (`/api/decompile`, `/api/code/{tree,file}`) + package-scoped logcat with stable Linux-UID filtering + mirror online/offline (`/api/device/status`) + sandboxed `/api/adb/shell` + `resolve_ui_element` LLM skill (deterministic fuser; also called inline by `/api/inspect/map` to attach a `resolution` block); Inspect-tab frontend wiring (4-column resizable layout, MirrorView with status dot + click-to-map, ElementMappingPanel with `BestBanner` / `ResolutionAlternatives` / `RagHitsList` for the fuser output, CodeView with scroll-to-line + highlight, ScopedLogcat, AdbShell). **UX step 3.5 done:** Settings tab (`#/settings`) — global config (form + raw-YAML editor + reset), per-app overrides (`apps/<app_id>/app_settings.json`), live status (global + per-app health probes via `androscan/web/health_probes.py` + `/api/status/{global,apps/{app_id}}` with `asyncio.gather` + 3 s cache), diagnostics (raw API + `/api/settings/reload`); `androscan/config/loader.py` extended with `CONFIG_FIELD_MAP` + `LIVE_RELOADABLE_FIELDS` + write-back helpers; `app.py` keeps live `Config` on `app.state.config`; `HealthDot` in the global header. See DEC-020 + DEC-021. |
+| 7     | Click-to-code mapping         | Backend + frontend both done (`POST /api/inspect/map` + `androscan/web/inspect_map.py`; `resolve_ui_element` LLM skill fuses raw candidates + RAG into a single `best`/`alternatives`/`reasoning` block; Inspect-tab UI surfaces the fused pick in a prominent banner, alternatives + RAG hits as collapsible sections, and auto-jumps the Code Browser to `resolution.best`). |
+| 8     | Static call graph (Smali)     | Not started (UX step 4 inside `Hook Lab`) |
+| 9     | Frida integration             | Not started (UX step 4 inside `Hook Lab`) |
+
+**Phase 6→9 UX rollout (in addition to backend phases above):**
+
+1. **[done]** Tab shell + `react-resizable-panels` + `WorkbenchContext` + `ChatDock` skeleton.
+2. **[done]** Reports tab refresh + chat back-end. `androscan/web/triage.py` (`apps/<app>/<run>/triage.json`); `androscan/web/chat.py` with layered guardrails (allowlisted system prompt per tab, length caps, ANSI/zero-width/secret redaction, per-kind attachment budgets, `<context>` prompt-injection wrapping, rate limit, transcript JSONL). LLM client extended (`response_format=None`, `messages` override). Frontend `FindingCard` with Markdown + per-card triage buttons + severity override + note; `ChatDock` wired to `/api/chat`. **Note:** Lane-1 RAG indexer for static decompiled code is **deferred to step 3** where it pairs with click-to-code mapping (the chat needs code retrieval there; Reports works on dossier + finding alone).
+3. Inspect tab — **done:**
+   - **[done]** Lane-1 RAG indexer over decompiled sources (one-shot after jadx finishes). New `androscan/rag/` package: brace-balanced chunker for `.java`/`.kt`, `EmbedProvider` protocol with `fastembed` (default ONNX) / `ollama` / `hash` (test fallback) implementations, per-app SQLite vector store (WAL, packed `float32` blobs) at `apps/<app_id>/.decompiled/<sha>/rag.sqlite`, brute-force cosine top-k (numpy when present, pure-Python fallback). Endpoints `GET /api/rag/{app_id}/status`, `POST /api/rag/{app_id}/rebuild`, `POST /api/rag/{app_id}/query`. Auto-built via `schedule_rag_build_after_decompile` when the decompile cache turns ready. New `llm`-tier skill `search_decompiled_sources` (query, top_k, package_prefix, file_substr) advertised in the prompt catalog and fail-open. Inspect-tab chat enrichment in `androscan/web/chat.py::_enrich_inspect_with_rag` appends top-k snippets as `code` attachments (fail-soft when RAG is unavailable). New `pyproject` extra `[rag]` (fastembed, numpy). `Config` adds `rag_embed_provider` / `rag_embed_model` / `rag_top_k_default` (YAML `rag.*`, env `ANDROSCAN_RAG_*`). 197 tests pass.
+   - **[done]** Package-scoped logcat backend (`/ws/logcat?package=…`) using **stable Linux-UID filtering** (`adb logcat --uid=<uid>` resolved via `stat /data/data/<pkg>` or `dumpsys package`) so the stream survives app restarts; falls back to `--pid=` re-resolution on older devices.
+   - **[done]** Mirror online/offline probe at `GET /api/device/status` (`adb get-state`); UI badge wiring still pending.
+   - **[done]** Click-to-map backend (`POST /api/inspect/map` in `androscan/web/inspect_map.py`): `dumpsys activity top` for foreground activity, `uiautomator dump /dev/tty` for view hierarchy, smallest-area-clickable bounds match, regex grep over the persistent decompile cache for handler candidates (`findViewById` > `onClick_near` > `compose_id` > `reference`). Persistent decompile cache backend in `androscan/web/decompile_cache.py` (`POST /api/decompile/{app_id}`, `GET /api/code/{app_id}/{tree,file}`) keyed by `sha256(apk)` under `apps/<app_id>/.decompiled/<sha>/sources/`. Sandboxed `POST /api/adb/shell` proxy with `shlex` parsing + denylist + 20 s timeout + 200 KB output cap.
+   - **[done]** New `llm`-tier skill `resolve_ui_element` (`androscan/skills/resolve_ui_element.py`) — deterministic, explainable scorer over raw click-to-code candidates with optional Lane-1 RAG enrichment (synthesises a query from `text` > `content_desc` > short resource id). Pure-function `resolve()` reused inline by `/api/inspect/map` so the response now carries a `resolution` block ({`best`, `alternatives`, `rag_hits`, `reasoning`}) without an LLM round-trip. Tests: `tests/test_resolve_ui_element.py` (13 tests). **210 tests total, all passing.**
+   - **[done]** Inspect-tab **frontend** wiring (`androscan/web/frontend/src/tabs/InspectTab.tsx` + components). Four-column resizable layout: Projects sidebar | Classes-&-methods tree + scoped logcat | UI-mapping/Code-browser tabs + chat dock | Mirror + adb-shell. `MirrorView` renders `/ws/mirror` PNG frames, polls `/api/device/status` for an online/offline status dot, translates clicks from image-pixel space to device-pixel space and forwards to `/api/inspect/map`. `ElementMappingPanel` shows a sub-activity progress bar during the map call and then renders the fused `resolution.best` as a prominent banner (`SourceBadge` regex/RAG pill, kind pill, score, reasons grid, snippet, "Open in Code browser"), the deterministic candidates list with kind pills + per-row "Open" buttons, plus collapsible `ResolutionAlternatives` and `RagHitsList` (with the synthesised RAG query). The Code-browser tab uses `CodeView` (line numbers, scroll-to-line, persistent line-range highlight, find query, gear prefs); a tap auto-opens `resolution.best.file` and scrolls/highlights the picked line range, falling back to `candidates[0]` when no fuser pick exists. Chat attachments (`attachments` memo in `InspectTab`) include the fused `best_handler` JSON block alongside the element + candidates so the LLM sees the picked file/line/reasons. New CSS for `.source-badge` (deterministic = green, rag = warn), `.best-banner` (accent border + soft background, reasons grid), `.resolution-alts`, `.rag-hits`. Vite production build clean (308 modules, 32 KB CSS, 393 KB JS).
+3.5. **[done]** Settings tab — fourth top-level tab (`#/settings`) with four sub-panels:
+   - **Global settings:** form view (with source pills `yaml`/`env`/`default` per field, env-lock indicator, restart-required pill on non-live-reloadable fields) **plus** a raw-YAML editor with server-side validation; "Reset to defaults" button.
+   - **App settings (per-app):** project dropdown; per-key override-or-inherit toggles writing to `apps/<app_id>/app_settings.json` (atomic); "Reset to defaults" with force-with-warning when an override would diverge from a global field still consumed via the boot-time closure.
+   - **Status:** live cards for global health (adb / jadx / apktool / frida / Ollama / embed-provider / disk free + writability) and per-app health (`pm path`, foreground activity, UID, uiautomator dump, apk-sha drift, RAG status, decompile cache freshness); "Refresh now" cache-bypass button.
+   - **Diagnostics:** raw API JSON for global + per-app payloads, `POST /api/settings/reload`.
+   - Backend modules: `androscan/web/health_probes.py` (timeboxed pure-function async probes — never raise, return `{ok, label, ...}`), `androscan/web/per_app_settings.py` (atomic schema-versioned writes, `effective_settings` merger), `androscan/web/status_routes.py` (`asyncio.gather` + 3 s in-process cache; `invalidate_status_cache()` on every settings save), `androscan/web/settings_routes.py` (validates raw YAML, `dump_to_yaml`, `restore_defaults_yaml`; returns `restart_required` per field). `androscan/config/loader.py` extended with `CONFIG_FIELD_MAP`, `LIVE_RELOADABLE_FIELDS`, `global_view_from_config`, `effective_sources`, `with_overrides`, `coerce_yaml_value`, `dump_to_yaml`, `save_raw_yaml`, `restore_defaults_yaml`, `validate_raw_yaml`, `read_raw_yaml`, `discover_config_path`. `app.py` keeps the live `Config` on `app.state.config` (`_current_config`/`_set_config` helpers) so live-reloadable fields take effect without restarting uvicorn.
+   - Frontend: `SettingsTab` + sub-panels, `HealthDot` in the global header (30 s polling, deep-link to Settings), `api/settings.ts`, `api/status.ts`, ~300 lines of new CSS in `App.css`.
+   - Tests: `tests/test_health_probes.py`, `tests/test_per_app_settings.py`, `tests/test_settings_routes.py`. All Python tests green; `tsc --noEmit` + `vite build` clean.
+   - See **DEC-020** (settings tab design) and **DEC-021** (probe shape + asyncio.gather + cache).
+4. Hook Lab tab: static smali call graph, Frida adapter + ring buffer + agentic tool calls (`frida_query`, `frida_stats`), Cytoscape overlay (static = muted grey, frida = bold cyan), Monaco decompiled + script editor, scope/hooks inspector, chat with frida summary + tail.
+
+**Settings tab follow-ups (incremental, P2):**
+- Migrate hot-path route handlers (`/api/llm/info`, chat, RAG, decompile) to read from `app.state.config` so live reload covers their fields too — currently they capture `config` at boot, which is why the UI shows a `restart_required` pill for those fields.
+- Add a "compare to global" diff view in the per-app settings panel so overrides are visible at a glance.
+- Persist the raw-YAML editor's draft locally (sessionStorage) so an accidental tab switch doesn't lose unsaved work.
+- Add a "Hook Lab readiness" rollup probe (frida-server present on device, frida CLI on host, target package gadget injectable) once Hook Lab work begins.
+
+---
+
+### Phase 6 — Web UI shell with emulator mirror
+
+**Goal:** Serve a React frontend from a FastAPI backend with live emulator screen mirroring and basic project browsing.
+
+1. **Backend skeleton** (`androscan/web/`): FastAPI app with CORS, static file serving, WebSocket endpoints; `GET /api/projects` (list `apps/` folders), `GET /api/projects/{app_id}/runs`, `GET /api/dossier/{app_id}/{run_ts}`, `GET /api/findings/{app_id}/{run_ts}`; config keys `web_host`, `web_port` in `global_config.yaml`.
+2. **React frontend scaffold** (`androscan/web/frontend/`): Vite + React + TypeScript; layout — sidebar (projects, dossier components, findings), main area (mirror + detail panels); dark theme, monospace code areas.
+3. **Emulator screen mirror:** prefer `scrcpy` piped to WebSocket (MJPEG/h264) or `adb exec-out screencap` polling fallback; `<canvas>` or `<video>` in React; touch forwarding via `adb shell input tap x y`.
+4. **Live logcat streaming:** backend `adb logcat` subprocess → WebSocket; frontend scrollable panel with level coloring; filter by tag/level/keyword.
+5. **CLI integration:** e.g. `python androscan.py --serve [--port …]` starts server; optional `python androscan.py --apk … --serve` runs analysis then opens UI.
+6. **Tests:** unit tests for REST responses (mock data); WebSocket connect/disconnect lifecycle.
+7. **Dependencies (target):** Python `fastapi`, `uvicorn[standard]`, `websockets`; frontend `react`, `react-dom`, `vite`, `typescript`.
+
+---
+
+### Phase 7 — Click-to-code mapping
+
+**Goal:** Tap on mirrored screen → identify UI element → trace to Activity/class/method → show decompiled source in Monaco.
+
+1. **UI element identification:** on tap, `uiautomator dump` (or equivalent); parse XML; match coordinates to bounds; extract `resource-id`, `class`, `content-desc`, `text`, `package`, `bounds`.
+2. **Activity resolution:** `dumpsys activity top` (or equivalent) for foreground Activity.
+3. **Resource ID → source:** parse `R.java` / `R$id.java` from jadx output; search for `findViewById(R.id.…)` / View Binding; resolve class + method.
+4. **Monaco Editor:** `@monaco-editor/react` in detail panel; Java/Kotlin highlighting; read-only default; jump to line for resource reference.
+5. **API:** `POST /api/tap` (x, y) → element + source mapping; `GET /api/source/{class_name}` (delegate to existing jadx-backed decompilation path).
+6. **LLM-assisted mapping (stretch):** when deterministic trace fails, optional LLM hint with reasoning shown alongside deterministic result.
+7. **Tests:** unit — XML parsing, coordinate matching, R.java parsing; integration — tap → element → source with fixtures. **[done]** `tests/test_inspect_map.py` covers element pick + handler grep + adb glue; `tests/test_web.py::test_api_inspect_map_returns_element_and_candidates` covers the end-to-end `/api/inspect/map` response (including the new `resolution` block); `tests/test_resolve_ui_element.py` covers the fuser scorer + RAG enrichment + skill registry path.
+8. **[done]** New skill `resolve_ui_element` (**llm** tier): takes element + foreground activity + raw handler candidates; scores them deterministically (kind base + foreground-activity bonus + activity-named-file bonus + early-line decay) and optionally enriches with Lane-1 RAG hits; returns `{best, alternatives, rag_hits, reasoning}`. Pure-function `resolve()` is also called inline by `/api/inspect/map`.
+
+---
+
+### Phase 8 — Static call graph from Smali
+
+**Goal:** Build navigable call graph from decoded Smali; visualize with Cytoscape.js; support LLM-assisted path questions.
+
+1. **Smali analysis** (`androscan/analysis/call_graph.py` or equivalent): walk apktool output; extract classes, methods, `invoke-*` targets; adjacency caller.method → callees; `extends` / `implements`.
+2. **Graph storage:** `apps/<app_id>/call_graph.json` (nodes + edges); rebuild when APK hash changes; node metadata (exported flag from dossier where applicable).
+3. **Graph query API:** `GET /api/graph/{app_id}` (paginated/filtered); `GET /api/graph/{app_id}/neighbors/{class.method}`; `GET /api/graph/{app_id}/paths?from=…&to=…`; `POST /api/graph/{app_id}/query` (LLM-assisted natural-language path questions).
+4. **Cytoscape.js:** zoom/pan/search/filter; click node → Monaco source; highlight paths; layouts (e.g. dagre, cose-bilkent).
+5. **New skill (target):** `query_call_graph` (**llm** tier): question + graph subset → relevant paths; usable from analysis workflow.
+6. **Tests:** unit — fixture Smali, graph build, path algorithms; integration — APK → graph → query (where feasible without device).
+
+---
+
+### Phase 9 — Frida integration (live tracing & hooking)
+
+**Goal:** Dynamic instrumentation from the UI — hook methods, trace calls, optional return tampering; LLM-assisted hook generation.
+
+1. **Frida adapter** (`androscan/adapters/frida_client.py` or equivalent): detect/push frida-server (configurable); Python `frida` attach/load/detach; availability checks like other external tools.
+2. **Hook templates** (`androscan/adapters/frida_hooks/`): parameterized JS — method entry/exit log, SSL pinning bypass patterns, crypto/SharedPreferences/Intent hooks; render from class/method/signature from graph or dossier.
+3. **Live trace streaming:** Frida `message` → WebSocket → UI trace panel (pause/resume, search, export).
+4. **Interactive hook builder:** pick method from graph or editor → hook type (log args, log return, modify return, custom JS); optional LLM “generate hook for objective”; **user confirm before deploy**.
+5. **New skill (target):** `generate_frida_hook` (**llm** tier): class, method, objective → Frida JS; basic syntax validation before deploy.
+6. **Exploit verification integration (optional):** extend signal matrix (`vuln_module_skills_signals.json`) with e.g. `frida_trace` where product requires deeper runtime evidence.
+7. **Tests:** unit — template rendering, JS generation, adapter with mocks; device integration opt-in only.
+8. **Dependencies (target):** `frida`, `frida-tools`; frida-server on device (operator-managed).
+
+**Cross-cutting:** artifacts under `apps/<app_id>/` (graphs, traces, hooks); new skills follow three-tier model; web server **bind 127.0.0.1** by default (local single-user); `global_config.yaml` sections `web:` and `frida:` (when implemented).
 
 ---
 
@@ -44,6 +146,7 @@ None. Phase 4 partial (error handling + docs cleanup) complete. CI remains parke
 - Integration test with fixture APK.
 - JSON output renderer.
 - Richer evidence provenance tracking.
+- **Interactive RE Workbench — Phase 7+** (Phase 6 shell landed; continue with click-to-code, graph, Frida per § below).
 
 ---
 
@@ -79,13 +182,38 @@ Use for real future work, not vague ideas.
 - add JSON output renderer
 - add richer evidence provenance tracking
 - add adapter for additional mobile tooling
-- add web UI shell
+- **Interactive RE Workbench (Phases 6–9)** — see § Interactive RE Workbench in this file (replaces vague “web UI shell” backlog item)
 - add queue-backed job execution
 - add configurable policy layer
 
 ---
 
 ## Completed Tasks
+
+### 2026-04 Phase 6 polish (UX step 3.5): Settings tab — global + per-app + status + diagnostics
+- outcome: New top-level `Settings` tab (`#/settings`) covering global config, per-app overrides, live status, and diagnostics. Backend: `androscan/web/health_probes.py` (timeboxed pure-function async probes for adb/jadx/apktool/frida/Ollama/embed-provider/disk + per-app pm-path/foreground/UID/uiautomator/apk-sha-drift/RAG/decompile-cache; never raise; `{ok, label, ...}` shape); `androscan/web/per_app_settings.py` (atomic schema-versioned writes to `apps/<app_id>/app_settings.json`, `effective_settings(global_view, per_app)` merger, `apk_overrides_summary`); `androscan/web/status_routes.py` (`GET /api/status/global`, `GET /api/status/apps/{app_id}` — `asyncio.gather` + 3 s in-process cache; `invalidate_status_cache()` on every settings save/reset/reload); `androscan/web/settings_routes.py` (`GET/PUT /api/settings/global`, `POST /api/settings/global/raw`, `POST /api/settings/global/reset`, per-app GET/PUT/reset, `POST /api/settings/reload`; validates raw YAML server-side; atomic write-back via tempfile + `os.replace`; returns `restart_required` per field). `androscan/config/loader.py` grew `CONFIG_FIELD_MAP` (Config field → `(yaml_section, yaml_key, env_var)`), `LIVE_RELOADABLE_FIELDS`, `global_view_from_config`, `effective_sources` (returns `yaml`/`env`/`default` per field for source pills), `with_overrides`, `coerce_yaml_value`, `dump_to_yaml`, `save_raw_yaml`, `restore_defaults_yaml`, `validate_raw_yaml`, `read_raw_yaml`, `discover_config_path`. `app.py` refactored to keep the live `Config` on `app.state.config` (`_current_config`/`_set_config` helpers) so live-reloadable fields take effect without uvicorn restart; new routers read via callable providers. Frontend: `SettingsTab` + 4 sub-panels (`GlobalSettingsPanel` with form + raw-YAML editor + dirty state + reset; `AppSettingsPanel` with dropdown + override-or-inherit + force-with-warning reset; `StatusPanel` with cards + per-card `HealthDot` + "Refresh now"; `DiagnosticsPanel` with raw API JSON + `/api/settings/reload`). New `HealthDot` in the global header polls `/api/status/global` every 30 s and rolls up to a single green/yellow/red dot that deep-links to Settings on click. Two new API clients (`api/settings.ts`, `api/status.ts`) and ~300 lines of new CSS in `App.css` (`.source-badge`, `.env-lock`, `.restart-pill`, `.status-card`, `.health-dot.{green,yellow,red}`, `.settings-nav`, `.yaml-editor`). Tests: `tests/test_health_probes.py` (subprocess + urllib mocks; 20 cases), `tests/test_per_app_settings.py` (load/save/reset/merge/atomic), `tests/test_settings_routes.py` (integration). All Python tests green; `tsc --noEmit` + `vite build` clean.
+- notes: One bug discovered during testing — the integration test was monkeypatching `androscan.web.health_probes.probe_adb_version`, but `androscan.web.status_routes` imports `probe_adb_version` *by name*, so the patch never reached the consumer. Fix: monkeypatch the **consumer** module (`androscan.web.status_routes`). Documented inline in `test_settings_routes.py` and in DEC-021. The "force-with-warning" per-app reset semantics + the `restart_required` pill for non-live-reloadable fields were both explicitly user-confirmed during design.
+- follow-up: (P2) Migrate hot-path handlers (`/api/llm/info`, chat, RAG, decompile) to read from `app.state.config` so live reload covers their fields. (P2) "Compare to global" diff view in the per-app panel. (P2) Persist raw-YAML draft to sessionStorage. (when Hook Lab starts) Add a "Hook Lab readiness" rollup probe.
+
+### 2026-04 Phase 6 polish (UX step 3, partial): Lane-1 RAG indexer
+- outcome: New `androscan/rag/` package (`chunking.py`, `embed.py`, `index.py`, `search.py`) implementing a per-app SQLite vector index of method-level chunks over the jadx decompiled sources. Brace-balanced chunker for `.java`/`.kt` (no tree-sitter). `EmbedProvider` protocol with `FastEmbedProvider` (default ONNX local), `OllamaEmbedProvider` (HTTP), and `HashProvider` (deterministic, test/no-deps fallback). Per-app store at `apps/<app_id>/.decompiled/<sha>/rag.sqlite` (WAL, packed `float32` blobs); brute-force cosine top-k (numpy when present, pure-Python fallback). Endpoints `GET /api/rag/{app_id}/status`, `POST /api/rag/{app_id}/rebuild`, `POST /api/rag/{app_id}/query` in `androscan/web/rag_routes.py`; jadx completion auto-schedules a daemon-thread RAG build via `schedule_rag_build_after_decompile`. New `llm`-tier skill `search_decompiled_sources` (query, top_k, package_prefix, file_substr) — advertised in prompt catalog, fail-open. Inspect-tab chat (`androscan/web/chat.py::_enrich_inspect_with_rag`) appends top-k chunks as `code` attachments before guardrails run; fail-soft when RAG is unavailable. `Config` extended with `rag_embed_provider` / `rag_embed_model` / `rag_top_k_default`; `global_config.yaml` adds `rag:` section; env overrides `ANDROSCAN_RAG_*`. New `pyproject` extra `[rag]` (fastembed, numpy). New tests: `tests/test_rag.py`, `tests/test_rag_integration.py`, plus three RAG endpoint tests in `tests/test_web.py` (197 tests total, all passing).
+- notes: Click-to-code backend was already in place via `POST /api/inspect/map` + `androscan/web/inspect_map.py` (foreground activity + uiautomator dump + handler grep) and persistent decompile cache (`/api/decompile`, `/api/code/{tree,file}`); package-scoped logcat (with stable Linux-UID filtering) and mirror online/offline (`/api/device/status`) were also already implemented. The remaining backend gap was the `resolve_ui_element` LLM skill — see the next entry. Multimodal chat attachments (PDF/CSV/screenshot) are deferred to after Hook Lab. `sqlite-vec` is reserved as a future drop-in replacement for the brute-force scan.
+- follow-up: Done in two follow-up entries below — `resolve_ui_element` LLM skill + `/api/inspect/map` fusion (backend), and the Inspect-tab frontend wiring entry. Next is UX step 4 (Hook Lab — Smali graph + Frida).
+
+### 2026-04 Phase 6 polish (UX step 3, partial): `resolve_ui_element` LLM skill + `/api/inspect/map` fusion
+- outcome: New `androscan/skills/resolve_ui_element.py` — `llm`-tier deterministic fuser that takes the element + foreground activity + raw handler candidates from `inspect_map.find_handlers` and produces a single `best` answer with reasoning, plus a ranked `alternatives` list. Score model: handler-kind base (`findViewById` 1.00 > `onClick_near` 0.80 > `compose_id` 0.60 > `reference` 0.20 > rag-cosine), additive bonuses for foreground-activity match (+0.50), activity-named files (+0.10), and an early-line decay bonus (≤+0.10 for line 1, → 0 at line 200). Optional Lane-1 RAG enrichment: synthesises a free-text query from `text` > `content_desc` > short resource id, fetches top-k chunks, and feeds them through the same scorer (so a clean `findViewById` in the foreground activity always beats an arbitrary semantic match). Pure-function `resolve()` is reused inline by `POST /api/inspect/map` (`androscan/web/app.py`) which now returns a `resolution` block (`{best, alternatives, rag_hits, reasoning}`) so the UI gets one ranked answer without an LLM round-trip. Skill is fail-soft on missing app dir / decompile cache / embed provider. Registered in `androscan/skills/__init__.py`. New tests: `tests/test_resolve_ui_element.py` (13 tests — pure helpers, deterministic scoring, foreground boost, early-line tie-break, RAG enrichment with `HashProvider`, fail-soft, registry path); `tests/test_web.py::test_api_inspect_map_returns_element_and_candidates` extended to assert the new `resolution` block. **210 tests total, all passing.**
+- notes: This closes the *backend* of Phase 6 step 3. The frontend wiring landed in the next entry below.
+- follow-up: Inspect-tab frontend wiring (done — see next entry); then UX step 4 (Hook Lab — Smali graph + Frida).
+
+### 2026-04 Phase 6 polish (UX step 3, final): Inspect-tab frontend wiring for the fuser
+- outcome: Surfaced the `resolution` block from `POST /api/inspect/map` end-to-end in the Inspect tab UI. Extended `androscan/web/frontend/src/api/inspect.ts` with `Resolution`, `ResolutionCandidate`, `ResolutionRagHit` types. New sub-components in `ElementMappingPanel.tsx`: `BestBanner` (regex/RAG `SourceBadge`, kind pill, score, reasons grid, snippet, "Open in Code browser"), `ResolutionAlternatives` (collapsible details with per-alt source badge + score + open button), `RagHitsList` (collapsible details with synthesised query and per-hit class.method label). `InspectTab.handleTap` now prefers `resolution.best` over `candidates[0]` when auto-opening the Code Browser, seeds `scrollTarget` + `highlightRange` (via `requestAnimationFrame` so re-clicks still fire), and propagates `best.method_name` so the method-emphasis label is correct. Chat attachments memo now appends a `best_handler` JSON block (file, line, class, method, source, score, reasons) so the LLM sees the fused pick alongside the element + candidate list. New CSS: `.source-badge` (deterministic = green, rag = warn), `.best-banner` (accent border + soft background, reasons grid), `.resolution-alts` / `.rag-hits` collapsibles. Vite production build clean (308 modules, 32 KB CSS, 393 KB JS); `tsc --noEmit` clean; 210 Python tests still passing.
+- notes: The rest of the Inspect-tab frontend (4-column resizable layout, mirror with status dot, click-to-map, scoped logcat, adb shell, Code-browser tab with `CodeView`) was already in place before this entry — only the fuser-output visualisation was missing. With this, Phase 6 step 3 is functionally complete (chat enrichment, RAG indexer, click-to-code backend, fuser skill, and full UI surface).
+- follow-up: UX step 4 (Hook Lab — Smali graph + Frida overlay + scope/hooks).
+
+### 2026-04 Phase 6 (initial): RE Workbench web shell
+- outcome: `androscan/web/` FastAPI app with CORS; REST `/api/health`, `/api/projects`, `/api/projects/{app_id}/runs`, `/api/dossier/{app_id}/{run_ts}`, `/api/findings/{app_id}/{run_ts}`, `POST /api/input/tap`; WebSockets `/ws/mirror` (adb screencap PNG polling), `/ws/logcat`; config `web_host`, `web_port`, `web_screencap_interval_ms` + env overrides; CLI `--serve`, `--web-port`; optional `--apk … --serve` after run. Vite + React + TypeScript UI under `androscan/web/frontend/` (build → `static/`, gitignored). Tests in `tests/test_web.py`. Dependencies: fastapi, uvicorn, websockets; dev httpx for TestClient.
+- notes: scrcpy path and logcat filter UI deferred; `GET /` returns JSON how-to when `static/` not built.
+- follow-up: Phase 6 polish; Phase 7 click-to-code.
 
 ### 2026-03-30 Phase 4 partial: Error handling + docs cleanup
 - outcome: Broader error handling across config, LLM client, ADB skills, workflow, and CLI. Config: explicit --config fails on missing/invalid file; type coercion with clear errors. LLM: resp.json() wrapped; empty content retried; non-404 HTTP errors show body detail; is_ollama_available returns diagnostic detail. ADB: TimeoutExpired caught in all subprocess calls (app_env_check, run_exploit_command, capture_signals). Workflow: generate_report result checked; disk errors on meta/observations caught; LLM parse failures logged. CLI: top-level exception handler; report read warnings. Misc: skills registry import errors logged; vuln_signals_config corrupted JSON caught; cache store disk errors caught; generate_report disk errors handled. Docs: DESIGN_DOC, ARCHITECTURE, DECISIONS, PROJECT_BRIEF, README, KNOWN_ISSUES, AI_ENGINEERING_CONSTITUTION updated for Phase 5, three-tier skills, and stale references fixed.

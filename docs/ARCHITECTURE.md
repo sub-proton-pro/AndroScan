@@ -75,7 +75,7 @@ The presentation layer is responsible for user interaction and output formatting
 
 Examples:
 - CLI
-- web UI
+- web UI (planned: **Phase 6+** local-only FastAPI + React “RE Workbench” — mirror, logcat, browse runs; later phases add graph + Frida controls)
 - API handlers
 - report generation/rendering
 - structured output serialization
@@ -99,6 +99,8 @@ Rules:
 - do not place business logic here
 - presentation should consume normalized outputs from lower layers
 - different presentation channels should not redefine domain semantics
+
+**Planned web UI (Phases 6–9):** The server is a **presentation** concern: it serves dossier/report JSON and streams device/UI events over WebSockets. It must **not** embed vulnerability detection logic or LLM prompts; it invokes orchestration and existing skills/adapters (same dependency direction as CLI). Default bind **127.0.0.1**; baseline posture is local single-user (see `docs/SAFETY_AND_SECURITY.md`).
 
 ---
 
@@ -141,7 +143,7 @@ The skills layer provides discrete, reusable capabilities that orchestration and
 
 Examples:
 - pipeline skills: extract_manifest, prepare_dossier, generate_report
-- LLM-requestable skills: get_decompiled_class, get_decompiled_method, list_classes_in_package
+- LLM-requestable skills: get_decompiled_class, get_decompiled_method, list_classes_in_package, **search_decompiled_sources** (Lane-1 RAG over the jadx output via `androscan.rag`) (planned: `resolve_ui_element`, `query_call_graph`, `generate_frida_hook` — Phases 7–9)
 - exploit-tier skills (orchestration only; not in the LLM catalog): app_env_check, build_exploit_command, capture_signals, run_exploit_command, verify_exploit_result
 
 Responsibilities:
@@ -262,7 +264,7 @@ The tool adapter layer wraps concrete tools and external integrations.
 Examples:
 - APK/IPA parsers
 - static analysis tools
-- dynamic analysis tools
+- dynamic analysis tools (planned: **Frida** client / frida-server lifecycle — Phase 9; keep behind a dedicated adapter)
 - filesystem readers
 - mobile platform tooling
 - external intelligence APIs
@@ -280,6 +282,8 @@ Rules:
 - prefer adapters/interfaces over raw direct usage
 - avoid leaking provider-specific details into business logic
 - keep integration behavior testable and replaceable
+
+**Planned Frida adapter (Phase 9):** Attach/load/detach scripts; stream messages to the web UI over WebSocket channels; optional new exploit-verification **signal** type (e.g. `frida_trace`) in `vuln_module_skills_signals.json`. LLM-generated hooks are **untrusted** until validated; user confirmation before deploy is a product rule (see `docs/DECISIONS.md` DEC-017).
 
 ---
 
@@ -306,6 +310,39 @@ Rules:
 - infrastructure should support the domain/application layer without dominating it
 - secret handling and configuration should be centralized and explicit
 - logging and metrics should be designed intentionally rather than scattered
+
+---
+
+### 4.10 Retrieval / RAG layer (Lane-1 — implemented)
+
+**Purpose:** Provide semantic retrieval over the per-app jadx decompiled sources so that the Inspect-tab chat and the `search_decompiled_sources` LLM skill can ground answers in concrete code without dumping the whole corpus into the context window.
+
+**Placement:** `androscan/rag/` (`chunking.py`, `embed.py`, `index.py`, `search.py`). It is **infrastructure** in the architectural sense — it stores derived data and serves queries — and depends only on the dossier/run-folder contracts. It does **not** implement vulnerability logic and is not a presentation concern. Web routes live in `androscan/web/rag_routes.py` (presentation wiring); the LLM skill `search_decompiled_sources` lives under `androscan/skills/` and goes through the existing skill registry.
+
+**Outputs:** A per-APK SQLite database at `apps/<app_id>/.decompiled/<sha>/rag.sqlite` (WAL; packed `float32` BLOB column). One DB per APK SHA — invalidation = drop the file. The schema is intentionally vector-ready so that `sqlite-vec` (or another ANN backend) can replace the brute-force scan without changing call sites.
+
+**Embedding providers:** `EmbedProvider` protocol with `FastEmbedProvider` (default), `OllamaEmbedProvider`, and a deterministic `HashProvider` for tests / no-deps environments. Provider selection is config-driven (`rag.embed_provider`, `ANDROSCAN_RAG_PROVIDER`).
+
+**Rules:**
+- treat the index as **derived data**: it must be safe to delete and rebuild from the decompile cache at any time
+- builds run in a daemon thread; the rest of the product **fails-open** if the index is missing or rebuilding
+- the LLM never receives raw decompiled directories; it receives bounded, sanitized chunks routed through the chat guardrails (`code` attachment kind, per-kind budget, `<context>` wrapping)
+- new retrieval surfaces must reuse `androscan.rag.query` rather than re-implement search
+
+---
+
+### 4.9 Static analysis / call graph (planned)
+
+**Purpose (Phase 8):** Derive a **method-level call graph** (and optional class hierarchy) from **Smali** under the apktool decode output — accurate for dispatch targets, complements jadx for human-readable browsing.
+
+**Placement:** Implementation lives in a bounded package (e.g. `androscan/analysis/`) or behind a small interface consumed by orchestration, the web API layer, and new **llm** skills (`query_call_graph`). It is **not** a new vulnerability module by default; it is shared infrastructure for reasoning and UI.
+
+**Outputs:** Serialized graph artifacts under `apps/<app_id>/` (e.g. `call_graph.json`); APIs paginate/filter to avoid loading entire graphs into the browser or LLM context at once.
+
+**Rules:**
+- graph builders must not depend on presentation (React)
+- prefer pure Python + tests on fixture Smali; optional heavy-path integration behind opt-in
+- LLM receives **subgraphs** or path query results, not unbounded full dumps
 
 ---
 
@@ -369,6 +406,8 @@ A new output mode should usually involve:
 - a new renderer or presentation adapter
 - reuse of normalized shared result models
 - minimal or no change to vulnerability modules
+
+**Web RE Workbench (Phases 6–9):** Treat FastAPI routes + WebSockets as presentation **wiring** only; reuse dossier/report models and existing skills (e.g. jadx-backed source fetch). Add REST/WS handlers, not duplicate business rules.
 
 ### 6.3 Adding a new skill
 
@@ -540,6 +579,8 @@ Its core principles are:
 - isolate external tools through adapters
 - normalize outputs for reuse across presentation channels
 - preserve testability and extensibility as the system grows
+
+**Roadmap extension:** Phases **6–9** (local web UI, click-to-code, Smali call graph, Frida) are specified in `docs/DESIGN_DOC.md` and `docs/TASKS.md` and must follow the same layer rules above.
 
 This document defines the intended structural model.
 It does not imply that every part is already fully implemented today.

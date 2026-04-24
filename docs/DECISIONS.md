@@ -407,6 +407,199 @@ Use the following structure for new entries:
 - related docs:
   - `androscan/llm/client.py`
 
+### DEC-015: Interactive RE Workbench — FastAPI + React (local web UI)
+- status: Active
+- date: 2026-04
+- owners: (project)
+- context:
+  A second presentation channel is needed for emulator mirroring, logcat, browsing dossier/reports, and later graph/Frida controls. The stack must stay maintainable, testable without a browser farm, and aligned with layer separation (presentation thin; no business logic in React routes).
+- decision:
+  Use **FastAPI** (+ `uvicorn`, WebSockets) for the local server and **React + Vite + TypeScript** for the SPA. **Monaco Editor** for code; **Cytoscape.js** for call-graph visualization (Phase 8). Default listen address **127.0.0.1**; no baseline multi-user auth (local trusted operator).
+- rationale:
+  FastAPI gives typed routes, WebSocket support, and static file serving in one process; React has the richest ecosystem for Monaco and Cytoscape; matches the agreed product plan.
+- alternatives considered:
+  - Svelte (lighter but smaller ecosystem for editor/graph plugins)
+  - Vanilla JS (fewest deps but more bespoke UI work)
+  - Separate Node backend (rejected: extra moving parts for a local tool)
+- tradeoffs / consequences:
+  - Adds Python optional deps and a `frontend/` build step when implementing Phase 6.
+  - Agents must keep API handlers free of vulnerability-specific logic.
+- follow-up:
+  Implement Phase 6 per `docs/TASKS.md`; record `web_*` config in `global_config.yaml` when code lands.
+- related docs:
+  - `docs/DESIGN_DOC.md` (Phase 6)
+  - `docs/ARCHITECTURE.md` §4.1
+  - `docs/SAFETY_AND_SECURITY.md` (local bind, when to strengthen)
+
+### DEC-016: Call graphs from Smali (apktool output), not from jadx AST alone
+- status: Active
+- date: 2026-04
+- owners: (project)
+- context:
+  The product needs accurate method-level edges for dispatch and JNI/native boundaries are less visible in Java decompilation. jadx is ideal for human-readable source browsing but is a lossy view for bytecode-level invokes.
+- decision:
+  Build the **primary** static call graph from **Smali** files produced by **apktool** decode. Use **jadx** for mapping UI taps and displaying source (Phases 7–8). Store graph artifacts under `apps/<app_id>/` (e.g. `call_graph.json`) with rebuild-on-APK-hash-change.
+- rationale:
+  Smali reflects actual `invoke-*` targets; aligns with existing apktool pipeline; keeps graph generation testable with small fixture Smali files.
+- alternatives considered:
+  - jadx IR / Java AST only (rejected as primary: less faithful to bytecode)
+  - External binary analysis tool as mandatory dependency (deferred: keep in-house parser first, adapter later if needed)
+- tradeoffs / consequences:
+  - Custom parser maintenance; must handle large apps via pagination/filtering in APIs and UI.
+- follow-up:
+  Implement `androscan/analysis/` (or equivalent) per `docs/TASKS.md` Phase 8; add `query_call_graph` **llm** skill when subgraph contract is stable.
+- related docs:
+  - `docs/DESIGN_DOC.md` (Phase 8)
+  - `docs/ARCHITECTURE.md` §4.9
+  - `docs/CONVENTIONS.md` (graph artifact conventions when implemented)
+
+### DEC-018: Lane-1 RAG over decompiled sources — embeddings + SQLite, not BM25 or JSON
+- status: Active
+- date: 2026-04
+- owners: (project)
+- context:
+  Phase 6 step 3 needs the Inspect-tab chat (and the new `search_decompiled_sources` LLM skill) to retrieve relevant decompiled code by semantic intent (e.g. "where is the deep-link parsed for activity X?"). The corpus is per-app jadx output (often hundreds of MB of `.java`/`.kt`); the corpus is rebuilt every time the APK changes (decompile cache is keyed by `sha256(apk)`). A naive lexical match (BM25) loses too much intent on decompiled identifiers (`a.b.c.d.foo()`); an in-memory JSON index hurts cold-start and makes invalidation messy.
+- decision:
+  - **Storage:** per-app **SQLite** at `apps/<app_id>/.decompiled/<sha>/rag.sqlite` (WAL, packed `float32` BLOB column). One DB per APK SHA — invalidation = drop the file. No global DB; no JSON index.
+  - **Retrieval:** **vector embeddings** (cosine top-k), **not** BM25 as the primary path. Brute-force scan in Python (numpy when available, pure-Python fallback); `sqlite-vec` is a planned drop-in replacement and the column layout is already `float32` so the swap is mechanical.
+  - **Embedding provider:** pluggable `EmbedProvider` protocol with three implementations — `fastembed` (default; small ONNX models, no GPU), `ollama` (HTTP `/api/embeddings`), and a deterministic `HashProvider` for tests / no-deps environments. Configurable via `rag.embed_provider` / `rag.embed_model` and `ANDROSCAN_RAG_*` env vars.
+  - **Chunking:** brace-balanced over `.java`/`.kt` (class headers + methods, keyword blacklist, char budgets). **Not** tree-sitter — jadx output is messy enough that a custom balancer is more reliable and avoids a heavy native dep.
+  - **Lifecycle:** auto-build in a **daemon thread** when `decompile_cache` finishes (`schedule_rag_build_after_decompile`). In-process lock prevents duplicate builds. The skill, the routes, and the chat enrichment all **fail-open** — if RAG is unavailable, the rest of the product still works.
+  - **LLM exposure:** retrieval is exposed to the model via the `search_decompiled_sources` **llm**-tier skill **and** as a transparent attachment-injection step in the Inspect tab chat (`_enrich_inspect_with_rag`). Both go through the same chat guardrails (per-kind budget for `kind="code"`, `<context>` wrapping, sanitization).
+- rationale:
+  Vectors handle paraphrase and intent better than lexical scores on decompiled identifiers. SQLite gives ACID writes, WAL concurrency, and trivial per-APK invalidation without a service dependency. The provider protocol means we can ship hermetic tests (Hash) and still reach for `fastembed` / `ollama` / `llama.cpp` without touching call sites.
+- alternatives considered:
+  - **BM25 / Whoosh / Tantivy** (rejected as primary: too lossy on decompiled identifiers; can be added later as a hybrid layer).
+  - **Single JSON index per app** (rejected: cold-start, no concurrent reads, awkward invalidation, no easy swap to a vector DB).
+  - **`sqlite-vec` from day one** (deferred: keeps the install matrix simpler; brute-force is fine at the per-app scale we need today and the schema is already vector-ready).
+  - **`tree-sitter` for chunking** (rejected: heavy native dep; jadx output already has enough structure for brace-balancing).
+  - **Always-on Ollama embeddings** (rejected as default: requires a running server even for static analysis; kept as an option for users who already have one).
+- tradeoffs / consequences:
+  - New optional dep set (`pyproject` extra `[rag]`: fastembed, numpy). The `hash` provider keeps the test path hermetic.
+  - Build is asynchronous, so callers must check `GET /api/rag/{app_id}/status` rather than assume readiness; tests for the endpoint monkeypatch `start_build_async` to run synchronously.
+  - Brute-force cosine is O(N·d) per query — fine for today's per-app sizes; revisit when we add `sqlite-vec`.
+  - Code retrieval enlarges the chat context — handled by the existing per-kind attachment budget (`code = 6 KB`) and the 32 KB total context cap (DEC-005 / `androscan/web/chat.py`).
+- follow-up:
+  - **[done]** `resolve_ui_element` LLM skill that consumes RAG hits + the existing `/api/inspect/map` (a.k.a. click-to-code) candidates — see DEC-019.
+  - Evaluate `sqlite-vec` once it's available across our target Python versions; benchmark vs. brute force.
+  - Optional: hybrid BM25 + vector reranking once the corpus and quality bar grow.
+
+### DEC-019: `resolve_ui_element` is a deterministic fuser, not an LLM-call wrapper
+- status: Active
+- date: 2026-04
+- owners: (project)
+- context:
+  Phase 6 step 3 needed an LLM-tier skill that turns a tap on the mirror into a confident answer about *which class.method handles it*. The raw output of `POST /api/inspect/map` (foreground activity, element with `resource_id`/`text`/bounds, and a list of regex-grep handler candidates by kind) is structurally rich, and the picking heuristics — "prefer `findViewById` matches in the foreground activity, near the top of the file" — are well-known. We need both an LLM-callable tool *and* a synchronous answer for the Inspect-tab UI without paying a model round-trip per click.
+- decision:
+  - Implement `resolve_ui_element` (`androscan/skills/resolve_ui_element.py`) as a **pure-function, deterministic, explainable scorer** — no LLM call inside. The `tier="llm"` label means "advertised in the prompt catalog so the planner can call it as a tool", mirroring `search_decompiled_sources` (DEC-018).
+  - Score model is small and additive so reasons are auditable: kind base (`findViewById` 1.00 > `onClick_near` 0.80 > `compose_id` 0.60 > `reference` 0.20 > rag-cosine), foreground-activity match bonus (+0.50), activity-named-file bonus (+0.10), early-line decay bonus (≤+0.10 for line 1, → 0 at line 200). RAG hits feed into the same scorer so a clean `findViewById` in the foreground activity always beats an arbitrary semantic match.
+  - Optional Lane-1 RAG enrichment uses a query synthesised from `text` > `content_desc` > short resource id (only when there is anchor text — RAG isn't asked random nonsense).
+  - The core logic lives in a pure-function `resolve(...)` helper; `execute(params, context)` adapts a `SkillContext` to it. The same helper is called inline by `POST /api/inspect/map` so the response carries a `resolution` block (`{best, alternatives, rag_hits, reasoning}`) — the UI gets a single ranked answer with no LLM round-trip per click.
+  - Fail-soft: missing app dir, missing decompile cache, missing embed provider all return `success=True` with a clean note in `text`/`rag_error`. The `/api/inspect/map` wiring catches any exception so the fuser can never break click-to-code.
+- rationale:
+  Tap → handler is a **closed-form ranking problem** once you have the inputs. A deterministic scorer is faster, cheaper, easier to test, and far easier to debug than asking an LLM to pick. Keeping it tier `llm` still lets the planner call it explicitly when reasoning about UI flows in chat — which is the actual collaboration mode we want.
+- alternatives considered:
+  - **LLM-call inside the skill** (rejected: latency per click, cost, and we'd lose explainability — every alt would need a justification round-trip).
+  - **Inline-only in `app.py`, no skill** (rejected: the planner can't request it as a tool; chat workflows lose the "find the handler for the Login button" capability).
+  - **More elaborate scoring (PageRank over call graph, etc.)** (deferred: out of scope for step 3; revisit when the Smali static call graph from step 4 is available — that data could feed a future scorer iteration).
+- tradeoffs / consequences:
+  - The scorer's weights are heuristic; if they prove wrong on real apps, tweaking is cheap because reasons are surfaced in the result (`best.reasons`).
+  - The `resolution` block adds a second pass over the candidate list per `/api/inspect/map` call, but the cost is negligible compared to `uiautomator dump`.
+  - `resolve_ui_element` has two callers (skill registry + `/api/inspect/map`) — both go through the same `resolve()` helper, so behaviour stays consistent.
+- follow-up:
+  - Wire the Inspect-tab frontend to `resolution.best` so click-to-map jumps the Monaco viewer to `file:line` and badges the source (`source: deterministic | rag`) and `score`.
+  - Once the Smali static call graph (Phase 8) lands, evaluate adding a graph-distance term to the scorer.
+- related docs:
+  - `docs/STATE.md` (Lane-1 RAG indexer)
+  - `docs/TASKS.md` (Phase 6 UX step 3)
+  - `docs/ARCHITECTURE.md` §4.10 (RAG layer)
+  - `docs/SAFETY_AND_SECURITY.md` §12.4 (RAG attachment handling)
+
+### DEC-020: Settings tab — first-class UI for global + per-app configuration
+- status: Active
+- date: 2026-04
+- owners: (project)
+- context:
+  Up to Phase 6 polish step 3, all configuration lived in `global_config.yaml` (with env-var overrides). There was no UI to inspect *what was actually loaded*, no way to express per-app overrides (e.g. "use `ollama` embeddings for this banking app, `fastembed` for everything else"), and no live status view of the moving parts the workbench depends on (adb, jadx, Ollama, the embed provider, the RAG index per app, the on-device foreground activity, etc.). Operators were debugging by `tail -f` and `curl`.
+- decision:
+  Add a dedicated **Settings tab** as the fourth top-level tab. The tab is split into four sections via a left-rail nav: *Global settings* (form **and** raw-YAML editor for `global_config.yaml`, with a "Reset to defaults" button), *App settings* (per-app overrides written to `apps/<app_id>/app_settings.json` — flat file, atomic writes, schema-versioned, never touches `app_meta.json`), *Status* (live cards for both global health and per-app device/decompile/RAG state), and *Diagnostics* (raw API payloads + uvicorn-less reload).
+  Backend: three new modules — `androscan/web/health_probes.py` (pure-function, timeboxed probes for adb/jadx/apktool/frida/ollama/fastembed/disk/uid/foreground-activity/uiautomator/apk-sha-drift), `androscan/web/per_app_settings.py` (load/save/reset + override merger), `androscan/web/settings_routes.py` and `androscan/web/status_routes.py` (FastAPI routers). `androscan/config/loader.py` grew `CONFIG_FIELD_MAP`, `LIVE_RELOADABLE_FIELDS`, `global_view_from_config`, `effective_sources`, `dump_to_yaml`, `save_raw_yaml`, `restore_defaults_yaml`, `with_overrides`, `discover_config_path`. `app.py` now stores config on `app.state.config` and the new routers read via a callable provider so live reload sticks for newly-added consumers (legacy closures keep boot-time config — the UI surfaces this via a `restart_required` pill).
+  Frontend: new `SettingsTab` (sectioned panels), `HealthDot` in the global header (polls global status every 30s, deep-links to Settings on click), and two API clients (`api/settings.ts`, `api/status.ts`).
+- rationale:
+  - **Discoverability**: the field map + source pills (`yaml`/`env`/`default`) tell operators *exactly* why a value is what it is — much better than reading code.
+  - **Per-app overrides** are necessary for real workflows (model swap per app, RAG provider swap, custom logcat retention) but they must not pollute `app_meta.json` (which is the analysis pipeline's output, not a settings store). A separate file keeps the concerns clean.
+  - **YAML editor + form**: the user can use whichever input mode fits their flow. Validation runs server-side via `validate_raw_yaml` so a bad save returns a clean 400 with the parse/type error.
+  - **Live status** turns previously hidden failure modes (Ollama down, fastembed not installed, jadx missing, apk sha drifted under us, uiautomator dump empty, foreground activity ≠ analysed app) into a single colour-coded grid.
+  - **Restart-required pill**: changing `web.host`/`web.port`/CORS won't take effect until uvicorn restarts; we mark these via `LIVE_RELOADABLE_FIELDS` rather than pretending we can hot-swap them.
+  - **Force-with-warning per-app overrides**: per the user's choice, we never refuse a valid override; we only warn when the override would diverge from a global setting that the rest of the codebase still reads via the boot-time closure (these will be migrated incrementally to read from `app.state.config`).
+- alternatives considered:
+  - **Form-only editor** (rejected: power users wanted to copy-paste YAML chunks; raw editor unblocks that).
+  - **Co-locate per-app settings inside `app_meta.json`** (rejected: mixes settings with pipeline output, makes "reset to defaults" risky).
+  - **Polled status with no caching** (rejected: opening the UI mounts multiple status cards; we cache for 3 s in-process to keep adb/Ollama happy).
+  - **Auto-restart uvicorn after a save** (rejected: would disconnect mirror/logcat WS sessions silently; the pill is honest about what needs a restart).
+- tradeoffs / consequences:
+  - Existing route handlers that captured `config` directly do not pick up live reloads. We accept this for now (documented via `restart_required`); the migration to `app.state.config` is incremental and per-handler.
+  - `app_settings.json` adds a third per-app file (alongside `app_meta.json`, `triage.json`); the `apk_overrides_summary` helper makes it easy to grep what's overridden.
+  - Probes are best-effort and timeboxed — a slow Ollama only adds its own timeout to `/api/status/global`, not the sum of all probe timeouts (we use `asyncio.gather`).
+- follow-up:
+  - Migrate hot-path route handlers (`/api/llm/info`, chat, RAG, decompile) to read from `app.state.config` so live reload covers their fields too.
+  - Add a "compare to global" diff view in the per-app panel so users can see overrides at a glance.
+  - Persist the YAML editor's draft locally (sessionStorage) so an accidental tab switch doesn't lose work.
+- related docs:
+  - `docs/STATE.md` (Settings tab implementation summary)
+  - `docs/TASKS.md` (Phase 6 follow-ups)
+  - `docs/SAFETY_AND_SECURITY.md` (config write-paths + env-lock semantics)
+  - `docs/ARCHITECTURE.md` (web layer module map)
+
+### DEC-021: Health probes are pure functions, timeboxed, and consumed via a callable map
+- status: Active
+- date: 2026-04
+- owners: (project)
+- context:
+  The Settings status panel needs to surface a dozen+ external dependencies (adb, jadx, apktool, frida, Ollama daemon, embed provider availability, disk free, apk-sha drift, on-device package state, foreground activity, uiautomator dump, etc.). Naive synchronous probes would either freeze the UI when Ollama is unreachable, or worse, time out the entire status request because of one slow check.
+- decision:
+  Implement every probe in `androscan/web/health_probes.py` as a small, side-effect-free, **async coroutine** with a hard wall-clock cap (default 2 s, 1 s for adb-shell probes, 1.5 s for HTTP). Probes never raise — they always return a dict shaped `{ok: bool, label: str, ...probe_extras, error?: str}`. The aggregator `androscan/web/status_routes.py` runs them in parallel via `asyncio.gather(..., return_exceptions=False)` so the slowest probe sets the response latency, not their sum. A 3-second in-process cache (`_STATUS_CACHE`) absorbs the burst of requests when multiple status cards mount at once.
+- rationale:
+  - **Pure functions are trivially unit-testable** without standing up the whole FastAPI app — `tests/test_health_probes.py` covers 20 cases by monkeypatching `asyncio.create_subprocess_exec` and `urllib.request.urlopen`.
+  - **Hard timeouts** prevent a wedged adb / Ollama from poisoning the rest of the status payload.
+  - **Asyncio.gather** keeps the status fan-out cheap; the user gets a full picture in well under a second on a healthy host.
+  - **Returning a dict instead of raising** means the aggregator code stays linear (no try/except wrapping every probe call).
+- alternatives considered:
+  - **Threadpool + sync probes** (rejected: more locks, more book-keeping; FastAPI is async first).
+  - **Per-probe HTTP endpoints** (rejected: chatty for the UI; the aggregator gives one call per panel).
+  - **No cache** (rejected: opening Settings would fan out to adb/Ollama 5+ times concurrently).
+- tradeoffs / consequences:
+  - The 3 s cache means a freshly-fixed Ollama might still report "down" for ≤3 s — acceptable; the user has a manual "Refresh now" button that bypasses the cache via the same URL (the cache is invalidated on settings save / reset / reload).
+  - Probe functions are imported by name into `status_routes` (for IDE-friendliness); tests must patch the **consumer module** to override behaviour, not the producer module. This is documented inline in `test_settings_routes.py`.
+- follow-up:
+  - Add a "Hook Lab readiness" rollup probe (frida-server present on device, frida CLI on host, target package gadget injectable) once Hook Lab work begins.
+  - Consider a small SSE channel to push status updates instead of 15 s polling once we have more than ~30 cards.
+- related docs:
+  - `docs/STATE.md` (status probes summary)
+  - `docs/TEST_STRATEGY.md` (monkeypatch-the-consumer pattern)
+
+### DEC-017: Frida as dynamic-analysis adapter; user confirmation for LLM-generated hooks
+- status: Active
+- date: 2026-04
+- owners: (project)
+- context:
+  Live instrumentation is powerful but risky: wrong scripts can crash the app, and LLM output must not run unchecked on the operator’s device.
+- decision:
+  Integrate **Frida** only through a **tool adapter** (Python `frida` client + optional frida-server push/start helpers). **LLM-generated** hook scripts require **explicit user confirmation** in the UI before injection. Optional Phase 5 extension: new signal type (e.g. `frida_trace`) in `vuln_module_skills_signals.json` for deeper verification evidence.
+- rationale:
+  Preserves adapter boundary (DEC-010), keeps LLM output untrusted (DEC-005), matches single-user local threat model with proportionate controls.
+- alternatives considered:
+  - Auto-run LLM hooks without confirmation (rejected)
+  - Frida calls scattered in presentation layer (rejected)
+- tradeoffs / consequences:
+  - CI cannot rely on real devices; tests mock the adapter; opt-in integration jobs for attach/hook lifecycle.
+- follow-up:
+  Implement Phase 9 per `docs/TASKS.md`; extend `docs/SAFETY_AND_SECURITY.md` / `docs/TEST_STRATEGY.md` as behavior lands.
+- related docs:
+  - `docs/DESIGN_DOC.md` (Phase 9)
+  - `docs/ARCHITECTURE.md` §4.7
+  - `docs/SAFETY_AND_SECURITY.md`
+
 ---
 
 ## Superseded / deprecated decisions
