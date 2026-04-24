@@ -50,7 +50,7 @@ def parse_response(raw: str) -> LLMResponse:
                 SkillRequest(skill=req["skill"], params=req.get("params") or {})
             )
 
-    for h in data.get("hypotheses") or []:
+    for idx, h in enumerate(data.get("hypotheses") or []):
         if not isinstance(h, dict):
             continue
         try:
@@ -58,9 +58,14 @@ def parse_response(raw: str) -> LLMResponse:
             title_val = h.get("title") or h.get("name") or ""
             raw_ep = h.get("exploit_params")
             exploit_params = raw_ep if isinstance(raw_ep, dict) else None
+            # Stable synthetic id when the model omits one. Required so the UI
+            # can address the finding via /api/triage/.../{finding_id}.
+            raw_id = str(h.get("id") or "").strip()
+            if not raw_id:
+                raw_id = f"finding-{idx}"
             out.hypotheses.append(
                 Hypothesis(
-                    id=str(h.get("id", "")),
+                    id=raw_id,
                     component_type=str(h.get("component_type", "")),
                     component_name=str(h.get("component_name", "")),
                     title=str(title_val),

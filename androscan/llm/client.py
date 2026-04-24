@@ -166,6 +166,58 @@ def _stream_request(
     )
 
 
+def stream_complete(
+    config: Config,
+    messages: list[dict[str, Any]],
+    *,
+    on_token: Optional[Callable[[str], None]] = None,
+    on_thinking: Optional[Callable[[str], None]] = None,
+    response_format: Optional[str] = None,
+    model: Optional[str] = None,
+) -> CompleteResult:
+    """Single-shot streaming call against Ollama.
+
+    Used by the workbench chat SSE endpoint where re-streaming on a
+    truncation retry (as ``_complete_ollama()`` would do) is
+    unacceptable — duplicate tokens would land in the user's message.
+    We make exactly one HTTP request and let the caller surface
+    ``done_reason == "length"`` to the user via the terminal SSE event.
+
+    Cloud providers don't currently flow through this helper; the
+    workbench SSE endpoint is Ollama-only by design (matches the
+    streaming/thinking semantics of the local model).
+    """
+    base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
+    url = f"{base_url}/api/chat"
+    model_name = model or getattr(config, "ollama_model", "qwen3.5:35b") or "qwen3.5:35b"
+    temperature = getattr(config, "ollama_temperature", 0.2)
+    num_predict = getattr(config, "ollama_num_predict", 8192)
+    timeout = OLLAMA_TIMEOUT_TIERS[-1]
+
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "messages": messages,
+        "stream": True,
+        "options": {"temperature": temperature, "num_predict": num_predict},
+    }
+    if response_format:
+        payload["format"] = response_format
+
+    try:
+        return _stream_request(url, payload, timeout, on_token, on_thinking)
+    except requests.ConnectionError:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {base_url}. Is it running? {OLLAMA_SETUP_TIP}"
+        ) from None
+    except requests.Timeout:
+        raise RuntimeError(
+            f"Ollama request timed out after {timeout}s. {OLLAMA_SETUP_TIP}"
+        ) from None
+    except requests.HTTPError as e:
+        _parse_http_error(e, base_url, payload)
+        raise  # _parse_http_error always raises, but mypy doesn't know that
+
+
 def _complete_ollama(
     prompt: str,
     config: Config,
@@ -176,8 +228,17 @@ def _complete_ollama(
     on_thinking: Optional[Callable[[str], None]] = None,
     run_logger: Optional[Any] = None,
     images: Optional[list[str]] = None,
+    response_format: Optional[str] = "json",
+    messages: Optional[list[dict[str, Any]]] = None,
 ) -> CompleteResult:
-    """Call Ollama /api/chat. Uses timeout and num_predict retry tiers."""
+    """Call Ollama /api/chat. Uses timeout and num_predict retry tiers.
+
+    response_format: "json" (default, for the analysis pipeline) or
+        None (prose; e.g. the RE Workbench chat).
+    messages: optional pre-built message list (overrides
+        ``system_content`` + ``prompt``). The workbench builds these
+        with its own guardrails before calling.
+    """
     base_url = (config.ollama_base_url or "").strip().rstrip("/") or "http://localhost:11434"
     url = f"{base_url}/api/chat"
     model_name = model or getattr(config, "ollama_model", "qwen3.5:35b") or "qwen3.5:35b"
@@ -185,21 +246,22 @@ def _complete_ollama(
 
     timeout_idx = 0
     num_predict_idx = 0
-    messages = _build_messages(system_content, prompt, images=images)
+    msgs = messages if messages is not None else _build_messages(system_content, prompt, images=images)
 
     while True:
         timeout = OLLAMA_TIMEOUT_TIERS[timeout_idx]
         current_num_predict = OLLAMA_NUM_PREDICT_TIERS[min(num_predict_idx, len(OLLAMA_NUM_PREDICT_TIERS) - 1)]
-        payload = {
+        payload: dict[str, Any] = {
             "model": model_name,
-            "messages": messages,
+            "messages": msgs,
             "stream": stream,
-            "format": "json",
             "options": {
                 "temperature": temperature,
                 "num_predict": current_num_predict,
             },
         }
+        if response_format:
+            payload["format"] = response_format
 
         try:
             result = _do_request(url, payload, timeout, stream, on_token, on_thinking)
@@ -424,17 +486,29 @@ def complete(
     on_thinking: Optional[Callable[[str], None]] = None,
     run_logger: Optional[Any] = None,
     images: Optional[list[str]] = None,
+    response_format: Optional[str] = "json",
+    messages: Optional[list[dict[str, Any]]] = None,
     **kwargs: Any,
 ) -> CompleteResult:
-    """Unified LLM call. Routes to Ollama or cloud provider based on config.llm_provider.
+    """Unified LLM call. Routes to Ollama or cloud provider based on ``config.llm_provider``.
 
     images: optional list of base64-encoded image strings for multimodal models.
+    response_format: "json" (default, analysis pipeline) or None (prose).
+        Currently honored only by the Ollama path; cloud responses are
+        always JSON-formatted today.
+    messages: optional pre-built message list. Honored by Ollama only;
+        cloud path will raise if used (the workbench chat is Ollama-only).
     """
     _ = kwargs
     if config is None:
         config = load_config()
 
     if config.is_cloud:
+        if messages is not None:
+            raise NotImplementedError(
+                "Pre-built messages are not yet supported for cloud providers; "
+                "switch to ollama for the RE Workbench chat or extend _complete_cloud."
+            )
         return _complete_cloud(
             prompt, config, model=model, system_content=system_content,
             stream=stream, on_token=on_token, on_thinking=on_thinking,
@@ -444,4 +518,5 @@ def complete(
         prompt, config, model=model, system_content=system_content,
         stream=stream, on_token=on_token, on_thinking=on_thinking,
         run_logger=run_logger, images=images,
+        response_format=response_format, messages=messages,
     )
