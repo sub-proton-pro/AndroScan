@@ -26,7 +26,14 @@ def run_first_time_setup(
     runner: Optional[_RunCommand] = None,
     npm_path: Optional[str] = None,
 ) -> int:
-    """Run ``pip install -e ".[dev]"`` and (if Node available) ``npm ci`` + ``npm run build``.
+    """Run ``pip install -e ".[dev,rag]"`` and (if Node available) ``npm ci`` + ``npm run build``.
+
+    The ``[rag]`` extra pulls in ``fastembed`` + ``numpy`` so semantic retrieval
+    (Inspect-tab chat enrichment, ``search_decompiled_sources`` skill, Settings →
+    Status RAG card) works out of the box. Without it, only the deterministic
+    ``hash`` embed provider is available, which is fine for tests but useless
+    for real semantic search. The first ``Build now`` click in the UI will then
+    download the fastembed ONNX model (~130 MB) into the per-user cache.
 
     Returns 0 on success, 1 on the first failed required step. The npm step is
     skipped (with a warning, exit 1) only if ``npm`` is not on PATH; otherwise
@@ -47,9 +54,10 @@ def run_first_time_setup(
     print(grey(f"    Repo: {repo_root}"), file=out)
     print(file=out)
 
-    # Step 1 -- editable install + dev deps (pytest, httpx for TestClient).
-    pip_cmd = [sys.executable, "-m", "pip", "install", "-e", ".[dev]"]
-    print(green("Step 1/2: pip install -e \".[dev]\""), file=out)
+    # Step 1 -- editable install + dev deps (pytest, httpx for TestClient) +
+    # rag deps (fastembed, numpy) so semantic retrieval works out of the box.
+    pip_cmd = [sys.executable, "-m", "pip", "install", "-e", ".[dev,rag]"]
+    print(green("Step 1/2: pip install -e \".[dev,rag]\""), file=out)
     print(grey(f"    $ {' '.join(pip_cmd)}"), file=out)
     rc = run(pip_cmd, repo_root)
     if rc != 0:

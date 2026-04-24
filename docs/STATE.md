@@ -63,7 +63,7 @@ See **DEC-020** (settings tab design) and **DEC-021** (probe shape + asyncio.gat
 
 ## What is known to work
 
-- `pip install -e ".[dev]"` and `pytest` from repo root succeed.
+- `pip install -e ".[dev,rag]"` and `pytest` from repo root succeed. (`[rag]` pulls in `fastembed` + `numpy` for semantic retrieval; `--setup` uses the same extras.)
 - `python androscan.py --serve` starts RE Workbench on `http://127.0.0.1:8420` (or `web.*` from config). With `androscan/web/static/` built (`npm run build` in `androscan/web/frontend/`), browser UI loads projects, mirror, logcat; requires **adb** for mirror/tap/logcat.
 - `python androscan.py --apk <path_to_apk> --task exported_components` runs real extraction → dossier → multi-turn LLM (Ollama) → consolidation → validation → exploit verification (emulator + ADB) → report under `apps/<app_id>/<run_ts>/`. With real APK, Ollama, and emulator running, report contains hypotheses with valid evidence_refs and verified/unverified status.
 - `--task` can be repeated (e.g. `--task a --task b`). CLI checks Ollama reachability before analysis; clear error and setup tip if unreachable.

@@ -8,10 +8,17 @@ LLM-native Android security analysis for pentesters. Analyzes APK attack surface
 python androscan.py --setup
 ```
 
-Runs `pip install -e ".[dev]"` (editable install + test deps) and, if Node.js is
-available, `npm ci` + `npm run build` in `androscan/web/frontend/` to produce
-the RE Workbench static assets at `androscan/web/static/`. Re-run after pulling
-changes that touch dependencies. (You can still install manually if you prefer.)
+Runs `pip install -e ".[dev,rag]"` (editable install + test deps + the
+[`fastembed`](https://qdrant.github.io/fastembed/) embedder used by the RE
+Workbench's semantic code search) and, if Node.js is available, `npm ci` +
+`npm run build` in `androscan/web/frontend/` to produce the RE Workbench
+static assets at `androscan/web/static/`. Re-run after pulling changes that
+touch dependencies. (You can still install manually if you prefer.)
+
+> The first time you click **Build now** on the Settings → Status RAG card
+> (or the first time the LLM calls `search_decompiled_sources`), fastembed
+> downloads the `BAAI/bge-small-en-v1.5` ONNX model (~130 MB) into its
+> per-user cache. Subsequent index builds reuse the cached model.
 
 ## Usage
 

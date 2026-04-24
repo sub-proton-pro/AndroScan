@@ -183,6 +183,7 @@ Use for real future work, not vague ideas.
 - add richer evidence provenance tracking
 - add adapter for additional mobile tooling
 - **Interactive RE Workbench (Phases 6–9)** — see § Interactive RE Workbench in this file (replaces vague “web UI shell” backlog item)
+- **Standalone "search code" UI for Lane-1 RAG** — backend (`POST /api/rag/{app_id}/query`) and the `SearchHit` shape are already shipped; today RAG is only consumed implicitly via Inspect-tab chat enrichment, the `/api/inspect/map` fuser, and the `search_decompiled_sources` LLM skill. A small operator-facing search affordance (e.g. a sub-tab inside Inspect, or a "Code search" panel inside the Code Browser) with click-to-jump into `CodeView` would make the index directly useful during manual RE. Pull this forward only if operators ask for it; nothing else depends on it.
 - add queue-backed job execution
 - add configurable policy layer
 

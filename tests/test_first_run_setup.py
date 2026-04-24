@@ -35,7 +35,7 @@ def test_setup_runs_pip_then_npm_ci_then_build(tmp_path: Path) -> None:
     assert len(calls) == 3
     pip_cmd, pip_cwd = calls[0]
     assert pip_cmd[:3] == [sys.executable, "-m", "pip"]
-    assert "install" in pip_cmd and "-e" in pip_cmd and ".[dev]" in pip_cmd
+    assert "install" in pip_cmd and "-e" in pip_cmd and ".[dev,rag]" in pip_cmd
     assert pip_cwd == repo.resolve()
 
     install_cmd, install_cwd = calls[1]

@@ -276,7 +276,7 @@ def _run() -> int:
         "--setup",
         action="store_true",
         default=False,
-        help="First-time setup: pip install -e \".[dev]\" and build the RE Workbench UI (npm).",
+        help="First-time setup: pip install -e \".[dev,rag]\" and build the RE Workbench UI (npm).",
     )
     parser.add_argument(
         "--serve",
