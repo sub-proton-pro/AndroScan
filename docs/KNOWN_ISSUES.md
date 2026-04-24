@@ -275,6 +275,29 @@ Use the following format for new entries:
 
 ---
 
+### ISSUE-009: Workbench chat cannot dig deeper than the initial RAG sweep
+- status: Open
+- impact: Medium
+- area: web / chat / RAG
+- introduced / observed: 2026-04 (Inspect-tab testing on a fixture banking APK)
+- summary:
+  `androscan/web/chat.py` is single-pass: it runs at most one `_enrich_inspect_with_rag` sweep (top-4 chunks, fail-soft) up-front, then calls the LLM once and returns prose. The LLM cannot request additional skills mid-turn the way `androscan/internal/workflow.py` does. When the question hinges on a specific method-level chunk that didn't make `_INSPECT_RAG_TOP_K = 4`, the model honestly hedges with "decompile and look it up yourself" instead of being able to call `search_decompiled_sources` (or `get_decompiled_method`) for the missing piece — even though those skills are registered and the analysis pipeline already uses them.
+- why it matters:
+  It produces low-trust answers for questions that the registered skill set can answer in milliseconds, undercutting the workbench's "ask the LLM about this APK" value proposition. Operators learn not to trust Inspect chat for deep questions, which weakens adoption.
+- current workaround:
+  Ask narrower questions, paste the suspected class name explicitly into the prompt so the RAG embedding aligns with the class header chunk, or run the full `androscan.py --apk ... --task ...` analysis pipeline (which has the agentic loop).
+- recommended fix:
+  Implement the bounded agentic skill loop + consent-class hook described in **DEC-022**. Independently, raise `_INSPECT_RAG_TOP_K` from 4 → 8–10 and bump `_INSPECT_RAG_PER_HIT_CHARS` proportionally as a same-day band-aid that reduces (but does not eliminate) the failure rate.
+- related tasks:
+  - "RE Workbench chat — agentic skill loop (P2, planned per DEC-022)" in `docs/TASKS.md` (under § Interactive RE Workbench)
+- related docs:
+  - `docs/DECISIONS.md` DEC-022
+  - `docs/STATE.md` (Partially implemented — workbench chat single-pass)
+  - `androscan/web/chat.py`
+  - `androscan/internal/workflow.py`
+
+---
+
 ## 7. Accepted limitations
 
 Use this section for limitations that are currently acceptable and not immediate defects.

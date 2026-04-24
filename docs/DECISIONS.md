@@ -600,6 +600,61 @@ Use the following structure for new entries:
   - `docs/ARCHITECTURE.md` §4.7
   - `docs/SAFETY_AND_SECURITY.md`
 
+### DEC-022: Workbench chat — agentic skill loop with a consent-class hook for side-effecting skills
+- status: Proposed
+- date: 2026-04
+- owners: (project)
+- context:
+  The workbench chat path (`androscan/web/chat.py`, `POST /api/chat` and `POST /api/chat/stream`) is one-shot: validate → optional one-pass `_enrich_inspect_with_rag` (top-4 chunks, fail-soft) → call `complete()` once → return prose. The LLM cannot ask for more data mid-turn. By contrast, the analysis pipeline in `androscan/internal/workflow.py` runs a real **`while turn < max_turns`** loop that calls `parse_response()` and `run_skills(...)` whenever the model emits `skill_requests`, feeding results back into the next turn's prompt.
+
+  Real symptom (April 2026 testing): in the Inspect-tab chat, an operator asked *"what is the name of this sqlite db and where in the device filesystem is it located?"*. RAG correctly retrieved the `BalanceDatabase` and `WeakBankContentProvider` chunks, but the chunker splits at the method level and the **constructor** chunk (where `super(context, "<name>", null, 1)` lives) didn't make the top-4. The model honestly hedged: *"the actual database name constant... is not shown — to find it, decompile and look in the constructor / `onCreate`."* The exact follow-up the model wanted to do (a second `search_decompiled_sources` call scoped to `BalanceDatabase.<init>`) is a registered LLM-tier skill that the chat path simply doesn't expose.
+
+  The gap matters more as the workbench grows: Hook Lab will introduce frida-related skills (DEC-017) that *do* have side effects on the device, so any agentic-loop design has to accommodate both read-only static-analysis skills (current state) and consent-required side-effecting skills (Hook Lab onward) without two parallel code paths.
+- decision:
+  - **Add a bounded agentic skill loop to the workbench chat path** that mirrors `workflow.py`'s pattern. Inspect, Reports, and Hook Lab tabs share one implementation in `androscan/web/chat.py`; tabs scope which skills are reachable via a per-tab allowlist (the existing `_TAB_SYSTEM_PROMPT` allowlist gains a `skills` axis).
+  - **Hard caps in code, not config:** `MAX_CHAT_TURNS = 5`, `MAX_SKILLS_PER_TURN = 3`, per-skill wall-clock timeout = 5 s, total per-chat-turn skill-output budget = ~6 KB (each skill result is truncated and headed with `# skill_name(args)` so the model knows what got cut).
+  - **Stream every step.** Extend the SSE event vocabulary (`thinking` / `content` / `done` / `error`) with two new types:
+    - `skill_request` — `{turn, skill, args, request_id}`
+    - `skill_result` — `{request_id, ok, duration_ms, preview, truncated}`
+    The frontend renders these as collapsible cards inside the existing thinking block. The user always sees what the LLM looked at, with click-to-expand for full results — that is the audit trail.
+  - **Consent-class hook, even though no skill needs it yet.** `SkillMeta` gains a `requires_confirmation: bool = False` field. The chat loop branches on it: `False` → execute immediately; `True` → emit a `skill_pending` SSE event with `{request_id, skill, args, rationale}`, the loop awaits a follow-up `POST /api/chat/skill_decision/{request_id}` from the client (Allow / Deny + optional edited args), then either runs or short-circuits with a "denied by operator" skill result. Pending state lives in an in-process `dict[request_id -> PendingSkill]` keyed by chat session, with a 90 s TTL.
+  - **Per-tab "always confirm" toggle** in Settings → Per-app overrides (defaults off). When on, every skill is treated as `requires_confirmation=True` for that tab. Operators who want pure-manual mode get it without a code change.
+  - **Transcript schema extension.** `apps/<app>/<run>/chat/<tab>.jsonl` adds `{type: "skill_call", turn, name, args, result_preview, duration_ms, decision?}` records interleaved with the existing `{type: "user"|"assistant"}` lines. Reports can cite "the LLM looked at `BalanceDatabase.<init>` lines 23–28" verbatim.
+  - **Today's classification:** all currently-registered LLM-tier skills (`get_decompiled_class`, `get_decompiled_method`, `list_classes_in_package`, `search_decompiled_sources`, `resolve_ui_element`) keep `requires_confirmation=False`. Hook-Lab-introduced skills (frida hook injection, `adb shell`-driving skills, anything that mutates device or files) ship with `requires_confirmation=True`.
+- rationale:
+  - **Read-only static-analysis skills do not justify confirm-mode friction.** Every current LLM-tier skill reads from the persistent decompile cache or hits the local SQLite RAG index — no `adb`, no network, no writes. The risk profile is roughly equivalent to "the IDE auto-completed by reading more files than I asked about." Gating each call behind a click would add 3–5 seconds of human-reaction latency per question with no safety benefit.
+  - **Streamed skill cards are the audit trail.** The thing operators actually want from confirm-mode (chain of evidence, reproducibility, "screenshot for the report") is delivered by visible-and-clickable skill events plus the transcript JSONL. They get to *see* what happened without having to *gate* it.
+  - **The consent hook is built once, used forever.** Hook Lab will need exactly this flow for frida hook injection (DEC-017 already commits us to user confirmation for LLM-generated hooks). Building the protocol now — even with zero skills using it — means Hook Lab inherits a working consent UI and a tested pause-and-resume protocol on day one. Otherwise we'll either skip safety in the rush to ship Hook Lab, or pause the Hook Lab milestone to retrofit consent.
+  - **One implementation, two modes.** A unified loop with a per-skill flag avoids the bug-magnet of maintaining "auto chat" and "manual chat" as separate code paths. Per-tab and per-app overrides are policy on top of the same engine.
+  - **Bounded loop > unbounded planner.** Hard caps in code (not config) prevent runaway costs and keep latency predictable. The model can ask for "more search" up to a budget; past that, it has to commit to an answer.
+- alternatives considered:
+  - **Pure auto-loop, no consent hook** (rejected): cheaper today, but Hook Lab will need the consent flow within the same milestone — building it incrementally there would either delay Hook Lab or compromise DEC-017.
+  - **Pure confirm-each-step UX with Allow/Stop on every skill** (rejected): permanent UX friction (3–5 clicks per multi-step question), pause-and-resume protocol is real engineering, and the safety justification is weak when 100% of currently-callable skills are read-only. Also: nothing stops a tired operator from clicking Allow 30 times.
+  - **No change; tune `_INSPECT_RAG_TOP_K` upward and accept the limitation** (rejected): increasing top-k to 10 + per-hit budget improves the failure rate but doesn't fix the underlying "lexical embedding mismatch" problem (a query like "where is X defined" will keep missing constructor chunks because they're mostly `super(...)` boilerplate). It's a band-aid we may apply *as well*, but it isn't a substitute for letting the model dig.
+  - **Tool-call API (Ollama / OpenAI native function-calling)** (deferred but not rejected): for Ollama models that support it (`llama3.1`, `qwen2.5-coder`, `mistral-nemo`), the loop body can use tool-calling instead of the `parse_response()` JSON convention `workflow.py` uses today. We keep the option open by abstracting the "extract skill requests from a model turn" step behind a small interface; the initial implementation reuses `parse_response()` for parity with the analysis pipeline.
+- tradeoffs / consequences:
+  - **Latency per chat turn grows with the loop.** A question that needed 3 skill calls now waits for 4 LLM turns + 3 skill executions before any final content streams. Mitigated by: streaming each `skill_request` / `skill_result` event so the user sees activity, hard cap on `MAX_CHAT_TURNS`, per-skill timeout.
+  - **Context window grows.** Each skill result gets appended to the next turn's messages. We need a small summarisation strategy past 2–3 results (keep most recent N raw, replace older ones with one-line citations).
+  - **Two consumers of the skill registry now exist** (`workflow.py` and `chat.py`). They share `run_skills()` but call it from different orchestration loops; behaviour drift is a risk. Mitigated by: shared `parse_response()` + `run_skills()`; integration tests that exercise both paths against the same fake skill set.
+  - **Pending-skill state is in-process.** A uvicorn restart drops pending consents. Acceptable for the single-operator local deployment; documented in `KNOWN_ISSUES.md` if/when it bites someone. Persisting to SQLite is a one-day follow-up if needed.
+  - **The streaming SSE schema is now larger** — frontends that don't recognise `skill_request` / `skill_result` / `skill_pending` ignore unknown event types (current `streamChat` parser already does this), so backwards compatibility is preserved.
+  - **`/api/chat` (non-streaming) cannot do interactive consent** — it returns 409 if the LLM requests a `requires_confirmation=True` skill. The streaming path is the only consent-capable surface. Non-streaming chat is mostly a test-friendly fallback at this point; documented.
+- follow-up:
+  - Build behind a per-tab feature flag (`chat.agentic_loop.enabled`) so it can ship dark and be enabled per tab as confidence grows.
+  - Add `tests/test_chat_agentic.py` covering: happy path with 1+ skill turns, max-turn cutoff, skill timeout, skill error mid-loop, consent-required skill with deny, consent-required skill with TTL expiry, SSE event ordering invariants.
+  - Ship Inspect-tab first (most obvious win), then Reports, then Hook Lab (which will exercise the consent path for the first real `requires_confirmation=True` skills).
+  - Revisit this DEC during Hook Lab to confirm the consent-class hook is sufficient for frida hook injection per DEC-017, or extend it (e.g. require a typed-confirmation phrase for hook scripts that touch security-sensitive APIs).
+  - Independently of this work, also bump `_INSPECT_RAG_TOP_K` from 4 → 8–10 as a quick UX win — the loop reduces but doesn't eliminate the value of better one-shot retrieval.
+- related docs:
+  - `docs/DECISIONS.md` DEC-013 (Skills as first-class layer with three-tier model)
+  - `docs/DECISIONS.md` DEC-017 (Frida user-confirmation requirement — this DEC is the mechanism that fulfils it)
+  - `docs/DECISIONS.md` DEC-018 (Lane-1 RAG — the primary read-only retrieval skill)
+  - `docs/DESIGN_DOC.md` (Phases 6–9; chat loop section to be added)
+  - `docs/SAFETY_AND_SECURITY.md` (consent semantics + per-skill budgets — section to be added)
+  - `docs/TASKS.md` (backlog entry to track implementation; "RE Workbench chat — agentic loop" P2 item under § Interactive RE Workbench)
+  - `androscan/web/chat.py` (current one-shot path — to be extended)
+  - `androscan/internal/workflow.py` (existing `while turn < max_turns` loop pattern — the model to mirror)
+
 ---
 
 ## Superseded / deprecated decisions

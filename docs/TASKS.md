@@ -74,6 +74,15 @@ Planned work: web-based interactive reverse engineering on top of the existing C
 - Persist the raw-YAML editor's draft locally (sessionStorage) so an accidental tab switch doesn't lose unsaved work.
 - Add a "Hook Lab readiness" rollup probe (frida-server present on device, frida CLI on host, target package gadget injectable) once Hook Lab work begins.
 
+**RE Workbench chat — agentic skill loop (P2, planned per DEC-022):**
+- Extend `androscan/web/chat.py` with a bounded `while turn < MAX_CHAT_TURNS` loop that calls `parse_response()` + `run_skills()` whenever the LLM emits `skill_requests` (mirroring `androscan/internal/workflow.py`'s pattern). Hard caps in code: `MAX_CHAT_TURNS = 5`, `MAX_SKILLS_PER_TURN = 3`, per-skill timeout = 5 s, per-turn skill-output budget ≈ 6 KB.
+- Add `requires_confirmation: bool = False` to `SkillMeta`. Today's read-only LLM-tier skills stay `False`; Hook-Lab-introduced skills (frida hook injection, anything that mutates device or files) ship `True`.
+- Extend the SSE vocabulary with `skill_request` / `skill_result` / `skill_pending` event types; render as collapsible cards inside the existing thinking block in `ChatDock`. For `skill_pending` (consent-required skills), the loop awaits `POST /api/chat/skill_decision/{request_id}` (Allow / Deny + optional edited args) with a 90 s TTL on pending state.
+- Per-tab "always confirm" toggle in Settings → Per-app overrides (default off); when on, every skill is treated as `requires_confirmation=True` for that tab.
+- Transcript schema: interleave `{type: "skill_call", turn, name, args, result_preview, duration_ms, decision?}` records into `apps/<app>/<run>/chat/<tab>.jsonl`.
+- Ship behind a per-tab feature flag (`chat.agentic_loop.enabled`) so it can ship dark and enable per tab as confidence grows. Order: Inspect → Reports → Hook Lab. New tests in `tests/test_chat_agentic.py` covering happy path, max-turn cutoff, skill timeout, skill error mid-loop, consent deny, consent TTL expiry, SSE event ordering.
+- Quick win to land independently: bump `_INSPECT_RAG_TOP_K` from 4 → 8–10 + raise `_INSPECT_RAG_PER_HIT_CHARS` proportionally. Reduces the failure rate that motivates this DEC but does not replace it.
+
 ---
 
 ### Phase 6 — Web UI shell with emulator mirror

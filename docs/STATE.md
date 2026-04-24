@@ -51,6 +51,7 @@ See **DEC-020** (settings tab design) and **DEC-021** (probe shape + asyncio.gat
 
 ### Partially implemented
 - Modules: `exported_components` workflow is wired; task dispatch supports multiple --task values; first module is the only one implemented.
+- **Workbench chat is single-pass.** `androscan/web/chat.py` does **not** loop on `skill_requests` like `androscan/internal/workflow.py` does, so the LLM cannot dig deeper mid-turn — it only sees what `_enrich_inspect_with_rag` (`_INSPECT_RAG_TOP_K = 4`) attached up-front. Symptom: questions that hinge on a specific method-level chunk that didn't make the top-4 (e.g. "what is this DB's name?" when the constructor chunk wasn't retrieved) get hedged answers like "decompile and look in the constructor / `onCreate`." Planned fix: agentic skill loop with consent-class hook, see **DEC-022** + the corresponding TASKS.md backlog entry; quick band-aid (independent of DEC-022): bump `_INSPECT_RAG_TOP_K` to 8–10. Tracked as **ISSUE-009**.
 
 ### Not yet implemented
 - Phase 4 CI: pytest on every push/PR — parked.
