@@ -169,7 +169,7 @@ The project is successful when:
 
 ## Current phase
 
-Phase 5 (exploit verification) complete; Phase 4 (CI, hardening) unparked.
+Phase 5 (exploit verification) complete; Phase 4 (CI, hardening) partially complete (CI on push/PR still parked). **Phase 6** (RE Workbench shell: FastAPI, REST, WebSockets, React UI after `npm run build`) is **implemented** — see `docs/STATE.md`. **Phases 7–9** (click-to-code, Smali graph, Frida) remain roadmap items in `docs/TASKS.md` / `docs/DESIGN_DOC.md` (DEC-015–017).
 
 ---
 

@@ -8,7 +8,7 @@ Its purpose is to capture:
 - repository structure and module boundaries
 - component dossier and LLM input/output schemas
 - prompt design and skills-based analysis flow
-- implementation roadmap (Phases 1–5)
+- implementation roadmap (Phases 1–5 complete for MVP core; Phases 6–9 planned for Interactive RE Workbench)
 - risks and mitigations
 - the first end-to-end vertical slice
 
@@ -83,7 +83,7 @@ APK path (CLI)
 
 | Layer | MVP responsibility |
 |-------|---------------------|
-| **Presentation** | CLI entrypoint (`androscan.py`), args (`--apk`, `--task` multi-valued, `--output`), render report to stdout and/or write under run folder. No business/LLM logic. |
+| **Presentation** | CLI entrypoint (`androscan.py`), args (`--apk`, `--task` multi-valued, `--output`), render report to stdout and/or write under run folder. No business/LLM logic. **Planned (Phase 6+):** optional local web UI (FastAPI + React) for mirror/logcat/browse — see roadmap § Phase 6–9. |
 | **Orchestration** | Select and run one or more task workflows; create run folder; hand off to module workflows; merge/normalize results. |
 | **Internal (application/domain)** | Dossier schema, finding/exploit-hypothesis model, normalization from LLM output, severity/confidence rules, report generation code. |
 | **LLM** | Ollama-only adapter, prompt construction (dossier + global context + skills), response parsing/validation, multi-turn loop, retries/timeouts. |
@@ -342,6 +342,39 @@ Skills use a three-tier model: **pipeline** (orchestration only: extract_manifes
 - **Artifacts:** `apps/<app_id>/<run_ts>/exploit_verification/<vuln_module>/<hyp_id>/` (e.g. exported_components) with before/after screenshots, logcat, commands, and verification result. Each vuln module has its own subfolder; each hypothesis has a per-hypothesis directory.
 - **Skills (exploit tier):** app_env_check, build_exploit_command, capture_signals, run_exploit_command, verify_exploit_result. Vuln–skill–signal_profile matrix (JSON) defines which signal types each module captures.
 
+### Phase 6 — Interactive RE Workbench: web UI shell + emulator mirror
+
+**Goal:** Local web UI on top of existing runs: browse `apps/<app_id>/` runs, dossier, findings; live emulator mirror and logcat; thin presentation only (no new vulnerability logic in the UI).
+
+**Deliverables (target):**
+
+- FastAPI + WebSocket server under `androscan/web/`; static-built React app (`androscan/web/frontend/`); bind **127.0.0.1** by default; config `web_host` / `web_port` in `global_config.yaml`.
+- REST: projects, runs, dossier JSON, report/findings JSON (see `docs/TASKS.md` Phase 6 list).
+- Mirror: scrcpy or `screencap` polling; forward taps via `adb shell input tap`.
+- Logcat stream over WebSocket; CLI entry e.g. `--serve` (optional `--apk … --serve` after analysis).
+
+**Tests:** mocked REST/WebSocket; no live Ollama/device required in default CI.
+
+### Phase 7 — Click-to-code mapping
+
+**Goal:** User taps mirror → resolve UI node (uiautomator XML + coordinate hit-test) → foreground Activity → resource-id / layout → jadx source references (`findViewById`, bindings) → open in Monaco at the right line.
+
+**Deliverables (target):** `POST /api/tap`, `GET /api/source/{class}`; optional LLM-assisted fallback; new **llm** skill `resolve_ui_element` (catalog + tests). Deterministic path preferred; LLM is advisory when tracing is ambiguous.
+
+### Phase 8 — Static call graph from Smali
+
+**Goal:** Offline graph from apktool Smali: methods as nodes, `invoke-*` as edges; optional class hierarchy; artifact `apps/<app_id>/call_graph.json`; graph APIs for neighbors/paths and LLM-assisted queries; Cytoscape.js in the UI.
+
+**Deliverables (target):** `androscan/analysis/` (or equivalent) builder; paginated/filtered `GET /api/graph/...`; new **llm** skill `query_call_graph` for subgraph + question → candidate paths (validated against graph where possible).
+
+### Phase 9 — Frida integration
+
+**Goal:** Attach to package on device/emulator; load parameterized hook scripts; stream trace events to UI; optional integration with exploit verification (new signal type e.g. `frida_trace` in `vuln_module_skills_signals.json`).
+
+**Deliverables (target):** Frida adapter behind tool-adapter boundaries; hook template library; user confirmation before deploying LLM-generated hooks; new **llm** skill `generate_frida_hook`; tests use mocks; device tests opt-in.
+
+**Full sub-task checklists:** `docs/TASKS.md` § Interactive RE Workbench.
+
 ---
 
 ## 9. Risks and mitigations
@@ -376,6 +409,7 @@ Skills use a three-tier model: **pipeline** (orchestration only: extract_manifes
 
 ## 11. Relationship to other docs
 
+- **Phases 6–9** (Interactive RE Workbench): detailed sub-tasks in `docs/TASKS.md`; architecture deltas in `docs/ARCHITECTURE.md`; rationale in `docs/DECISIONS.md` (DEC-015–017).
 - **Target shape and MVP contracts:** this document.
 - **Concise purpose:** `docs/PROJECT_BRIEF.md`.
 - **Current implementation:** `docs/STATE.md`.

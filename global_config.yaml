@@ -21,3 +21,19 @@ workflow:
 output:
   section_rule_char: "─"
   section_rule_length: 60
+
+# Local RE Workbench (Phase 6): bind loopback by default; see docs/SAFETY_AND_SECURITY.md
+web:
+  host: "127.0.0.1"
+  port: 8420
+  screencap_interval_ms: 500
+
+# Lane-1 RAG over decompiled sources (Phase 6 step 3).
+# Provider can be: fastembed (default, local ONNX) | ollama (re-uses base_url above)
+# Model: leave empty for the provider's recommended default
+#   fastembed -> BAAI/bge-small-en-v1.5
+#   ollama    -> nomic-embed-text  (run: ollama pull nomic-embed-text)
+rag:
+  embed_provider: "fastembed"
+  embed_model: ""
+  top_k_default: 8

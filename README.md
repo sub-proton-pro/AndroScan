@@ -2,6 +2,17 @@
 
 LLM-native Android security analysis for pentesters. Analyzes APK attack surface (exported components, deep links) with a local LLM (Ollama) to produce evidence-backed exploitability findings. After hypotheses are produced, the workflow can run **exploit verification** on an emulator via ADB (device checks, command execution, signal capture, LLM-assisted verification) so the report can mark findings **verified** or **unverified**.
 
+## Setup (first run)
+
+```bash
+python androscan.py --setup
+```
+
+Runs `pip install -e ".[dev]"` (editable install + test deps) and, if Node.js is
+available, `npm ci` + `npm run build` in `androscan/web/frontend/` to produce
+the RE Workbench static assets at `androscan/web/static/`. Re-run after pulling
+changes that touch dependencies. (You can still install manually if you prefer.)
+
 ## Usage
 
 ```bash
@@ -9,6 +20,22 @@ python androscan.py --apk <path-to.apk> [--task exported_components] [--output <
 ```
 
 See `python androscan.py --help` for options.
+
+### RE Workbench (local web UI, Phase 6)
+
+```bash
+# Needs adb. UI assets must exist (run --setup once, or `npm run build` manually).
+python androscan.py --serve
+# Open http://127.0.0.1:8420/  (port from global_config.yaml web.port or --web-port)
+```
+
+After a full APK run, start the server with the same analysis:
+
+```bash
+python androscan.py --apk <path-to.apk> --task exported_components --serve
+```
+
+Dev mode (Vite proxy to API): run `python androscan.py --serve`, then `cd androscan/web/frontend && npm run dev`.
 
 ## Skills
 
@@ -22,6 +49,7 @@ Skill definitions and parameters are in the skills layer (`androscan/skills/`). 
 
 ## Docs
 
-- `docs/DESIGN_DOC.md` — architecture and MVP design
+- `docs/DESIGN_DOC.md` — architecture and MVP design (includes **planned** Phases 6–9: Interactive RE Workbench)
 - `docs/STATE.md` — current implementation state
-- `docs/TASKS.md` — task queue and priorities
+- `docs/TASKS.md` — task queue and priorities (§ Interactive RE Workbench for phased milestones)
+- `docs/ARCHITECTURE.md`, `docs/DECISIONS.md` — structure and ADRs (DEC-015–017 for web UI, call graph, Frida)

@@ -1,0 +1,395 @@
+"""Unit tests for the pure-function health probes.
+
+We monkeypatch ``shutil.which`` and ``asyncio.create_subprocess_exec`` to
+keep the tests hermetic — no real adb / jadx / ollama needs to be on the
+test runner.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from androscan.web import health_probes as hp
+
+
+# ---------------------------------------------------------------------------
+# Subprocess plumbing
+
+
+class _FakeProc:
+    def __init__(self, rc: int, stdout: bytes, stderr: bytes) -> None:
+        self.returncode = rc
+        self._out = stdout
+        self._err = stderr
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        return self._out, self._err
+
+
+def _make_subprocess_factory(plan: dict[str, _FakeProc]):
+    """Return a coroutine that mimics ``asyncio.create_subprocess_exec``.
+
+    ``plan`` keys are the first argv element (the binary). Anything not in
+    the plan raises ``FileNotFoundError`` to mirror real "missing binary"
+    behaviour.
+    """
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        if not argv:
+            raise FileNotFoundError("no binary")
+        cmd = argv[0]
+        if cmd not in plan:
+            raise FileNotFoundError(cmd)
+        return plan[cmd]
+    return factory
+
+
+# ---------------------------------------------------------------------------
+# probe_tool_version
+
+
+def test_probe_tool_version_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hp, "_which", lambda c: None)
+    out = asyncio.run(hp.probe_tool_version("nope"))
+    assert out["ok"] is False
+    assert out["found"] is False
+    assert out["error"]
+
+
+def test_probe_tool_version_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hp, "_which", lambda c: f"/fake/bin/{c}")
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"/fake/bin/jadx": _FakeProc(0, b"jadx 1.5.0\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_tool_version("jadx", "--version", parse_first_token=True))
+    assert out["ok"] is True
+    assert out["found"] is True
+    assert out["version"] == "1.5.0"
+
+
+def test_probe_tool_version_no_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hp, "_which", lambda c: f"/fake/bin/{c}")
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"/fake/bin/adb": _FakeProc(0, b"", b"")}),
+    )
+    out = asyncio.run(hp.probe_tool_version("adb"))
+    assert out["ok"] is False
+    assert "no version output" in out["error"]
+
+
+def test_probe_apktool_version_uses_version_subcommand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Apktool 2.x exits non-zero for `--version`; the probe must call the
+    # `version` subcommand instead. Record argv to prove the wiring.
+    seen_argv: list[tuple[str, ...]] = []
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        seen_argv.append(argv)
+        return _FakeProc(0, b"2.12.0\n", b"")
+
+    monkeypatch.setattr(hp, "_which", lambda c: f"/fake/bin/{c}")
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_apktool_version("apktool"))
+    assert out["ok"] is True
+    assert out["version"] == "2.12.0"
+    assert seen_argv == [("/fake/bin/apktool", "version")]
+
+
+# ---------------------------------------------------------------------------
+# probe_adb_device
+
+
+def test_probe_adb_device_connected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Healthy emulator: get-state returns `device`, get-serialno returns serial."""
+    seen_argv: list[tuple[str, ...]] = []
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        seen_argv.append(argv)
+        if argv[1] == "get-state":
+            return _FakeProc(0, b"device\n", b"")
+        if argv[1] == "get-serialno":
+            return _FakeProc(0, b"emulator-5554\n", b"")
+        return _FakeProc(1, b"", b"unexpected")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_adb_device())
+    assert out["ok"] is True
+    assert out["connected"] is True
+    assert out["state"] == "device"
+    assert out["serial"] == "emulator-5554"
+    assert out["error"] is None
+    # Both helper calls happened, in order.
+    assert [a[1] for a in seen_argv] == ["get-state", "get-serialno"]
+
+
+def test_probe_adb_device_no_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No emulator attached: get-state exits non-zero with adb stderr."""
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        # Real adb prints to stderr in this case.
+        return _FakeProc(1, b"", b"adb: no devices/emulators found\n")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_adb_device())
+    assert out["ok"] is False
+    assert out["connected"] is False
+    assert out["state"] is None
+    assert out["serial"] is None
+    assert "no devices" in out["error"]
+
+
+def test_probe_adb_device_unauthorized(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Device is plugged in but not authorised → not ok, but connected=True."""
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        if argv[1] == "get-state":
+            return _FakeProc(0, b"unauthorized\n", b"")
+        return _FakeProc(1, b"", b"")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_adb_device())
+    assert out["ok"] is False
+    assert out["connected"] is True
+    assert out["state"] == "unauthorized"
+    # No serial lookup attempted for non-`device` states.
+    assert out["serial"] is None
+    assert "unauthorized" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# probe_pkg_running (regression: ok must reflect actual running state)
+
+
+def test_probe_pkg_running_not_running_when_no_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No device → adb shell fails → card is not ok and surfaces stderr.
+
+    Regression: previously this returned ``ok=True, error=None`` even when
+    adb couldn't reach a device, which made the "Running on device" card
+    misleadingly green.
+    """
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        return _FakeProc(1, b"", b"adb: no devices/emulators found\n")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_pkg_running("com.example"))
+    assert out["ok"] is False
+    assert out["running"] is False
+    assert out["pid"] is None
+    assert "no devices" in (out["error"] or "")
+
+
+def test_probe_pkg_running_actually_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        return _FakeProc(0, b"4242\n", b"")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_pkg_running("com.example"))
+    assert out["ok"] is True
+    assert out["running"] is True
+    assert out["pid"] == 4242
+    assert out["error"] is None
+
+
+# ---------------------------------------------------------------------------
+# Ollama probes
+
+
+def test_probe_ollama_tags_no_curl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the urllib fallback path."""
+    import androscan.web.health_probes as mod
+
+    def fake_which(name: str) -> str | None:
+        return None  # no curl
+
+    monkeypatch.setattr(mod.shutil, "which", fake_which)
+
+    def fake_sync_thread(fn):
+        async def runner():
+            return fn()
+        return runner()
+
+    # Patch asyncio.to_thread to call our function inline.
+    async def to_thread(fn, *args, **kw):
+        return fn(*args, **kw)
+
+    monkeypatch.setattr("asyncio.to_thread", to_thread)
+
+    # Make urllib.urlopen succeed with a known JSON.
+    import json as _json
+
+    class _FakeResp:
+        def read(self) -> bytes:
+            return _json.dumps({"models": [{"name": "qwen3.5:35b"}, {"name": "nomic-embed-text"}]}).encode()
+
+        def __enter__(self):  # noqa: D401
+            return self
+
+        def __exit__(self, *a) -> None:  # noqa: D401
+            pass
+
+    def fake_urlopen(req, timeout=0):
+        return _FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    out = asyncio.run(hp.probe_ollama_tags("http://localhost:11434"))
+    assert out["ok"] is True
+    assert "qwen3.5:35b" in out["models"]
+    assert hp.model_present(out, "qwen3.5:35b")
+    assert hp.model_present(out, "qwen3.5") is True  # bare match
+    assert hp.model_present(out, "missing") is False
+
+
+# ---------------------------------------------------------------------------
+# Embed provider
+
+
+def test_probe_fastembed_available_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    out = hp.probe_fastembed_available()
+    assert out["ok"] is False
+    assert out["installed"] is False
+
+
+def test_probe_fastembed_model_cache_missing_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FASTEMBED_CACHE", str(tmp_path / "does_not_exist"))
+    out = hp.probe_fastembed_model_cache("BAAI/bge-small-en-v1.5")
+    assert out["ok"] is False
+    assert out["cached"] is False
+
+
+def test_probe_fastembed_model_cache_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = tmp_path / "fec"
+    (cache / "fast-bge-small-en-v1.5").mkdir(parents=True)
+    monkeypatch.setenv("FASTEMBED_CACHE", str(cache))
+    out = hp.probe_fastembed_model_cache("BAAI/bge-small-en-v1.5")
+    assert out["cached"] is True
+
+
+def test_probe_embed_provider_hash_always_ok() -> None:
+    out = asyncio.run(hp.probe_embed_provider("hash", "", ""))
+    assert out["ok"] is True
+    assert out["provider"] == "hash"
+
+
+# ---------------------------------------------------------------------------
+# Disk / path / dir-size
+
+
+def test_probe_disk(tmp_path: Path) -> None:
+    out = hp.probe_disk(tmp_path)
+    assert "free_gb" in out
+    assert isinstance(out["low_space"], bool)
+
+
+def test_probe_path_writable_existing(tmp_path: Path) -> None:
+    out = hp.probe_path_writable(tmp_path)
+    assert out["ok"] is True
+    assert out["writable"] is True
+
+
+def test_probe_path_writable_missing(tmp_path: Path) -> None:
+    out = hp.probe_path_writable(tmp_path / "nope")
+    assert out["ok"] is False
+
+
+def test_probe_dir_size(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_bytes(b"x" * 100)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "b.txt").write_bytes(b"y" * 200)
+    out = hp.probe_dir_size(tmp_path)
+    assert out["ok"] is True
+    assert out["size_bytes"] >= 300
+    assert out["entries"] >= 3
+
+
+# ---------------------------------------------------------------------------
+# APK sha drift
+
+
+def test_probe_apk_sha_drift_missing_inputs() -> None:
+    out = hp.probe_apk_sha_drift(None, None)
+    assert out["ok"] is False
+    assert "no apk_path" in out["error"]
+
+
+def test_probe_apk_sha_drift_match(tmp_path: Path) -> None:
+    apk = tmp_path / "x.apk"
+    apk.write_bytes(b"abc")
+    from androscan.internal.app_meta import compute_apk_sha256
+    sha = compute_apk_sha256(apk)
+    out = hp.probe_apk_sha_drift(str(apk), sha)
+    assert out["ok"] is True
+    assert out["drift"] is False
+
+
+def test_probe_apk_sha_drift_mismatch(tmp_path: Path) -> None:
+    apk = tmp_path / "x.apk"
+    apk.write_bytes(b"abc")
+    out = hp.probe_apk_sha_drift(str(apk), "deadbeef" * 8)
+    assert out["ok"] is False
+    assert out["drift"] is True
+
+
+# ---------------------------------------------------------------------------
+# Per-app on-device probes (all use the FakeProc plumbing)
+
+
+def test_probe_pkg_installed_yes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"package:/data/app/foo/base.apk\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_pkg_installed("com.example"))
+    assert out["installed"] is True
+    assert out["apk_path_on_device"]
+
+
+def test_probe_pkg_installed_no(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"", b"")}),
+    )
+    out = asyncio.run(hp.probe_pkg_installed("com.example"))
+    assert out["installed"] is False
+
+
+def test_probe_pkg_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"12345\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_pkg_running("com.example"))
+    assert out["running"] is True
+    assert out["pid"] == 12345
+
+
+def test_probe_foreground_activity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"  ACTIVITY com.example/.MainActivity\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_foreground_activity())
+    assert out["ok"] is True
+    assert out["activity"] == "com.example/.MainActivity"
+    assert out["package"] == "com.example"
+
+
+def test_probe_python_env_shape() -> None:
+    out = hp.probe_python_env()
+    assert "python_version" in out
+    assert "modules" in out

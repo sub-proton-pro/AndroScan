@@ -43,6 +43,22 @@ def test_parse_response_invalid_json():
     assert resp.skill_requests == []
 
 
+def test_parse_response_assigns_synthetic_id_when_missing():
+    """LLMs frequently omit `id`; parser must synthesize a stable one so the
+    UI can address findings via /api/triage/.../{finding_id}."""
+    raw = (
+        '{"hypotheses": ['
+        '{"component_type": "activity", "title": "A"},'
+        '{"id": "", "component_type": "activity", "title": "B"},'
+        '{"id": "   ", "component_type": "activity", "title": "C"}'
+        "]}"
+    )
+    resp = parse_response(raw)
+    ids = [h.id for h in resp.hypotheses]
+    assert ids == ["finding-0", "finding-1", "finding-2"]
+    assert all(i.strip() for i in ids)
+
+
 def test_complete_calls_ollama_and_returns_response():
     """complete() POSTs to Ollama /api/chat and returns CompleteResult. No live Ollama."""
     mock_resp = MagicMock()

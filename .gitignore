@@ -31,3 +31,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# RE Workbench frontend
+androscan/web/frontend/node_modules/
+androscan/web/static/
