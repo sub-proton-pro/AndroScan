@@ -2,7 +2,9 @@
 """AndroScan CLI: LLM-native Android pentesting tool.
 
 Usage:
-  python androscan.py --apk <path> [--task <name> ...] [--output <dir>] [--config <file>] [--model <name>]
+  python androscan.py --setup
+  python androscan.py --apk <path> [--task <name> ...] [--output <dir>] [--config <file>] [--model <name>] [--serve] [--web-port N]
+  python androscan.py --serve [--config <file>] [--web-port N]
   python androscan.py --list-models [--config <file>]
 """
 
@@ -32,6 +34,7 @@ from androscan.cli_spinner import pause_active, resume_active, spinner
 from androscan.cli_term import blue, bright_red, colored_json, dark_red, gold, green, grey, orange
 from androscan.config import load_config
 from androscan.internal.app_meta import extracted_apk_path, save_app_meta
+from androscan.internal.first_run_setup import run_first_time_setup
 from androscan.internal.resolve_app_id import resolve_app_id
 from androscan.internal.run_folder import create_run_folder, run_folder_display_path
 from androscan.internal.run_log import RunLogger
@@ -40,6 +43,18 @@ from androscan.config import CLOUD_PROVIDERS
 from androscan.llm import is_ollama_available
 from androscan.llm.client import OLLAMA_SETUP_TIP
 from androscan.llm.parser import Hypothesis
+
+
+def _run_web_server(config: Any, web_port: Optional[int] = None) -> int:
+    """Start local FastAPI RE Workbench (blocks until interrupted)."""
+    from androscan.web.server import run_web_server
+
+    cfg = dataclasses.replace(config, web_port=web_port) if web_port is not None else config
+    host = cfg.web_host
+    port = cfg.web_port
+    print(green(f"RE Workbench: http://{host}:{port}/  (Ctrl+C to stop)"))
+    run_web_server(cfg)
+    return 0
 
 
 def _section(title: str, rule: Optional[str] = None) -> None:
@@ -258,6 +273,25 @@ def _run() -> int:
         help="List locally available Ollama models and exit.",
     )
     parser.add_argument(
+        "--setup",
+        action="store_true",
+        default=False,
+        help="First-time setup: pip install -e \".[dev]\" and build the RE Workbench UI (npm).",
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        default=False,
+        help="After analysis (or immediately if no --apk), start the local RE Workbench web UI (FastAPI).",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Port for RE Workbench (default: config web.port, e.g. 8420).",
+    )
+    parser.add_argument(
         "--exploit_verification_test",
         action="store_true",
         default=False,
@@ -272,13 +306,19 @@ def _run() -> int:
     args = parser.parse_args()
     verbosity = max(1, args.verbose)
 
+    if args.setup:
+        return run_first_time_setup(Path(__file__).resolve().parent)
+
     config = load_config(args.config)
 
     if args.list_models:
         return _list_models(config)
 
+    if args.serve and not args.apk:
+        return _run_web_server(config, args.web_port)
+
     if not args.apk:
-        parser.error("--apk is required (unless using --list-models)")
+        parser.error("--apk is required (unless using --list-models or --serve without --apk)")
 
     if args.provider:
         provider = args.provider.strip().lower()
@@ -542,6 +582,9 @@ def _run() -> int:
     print(f"  Tasks:    {tasks_str}")
     print(f"  Output:   {display_output}")
     print(f"  Report:   {Path(display_output) / 'report.json'}")
+    if args.serve:
+        cfg = dataclasses.replace(config, web_port=args.web_port) if args.web_port is not None else config
+        return _run_web_server(cfg, None)
     return 0
 
 
