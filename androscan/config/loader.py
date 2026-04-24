@@ -4,8 +4,10 @@ Merge order: defaults (constants) -> global_config.yaml (if present) -> env vars
 Env vars override file. Pass config file path via --config or use default search paths.
 """
 
+import dataclasses
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -43,6 +45,68 @@ CLOUD_PROVIDERS = {
 }
 
 
+# Mapping from flat ``Config`` field name to its YAML location and the env
+# variable (if any) that would override it. Used by :func:`effective_sources`
+# to build the "source pills" the Settings UI shows next to each value, and
+# by :func:`dump_to_yaml` to write a partial update back to the YAML file
+# without disturbing keys it doesn't recognise.
+#
+# Each entry: ``field -> (yaml_section, yaml_key, env_var | None)``.
+CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
+    "ollama_base_url":             ("ollama",   "base_url",          "ANDROSCAN_OLLAMA_URL"),
+    "ollama_timeout_sec":          ("ollama",   "timeout_sec",       "ANDROSCAN_OLLAMA_TIMEOUT"),
+    "ollama_model":                ("ollama",   "model",             "ANDROSCAN_OLLAMA_MODEL"),
+    "ollama_temperature":          ("ollama",   "temperature",        None),
+    "ollama_num_predict":          ("ollama",   "num_predict",        None),
+    "llm_provider":                ("llm",      "provider",          "ANDROSCAN_LLM_PROVIDER"),
+    "cloud_model":                 ("llm",      "cloud_model",       "ANDROSCAN_CLOUD_MODEL"),
+    "cloud_api_key":               ("llm",      "cloud_api_key",      None),
+    "cloud_temperature":           ("llm",      "cloud_temperature",  None),
+    "run_folder_root":             ("paths",    "run_folder_root",   "ANDROSCAN_RUN_FOLDER"),
+    "apktool_cmd":                 ("paths",    "apktool_cmd",        None),
+    "jadx_cmd":                    ("paths",    "jadx_cmd",           None),
+    "max_turns":                   ("workflow", "max_turns",          None),
+    "max_hypotheses_per_report":   ("workflow", "max_hypotheses_per_report", None),
+    "per_component_analysis":      ("workflow", "per_component_analysis",     None),
+    "section_rule_char":           ("output",   "section_rule_char",  None),
+    "section_rule_length":         ("output",   "section_rule_length", None),
+    "web_host":                    ("web",      "host",              "ANDROSCAN_WEB_HOST"),
+    "web_port":                    ("web",      "port",              "ANDROSCAN_WEB_PORT"),
+    "web_screencap_interval_ms":   ("web",      "screencap_interval_ms", "ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"),
+    "rag_embed_provider":          ("rag",      "embed_provider",    "ANDROSCAN_RAG_PROVIDER"),
+    "rag_embed_model":             ("rag",      "embed_model",       "ANDROSCAN_RAG_MODEL"),
+    "rag_top_k_default":           ("rag",      "top_k_default",     "ANDROSCAN_RAG_TOP_K"),
+}
+
+
+# Fields that the in-process FastAPI app can re-read after a write without a
+# uvicorn restart. Anything **not** in this set requires the user to bounce
+# the server (the Settings UI surfaces this with a "restart required" pill).
+LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
+    "ollama_base_url",
+    "ollama_timeout_sec",
+    "ollama_model",
+    "ollama_temperature",
+    "ollama_num_predict",
+    "llm_provider",
+    "cloud_model",
+    "cloud_api_key",
+    "cloud_temperature",
+    "apktool_cmd",
+    "jadx_cmd",
+    "max_turns",
+    "max_hypotheses_per_report",
+    "per_component_analysis",
+    "section_rule_char",
+    "section_rule_length",
+    "rag_embed_provider",
+    "rag_embed_model",
+    "rag_top_k_default",
+    "web_screencap_interval_ms",
+})
+
+
+
 @dataclass(frozen=True)
 class Config:
     """Runtime configuration. Load via load_config()."""
@@ -64,6 +128,12 @@ class Config:
     jadx_cmd: str
     section_rule_char: str
     section_rule_length: int
+    web_host: str
+    web_port: int
+    web_screencap_interval_ms: int
+    rag_embed_provider: str
+    rag_embed_model: str
+    rag_top_k_default: int
 
     @classmethod
     def default(cls) -> "Config":
@@ -85,6 +155,12 @@ class Config:
             jadx_cmd=constants.JADX_CMD_DEFAULT,
             section_rule_char=constants.SECTION_RULE_CHAR,
             section_rule_length=constants.SECTION_RULE_LENGTH,
+            web_host="127.0.0.1",
+            web_port=8420,
+            web_screencap_interval_ms=500,
+            rag_embed_provider="fastembed",
+            rag_embed_model="",
+            rag_top_k_default=8,
         )
 
     @property
@@ -181,6 +257,14 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["jadx_cmd"] = paths.get("jadx_cmd") or constants.JADX_CMD_DEFAULT
     out["section_rule_char"] = output.get("section_rule_char") or constants.SECTION_RULE_CHAR
     out["section_rule_length"] = _safe_int(output.get("section_rule_length"), constants.SECTION_RULE_LENGTH, "output.section_rule_length")
+    web = config_dict.get("web") or {}
+    out["web_host"] = (web.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    out["web_port"] = _safe_int(web.get("port"), 8420, "web.port")
+    out["web_screencap_interval_ms"] = _safe_int(web.get("screencap_interval_ms"), 500, "web.screencap_interval_ms")
+    rag = config_dict.get("rag") or {}
+    out["rag_embed_provider"] = (rag.get("embed_provider") or "fastembed").strip() or "fastembed"
+    out["rag_embed_model"] = (rag.get("embed_model") or "").strip()
+    out["rag_top_k_default"] = _safe_int(rag.get("top_k_default"), 8, "rag.top_k_default")
     return out
 
 
@@ -190,7 +274,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
     config_path: explicit path to YAML file. If None, search:
       - cwd / global_config.yaml
       - cwd / config / global_config.yaml
-    Env: ANDROSCAN_OLLAMA_URL, ANDROSCAN_OLLAMA_TIMEOUT, ANDROSCAN_OLLAMA_MODEL, ANDROSCAN_RUN_FOLDER.
+    Env: ANDROSCAN_OLLAMA_URL, ANDROSCAN_OLLAMA_TIMEOUT, ANDROSCAN_OLLAMA_MODEL, ANDROSCAN_RUN_FOLDER,
+    ANDROSCAN_WEB_HOST, ANDROSCAN_WEB_PORT, ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS.
     """
     defaults = Config.default()
     yaml_data: dict[str, Any] = {}
@@ -225,6 +310,36 @@ def load_config(config_path: Optional[str] = None) -> Config:
         merged["llm_provider"] = os.environ["ANDROSCAN_LLM_PROVIDER"].strip().lower()
     if os.environ.get("ANDROSCAN_CLOUD_MODEL"):
         merged["cloud_model"] = os.environ["ANDROSCAN_CLOUD_MODEL"].strip()
+    if os.environ.get("ANDROSCAN_WEB_HOST"):
+        merged["web_host"] = os.environ["ANDROSCAN_WEB_HOST"].strip() or merged.get("web_host", "127.0.0.1")
+    if os.environ.get("ANDROSCAN_WEB_PORT"):
+        try:
+            merged["web_port"] = max(1, min(65535, int(os.environ["ANDROSCAN_WEB_PORT"].strip())))
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_WEB_PORT={os.environ['ANDROSCAN_WEB_PORT']!r} is not a valid integer; using YAML/default.",
+                file=sys.stderr,
+            )
+    if os.environ.get("ANDROSCAN_RAG_PROVIDER"):
+        merged["rag_embed_provider"] = os.environ["ANDROSCAN_RAG_PROVIDER"].strip() or merged.get("rag_embed_provider", "fastembed")
+    if os.environ.get("ANDROSCAN_RAG_MODEL"):
+        merged["rag_embed_model"] = os.environ["ANDROSCAN_RAG_MODEL"].strip()
+    if os.environ.get("ANDROSCAN_RAG_TOP_K"):
+        try:
+            merged["rag_top_k_default"] = max(1, int(os.environ["ANDROSCAN_RAG_TOP_K"].strip()))
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_RAG_TOP_K={os.environ['ANDROSCAN_RAG_TOP_K']!r} invalid; using default.",
+                file=sys.stderr,
+            )
+    if os.environ.get("ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"):
+        try:
+            merged["web_screencap_interval_ms"] = max(50, int(os.environ["ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"].strip()))
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS={os.environ['ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS']!r} invalid; using default.",
+                file=sys.stderr,
+            )
 
     return Config(
         ollama_base_url=merged["ollama_base_url"],
@@ -244,4 +359,313 @@ def load_config(config_path: Optional[str] = None) -> Config:
         jadx_cmd=merged["jadx_cmd"],
         section_rule_char=merged["section_rule_char"] or constants.SECTION_RULE_CHAR,
         section_rule_length=max(1, merged["section_rule_length"]),
+        web_host=str(merged.get("web_host") or "127.0.0.1").strip() or "127.0.0.1",
+        web_port=max(1, min(65535, int(merged.get("web_port", 8420)))),
+        web_screencap_interval_ms=max(50, int(merged.get("web_screencap_interval_ms", 500))),
+        rag_embed_provider=str(merged.get("rag_embed_provider") or "fastembed").strip() or "fastembed",
+        rag_embed_model=str(merged.get("rag_embed_model") or "").strip(),
+        rag_top_k_default=max(1, int(merged.get("rag_top_k_default", 8))),
     )
+
+
+# ---------------------------------------------------------------------------
+# Settings-tab helpers: introspection, partial overrides, and YAML write-back
+# ---------------------------------------------------------------------------
+
+
+def config_as_flat_dict(config: Config) -> dict[str, Any]:
+    """``dataclasses.asdict`` for ``Config`` (alias kept for clarity at call sites)."""
+    return dataclasses.asdict(config)
+
+
+def global_view_from_config(config: Config) -> dict[str, dict[str, Any]]:
+    """Return the YAML-shaped nested view of ``config``.
+
+    Mirrors :func:`_merge_from_yaml` in reverse: every flat field is grouped
+    by the section it lives under in ``global_config.yaml``. Used by the
+    Settings tab and by :func:`androscan.web.per_app_settings.effective_settings`
+    to overlay per-app overrides without each consumer hand-rolling the
+    section grouping.
+    """
+    flat = config_as_flat_dict(config)
+    out: dict[str, dict[str, Any]] = {}
+    for field, (section, key, _env) in CONFIG_FIELD_MAP.items():
+        if field not in flat:
+            continue
+        out.setdefault(section, {})[key] = flat[field]
+    # Convenience mirrors so per-app sections can inherit from a clean
+    # root even when they have no equivalent global key (e.g. inspect).
+    out.setdefault("inspect", {})
+    out.setdefault("decompile", {})
+    out.setdefault("exploit", {})
+    out.setdefault("chat", {})
+    return out
+
+
+def effective_sources(
+    config_path: Optional[Path],
+) -> dict[str, str]:
+    """Return ``{field: 'yaml' | 'env' | 'default'}`` for every Config field.
+
+    The Settings UI uses this to disable inputs whose value comes from an
+    environment variable (since saving the YAML wouldn't take effect) and
+    to badge "default" entries the user hasn't customised.
+    """
+    yaml_data: dict[str, Any] = {}
+    if config_path and config_path.is_file():
+        yaml_data = _load_yaml(config_path)
+    sources: dict[str, str] = {}
+    for field, (section, key, env_var) in CONFIG_FIELD_MAP.items():
+        if env_var and os.environ.get(env_var):
+            sources[field] = "env"
+            continue
+        sec = yaml_data.get(section) or {}
+        if isinstance(sec, dict) and key in sec and sec[key] is not None and sec[key] != "":
+            sources[field] = "yaml"
+            continue
+        sources[field] = "default"
+    return sources
+
+
+def env_overrides() -> dict[str, str]:
+    """Snapshot of currently-set ``ANDROSCAN_*`` env vars (value redacted-safe).
+
+    Names only — values are echoed back so the UI can show "ollama_model
+    is locked because $ANDROSCAN_OLLAMA_MODEL=qwen2:7b is set".
+    """
+    out: dict[str, str] = {}
+    for _field, (_s, _k, env) in CONFIG_FIELD_MAP.items():
+        if env and os.environ.get(env):
+            out[env] = os.environ[env]
+    return out
+
+
+def with_overrides(config: Config, **overrides: Any) -> Config:
+    """Return a new ``Config`` with ``overrides`` applied (validated + clamped).
+
+    Used for live-reload after a YAML save: we re-run :func:`load_config`
+    in the general case, but simple per-app effective-config calculations
+    can use this to apply just a few tweaks without I/O. Unknown keys
+    raise ``ValueError`` so a typo doesn't silently no-op.
+    """
+    flat = config_as_flat_dict(config)
+    for k, v in overrides.items():
+        if k not in flat:
+            raise ValueError(f"Unknown Config field: {k!r}")
+        flat[k] = v
+    # Re-apply the same clamps load_config() does so callers can't smuggle
+    # negative timeouts or out-of-range ports through this path.
+    return Config(
+        ollama_base_url=str(flat["ollama_base_url"]).strip().rstrip("/") or "http://localhost:11434",
+        ollama_timeout_sec=max(1, int(flat["ollama_timeout_sec"])),
+        ollama_model=str(flat["ollama_model"] or "qwen3.5:35b"),
+        ollama_temperature=float(flat["ollama_temperature"]),
+        ollama_num_predict=max(1, int(flat["ollama_num_predict"])),
+        llm_provider=str(flat.get("llm_provider") or "ollama").strip().lower() or "ollama",
+        cloud_model=str(flat.get("cloud_model") or "").strip(),
+        cloud_api_key=str(flat.get("cloud_api_key") or "").strip(),
+        cloud_temperature=float(flat.get("cloud_temperature") or 0.2),
+        run_folder_root=str(flat["run_folder_root"] or "apps"),
+        max_turns=max(1, int(flat["max_turns"])),
+        max_hypotheses_per_report=max(0, int(flat["max_hypotheses_per_report"])),
+        per_component_analysis=bool(flat["per_component_analysis"]),
+        apktool_cmd=str(flat["apktool_cmd"] or constants.APKTOOL_CMD_DEFAULT),
+        jadx_cmd=str(flat["jadx_cmd"] or constants.JADX_CMD_DEFAULT),
+        section_rule_char=str(flat["section_rule_char"] or constants.SECTION_RULE_CHAR),
+        section_rule_length=max(1, int(flat["section_rule_length"])),
+        web_host=str(flat["web_host"] or "127.0.0.1").strip() or "127.0.0.1",
+        web_port=max(1, min(65535, int(flat["web_port"]))),
+        web_screencap_interval_ms=max(50, int(flat["web_screencap_interval_ms"])),
+        rag_embed_provider=str(flat["rag_embed_provider"] or "fastembed").strip() or "fastembed",
+        rag_embed_model=str(flat["rag_embed_model"] or "").strip(),
+        rag_top_k_default=max(1, int(flat["rag_top_k_default"])),
+    )
+
+
+def coerce_yaml_value(field: str, raw: Any) -> Any:
+    """Coerce a JSON-parsed value to the type ``Config.<field>`` expects.
+
+    Returns the cleaned value or raises ``ValueError`` so the HTTP layer
+    can return a clean 400 with the offending field name.
+    """
+    if field not in CONFIG_FIELD_MAP:
+        raise ValueError(f"Unknown Config field: {field!r}")
+    int_fields = {
+        "ollama_timeout_sec", "ollama_num_predict",
+        "max_turns", "max_hypotheses_per_report",
+        "section_rule_length",
+        "web_port", "web_screencap_interval_ms",
+        "rag_top_k_default",
+    }
+    float_fields = {"ollama_temperature", "cloud_temperature"}
+    bool_fields = {"per_component_analysis"}
+    str_fields = {
+        "ollama_base_url", "ollama_model",
+        "llm_provider", "cloud_model", "cloud_api_key",
+        "run_folder_root", "apktool_cmd", "jadx_cmd",
+        "section_rule_char",
+        "web_host",
+        "rag_embed_provider", "rag_embed_model",
+    }
+    if field in int_fields:
+        return _safe_int(raw, 0, field)
+    if field in float_fields:
+        return _safe_float(raw, 0.0, field)
+    if field in bool_fields:
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+        return bool(raw)
+    if field in str_fields:
+        if raw is None:
+            return ""
+        return str(raw).strip()
+    raise ValueError(f"Unhandled coercion for {field!r}")
+
+
+def dump_to_yaml(config_path: Path, partial: dict[str, Any]) -> dict[str, Any]:
+    """Atomically merge ``partial`` (flat field dict) into the YAML at ``config_path``.
+
+    Preserves any keys / sections the loader doesn't know about (so user
+    comments aren't *removed* but their hand-edits to unrelated keys
+    survive a UI save). Returns the new full YAML dict that was written.
+    """
+    existing: dict[str, Any] = {}
+    if config_path.is_file():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                loaded = yaml.safe_load(f)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (yaml.YAMLError, OSError):
+            existing = {}
+
+    for field, value in partial.items():
+        if field not in CONFIG_FIELD_MAP:
+            raise ValueError(f"Unknown Config field: {field!r}")
+        section, key, _env = CONFIG_FIELD_MAP[field]
+        sec = existing.get(section)
+        if not isinstance(sec, dict):
+            sec = {}
+        coerced = coerce_yaml_value(field, value)
+        sec[key] = coerced
+        existing[section] = sec
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=".global_config.", suffix=".yaml.tmp", dir=str(config_path.parent)
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(existing, f, sort_keys=False, default_flow_style=False)
+        os.replace(tmp_name, config_path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return existing
+
+
+def validate_raw_yaml(raw_text: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Parse + validate a YAML string the user typed in the Settings UI.
+
+    Returns ``(parsed_dict, None)`` on success or ``(None, error_message)``
+    on parse / shape failure. We also dry-run :func:`_merge_from_yaml` so
+    the user gets type errors *before* the file is overwritten.
+    """
+    if not isinstance(raw_text, str):
+        return None, "raw YAML must be a string"
+    try:
+        loaded = yaml.safe_load(raw_text)
+    except yaml.YAMLError as e:
+        return None, f"YAML parse error: {e}"
+    if loaded is None:
+        # An empty file is valid — it just means "everything default".
+        loaded = {}
+    if not isinstance(loaded, dict):
+        return None, "top-level YAML must be a mapping (got something else)"
+    try:
+        _merge_from_yaml(loaded)
+    except (ValueError, TypeError) as e:
+        return None, f"validation error: {e}"
+    return loaded, None
+
+
+def save_raw_yaml(config_path: Path, raw_text: str) -> dict[str, Any]:
+    """Atomically replace ``config_path`` with the user-edited YAML text.
+
+    Validates first via :func:`validate_raw_yaml`; raises ``ValueError`` on
+    bad input so the HTTP layer returns a 400 with the offending message.
+    Returns the parsed dict on success.
+    """
+    parsed, err = validate_raw_yaml(raw_text)
+    if err is not None:
+        raise ValueError(err)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=".global_config.", suffix=".yaml.tmp", dir=str(config_path.parent)
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(raw_text)
+        os.replace(tmp_name, config_path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return parsed or {}
+
+
+def read_raw_yaml(config_path: Path) -> str:
+    """Return the on-disk YAML text (empty string if the file doesn't exist)."""
+    if not config_path.is_file():
+        return ""
+    try:
+        return config_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def restore_defaults_yaml(config_path: Path) -> dict[str, Any]:
+    """Overwrite ``config_path`` with the default YAML view of ``Config.default()``.
+
+    "Reset to defaults" path the Settings UI exposes. Preserves the file
+    location and any hand-added env-var overrides (those still win at
+    ``load_config`` time even after we wipe the YAML).
+    """
+    defaults = Config.default()
+    full = global_view_from_config(defaults)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=".global_config.", suffix=".yaml.tmp", dir=str(config_path.parent)
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(full, f, sort_keys=False, default_flow_style=False)
+        os.replace(tmp_name, config_path)
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return full
+
+
+def discover_config_path(cwd: Optional[Path] = None) -> Path:
+    """Best-effort discovery of where to write ``global_config.yaml``.
+
+    Mirrors the search order in :func:`load_config`. If the file exists,
+    return it. Otherwise return the canonical default location so the
+    Settings "save" path creates it there rather than in some arbitrary
+    cwd at request-time.
+    """
+    base = cwd or Path.cwd()
+    candidates = [base / "global_config.yaml", base / "config" / "global_config.yaml"]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return candidates[0]
