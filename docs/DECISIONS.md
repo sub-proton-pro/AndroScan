@@ -438,20 +438,25 @@ Use the following structure for new entries:
 - context:
   The product needs accurate method-level edges for dispatch and JNI/native boundaries are less visible in Java decompilation. jadx is ideal for human-readable source browsing but is a lossy view for bytecode-level invokes.
 - decision:
-  Build the **primary** static call graph from **Smali** files produced by **apktool** decode. Use **jadx** for mapping UI taps and displaying source (Phases 7–8). Store graph artifacts under `apps/<app_id>/` (e.g. `call_graph.json`) with rebuild-on-APK-hash-change.
+  Build the **primary** static call graph from **Smali** files produced by **apktool** decode. Use **jadx** for mapping UI taps and displaying source (Phases 7–8). Store graph artifacts in a **per-app SQLite** database at `apps/<app_id>/.decompiled/<sha>/call_graph.sqlite` (mirroring DEC-018's RAG store layout — same `<sha>`-keyed cache directory, same drop-the-file-to-invalidate model). Rebuild on APK hash change.
 - rationale:
-  Smali reflects actual `invoke-*` targets; aligns with existing apktool pipeline; keeps graph generation testable with small fixture Smali files.
+  Smali reflects actual `invoke-*` targets; aligns with existing apktool pipeline; keeps graph generation testable with small fixture Smali files. SQLite (vs. a JSON blob) matches DEC-018, gives ACID writes + indexed lookups for `neighbors` / `paths` queries on real apps without loading the whole graph into memory, and survives partial writes during long apktool runs.
 - alternatives considered:
   - jadx IR / Java AST only (rejected as primary: less faithful to bytecode)
   - External binary analysis tool as mandatory dependency (deferred: keep in-house parser first, adapter later if needed)
+  - JSON blob at `apps/<app_id>/call_graph.json` (originally chosen here, superseded — see footnote below; doesn't scale to real apps and breaks the `<sha>`-keyed invalidation model)
 - tradeoffs / consequences:
   - Custom parser maintenance; must handle large apps via pagination/filtering in APIs and UI.
+  - Adds a third per-app SQLite store alongside the RAG index (DEC-018) — operationally the same shape; tests can use the existing fixture-driven pattern.
 - follow-up:
   Implement `androscan/analysis/` (or equivalent) per `docs/TASKS.md` Phase 8; add `query_call_graph` **llm** skill when subgraph contract is stable.
 - related docs:
   - `docs/DESIGN_DOC.md` (Phase 8)
   - `docs/ARCHITECTURE.md` §4.9
   - `docs/CONVENTIONS.md` (graph artifact conventions when implemented)
+  - **DEC-023** (Hook Lab v1 — Smali call graph + Frida adapter; ratifies the SQLite storage choice as part of the Hook Lab plan)
+
+**Superseded sub-decision (2026-04-25):** the original storage clause specified a JSON blob at `apps/<app_id>/call_graph.json`. That clause was superseded by **DEC-023** during Hook Lab v1 planning in favour of per-app SQLite at `apps/<app_id>/.decompiled/<sha>/call_graph.sqlite`. DEC-016 itself remains Active — the Smali-first sourcing decision and the rebuild-on-APK-hash-change semantic are unchanged; only the on-disk format and path were tightened.
 
 ### DEC-018: Lane-1 RAG over decompiled sources — embeddings + SQLite, not BM25 or JSON
 - status: Active
@@ -654,6 +659,67 @@ Use the following structure for new entries:
   - `docs/TASKS.md` (backlog entry to track implementation; "RE Workbench chat — agentic loop" P2 item under § Interactive RE Workbench)
   - `androscan/web/chat.py` (current one-shot path — to be extended)
   - `androscan/internal/workflow.py` (existing `while turn < max_turns` loop pattern — the model to mirror)
+
+### DEC-023: Hook Lab v1 — Smali call graph + Frida adapter with template-driven hooks and deterministic pentester summaries
+- status: Proposed
+- date: 2026-04-25
+- owners: (project)
+- context:
+  Phase 6 step 4 (Hook Lab) brings together two previously-deferred pieces of the RE Workbench: a static call graph from Smali (DEC-016) and live Frida instrumentation (DEC-017). Together they unlock the planned "click a method → see its callers/callees → optionally hook it and watch live traces" workflow that the Inspect tab cannot deliver alone. Before any code lands, the planning conversation (April 2026) settled eight open design questions that span call-graph fidelity, on-disk storage, frida-server provisioning, hook source policy, the Inject-button confirmation UX, trace persistence, per-app vs. global safety knobs, and graph-visualisation strategy. This entry records those decisions in one place so the Hook Lab implementation rolls out in a strictly linear 8-sub-step sequence (4.1 → 4.8 in `docs/TASKS.md`) without re-litigating policy mid-implementation.
+- decision:
+  - **Call-graph fidelity (v1 = "v2" in the planning shorthand):** the Smali parser resolves **direct `invoke-*`** edges *and* performs **virtual-dispatch resolution** for `invoke-virtual` / `invoke-interface` against the in-app class hierarchy (no framework classes). Edges that come from dispatch resolution rather than a direct invoke are tagged `kind: "virtual_dispatch"` and rendered **dashed** in Cytoscape; the LLM is told they are inferences, not literal bytecode targets. Reflection-resolved edges are deferred to v3; nodes whose method body contains `Class.forName` / `Method.invoke` patterns carry `may_have_unresolved_reflection: true` so consumers (UI, LLM skill) can flag the gap honestly.
+  - **Storage:** per-app SQLite at `apps/<app_id>/.decompiled/<sha>/call_graph.sqlite`, mirroring DEC-018's RAG store. Drop-the-file-to-invalidate; same `<sha>`-keyed cache directory as decompile + RAG. **DEC-016 is amended** in this same commit to reflect this — its original JSON-blob clause is footnoted as a superseded sub-decision.
+  - **frida-server provisioning:** **operator-managed for v1.** Androscan does not push/start frida-server. A new probe in `androscan/web/health_probes.py` checks (a) frida CLI on the host, (b) frida-server reachable on the device, (c) host/server version skew. Results surface as a Settings → Status card (same pattern as the existing adb / jadx / Ollama cards). No `adb push frida-server` helper in v1; deferred to v2 if operator demand justifies it.
+  - **Hook source policy (v1):** **template library + LLM parameter-fill only — no free-form LLM JS.** The library lives at `androscan/adapters/frida_hooks/` and ships with five templates for v1: method entry/exit log, SSL-pinning bypass, crypto, SharedPreferences, and Intent. Each template defines a parameter schema (which the LLM-tier `generate_frida_hook` skill fills) and a `pentester_summary_template: str` (Python `.format()`-style with the same parameter names as the JS template). The LLM only fills parameters; it never emits raw JS in v1. Free-form LLM JS is a future possibility but explicitly out of v1 scope.
+  - **Confirmation UX (Option A — single Inject button):** the Hook Lab UI renders the parametrised JS (Monaco, syntax-highlighted) **plus a deterministic pentester-perspective summary** (rendered from the template's `pentester_summary_template` — what class/method is hooked, what the script observes/modifies, what data it might capture such as auth tokens or crypto material) above a single `Inject` button. The summary is a plain-text render — **no separate LLM call**, no probabilistic prose. This satisfies DEC-017's "explicit user confirmation for LLM-generated hooks" requirement. Option B (typed-confirmation phrase, sensitive-API allowlist) was considered and dropped — the operator is a pentester whose entire workflow is security-sensitive, so a typed phrase per hook would be permanent friction without proportional safety benefit.
+  - **Trace persistence:** Frida `message` events stream to the UI ring buffer **and** persist to `apps/<app_id>/<run_ts>/frida/<session>.jsonl` alongside chat transcripts and exploit-verification artifacts. Reports / triage can cite exact frida observations later; tests can assert the on-disk shape without standing up a real device.
+  - **Per-app safety knobs (in `app_settings.json`):** exactly two —
+    - `hook_target_package_prefix: str` (default = the app's own package id; hooks targeting classes outside this prefix are rejected server-side before the Inject button can fire),
+    - `auto_attach_on_session_start: bool` (default `false`).
+    Notably **no `hook_template_allowlist`**: every template in `frida_hooks/` is available to the LLM by default. The earlier planning draft proposed an allowlist; it was dropped because gating templates per-app adds configuration burden with little safety upside (the templates are vetted on commit; the Inject confirmation gate already covers per-call review).
+  - **Global perf knob (in `global_config.yaml`):** `frida.trace_ring_buffer_size: int` (default 5000 events). Not per-app — the limit is a UI/memory cost, not a per-app policy.
+  - **JS pre-validation (Risk #1 mitigation):** the rendered JS is parsed with **`pyjsparser`** (pure-Python, ~30 KB, zero runtime deps — no Node.js requirement) before the Inject button is enabled. Parse failures show inline with the parser's error position; Inject stays disabled until the script parses. This catches template-rendering bugs and obviously malformed parameter substitutions without needing a real frida session to fail. `esprima-python` was considered but `pyjsparser` is smaller and sufficient for syntax-grade validation (we don't need full ECMAScript semantics).
+- rationale:
+  - **v2 fidelity hits the sweet spot:** direct invokes alone miss the most common Android pattern (callbacks dispatched through interface references); full reflection resolution is a separate hard problem (taint analysis on string concat) that would block Hook Lab indefinitely. The dashed-edge convention keeps the v2/v3 boundary visible to operators rather than hiding it.
+  - **SQLite mirrors DEC-018:** one storage idiom across decompile cache, RAG index, and call graph keeps invalidation, backups, and ops mental model consistent. The `<sha>`-keyed cache directory is already the unit of invalidation; piggybacking on it is the lowest-friction choice.
+  - **Operator-managed frida-server for v1:** automating frida-server push/start on rooted/Magisk/userspace-gadget devices is genuinely complex and varies per OEM. Surfacing version skew is a 90% win without owning that complexity; we can revisit when it becomes a real complaint.
+  - **Templates + parameter-fill, no free-form JS:** Frida scripts can crash the target app or persist data exfiltration code; the v1 risk profile of letting the LLM emit raw JS is unattractive. Templates are reviewed on commit, parameter substitution is bounded, and the LLM stays in its strongest mode (structured JSON for parameter values, not novel code).
+  - **Single Inject button + pentester summary:** for an operator whose entire job is touching security-sensitive surfaces, a typed-phrase ceremony per hook would burn through trust quickly. The pentester summary gives them the *information* needed to consent (what does this script *do*, in plain English, from their perspective) without making consent itself a chore. Deterministic rendering (vs. an LLM-generated summary) keeps the consent surface non-negotiable: the same parameters always produce the same summary, so an operator who Inject'd "log SharedPreferences reads with key prefix `auth_`" yesterday gets the exact same words today.
+  - **Trace persistence:** parity with chat / exploit-verification artifacts; without it, frida is the one part of the workbench whose evidence trail evaporates on a uvicorn restart.
+  - **Safety knobs are intentionally minimal:** every additional knob is a new failure mode and a new doc surface. `hook_target_package_prefix` covers the "don't accidentally hook Chrome" case; `auto_attach_on_session_start` covers the "I don't want frida running until I say so" case. Anything more granular can be added when a real workflow asks for it.
+  - **Global ring buffer:** memory cost is uniform regardless of which app is being analysed; no per-app override needed.
+  - **`pyjsparser` over `esprima-python` or a Node.js subprocess:** pure-Python keeps the install matrix simple (no `nodeenv`, no platform-specific binaries); syntax-grade validation is what we need, not full semantic checking; `pyjsparser` is small enough to vendor if upstream goes quiet.
+- alternatives considered:
+  - **v1 with v3 fidelity (full reflection resolution)**: rejected — open-ended scope, would push Hook Lab past the milestone budget. Captured as a v3 follow-up.
+  - **JSON-blob storage** (the original DEC-016 wording): rejected for the same reasons as DEC-018 (cold-start cost, awkward partial-update semantics, no indexed lookups for `neighbors` / `paths`).
+  - **Auto-provisioned frida-server**: deferred — see rationale above.
+  - **Free-form LLM JS for hooks**: rejected for v1 — risk profile incompatible with the single-Inject UX. Reconsidered for v2 when telemetry shows which template gaps drive operators to ask for custom JS.
+  - **Option B confirmation UX (typed phrase + per-API allowlist)**: rejected — friction-to-safety ratio is wrong for a pentester operator.
+  - **Per-app `hook_template_allowlist`**: dropped during planning — adds config burden without an operator scenario that motivates it.
+  - **`esprima-python` for JS pre-validation**: viable; `pyjsparser` is smaller and sufficient.
+  - **Skip JS pre-validation, rely on frida's runtime errors**: rejected — runtime failures land *after* the operator clicks Inject, which is exactly the moment we should be most careful.
+- tradeoffs / consequences:
+  - **Virtual-dispatch resolution adds parser complexity** — class-hierarchy walks are bounded by the in-app type set (no framework classes), so the cost is linear in app size. Tests use small fixture Smali to assert the dashed-vs-solid edge classification.
+  - **SQLite store adds a third per-app file under `<sha>/`** — operationally identical to RAG; no new ops complexity.
+  - **`pyjsparser` and `frida` / `frida-tools` become Python deps.** `pyjsparser` is pure-Python (negligible install cost). `frida` and `frida-tools` add a real install step but are necessary for the feature to exist; they go under a new `pyproject.toml` extra `[frida]` so users who only want static analysis don't pay for them. `--setup` will install the extra by default once Hook Lab ships (parallel to how `[rag]` is currently handled).
+  - **Operator-managed frida-server means a higher first-run-friction floor** — the Settings → Status card is the mitigation; the README will get a Hook Lab section pointing at `frida-server` install docs when sub-step 4.3 lands.
+  - **Pentester-summary templates ship with each hook template** — adding a new template is now a two-deliverable change (JS template + summary template). Templates without a summary template fail the test suite; this keeps the consent surface honest by construction.
+  - **No free-form JS in v1** means a small set of operator workflows ("hook a custom obfuscated method that doesn't fit any template") are blocked until v2. Acceptable for the v1 scope.
+- follow-up:
+  - Implement sub-steps 4.1 → 4.8 strictly linearly per `docs/TASKS.md` § Hook Lab v1 — sub-step backlog. One sub-step per Agent-mode session. Brief Ask-mode planning checkpoint at the top of 4.1 to settle the SQLite schema before code lands.
+  - Add a "Hook Lab readiness" rollup probe to Settings → Status (frida CLI on host + frida-server reachable + version skew + target app installable) once sub-step 4.3 lands.
+  - Once the Hook Lab agentic loop is wired (sub-step 4.7), revisit DEC-022's consent-class hook to confirm Hook Lab's `requires_confirmation=True` skills (frida hook injection) interact correctly with the chat consent UI.
+  - Promote DEC-023 from Proposed → Active when sub-step 4.1 lands and the design is no longer hypothetical.
+  - Reconsider free-form LLM JS (v2) and reflection resolution (v3) once we have telemetry from real Hook Lab use.
+- related docs:
+  - `docs/DECISIONS.md` **DEC-016** (Smali-first call graph; storage clause amended in this commit to match)
+  - `docs/DECISIONS.md` **DEC-017** (Frida user-confirmation requirement — Option A + the deterministic pentester summary fulfil it for v1)
+  - `docs/DECISIONS.md` **DEC-018** (RAG SQLite store layout — Hook Lab's call-graph store mirrors it)
+  - `docs/DECISIONS.md` **DEC-022** (Workbench chat agentic loop — its consent-class hook is the consent UI Hook Lab's `generate_frida_hook` will exercise once both are wired)
+  - `docs/TASKS.md` § Hook Lab v1 — sub-step backlog (the implementation plan)
+  - `docs/STATE.md` ("Not yet implemented" — Hook Lab pointer)
+  - `docs/DESIGN_DOC.md` Phases 8 + 9
+  - `docs/SAFETY_AND_SECURITY.md` (Frida adapter scope + per-app `hook_target_package_prefix` semantics — to be extended when sub-steps 4.3 / 4.5 land)
 
 ---
 

@@ -58,6 +58,7 @@ See **DEC-020** (settings tab design) and **DEC-021** (probe shape + asyncio.gat
 - `exported_provider` signal captures: `content_provider_query` and `app_data_snapshot` signal types fall through to stub in `capture_signals.py`; `logcat` and the exploit command template (`query_provider`) are real.
 - Integration test with fixture APK (extraction + dossier shape) — parked in backlog.
 - **Phases 7–9:** click-to-code (uiautomator + Monaco — Lane-1 RAG over decompiled source has landed but the `POST /api/inspect/click_to_code` endpoint and Inspect-tab UI wiring have not), Smali call graph + Cytoscape, Frida — not started; see `docs/TASKS.md`.
+- **Hook Lab** — Smali call graph + Frida adapter + template-driven hooks + live trace overlay. Implementation plan locked in **DEC-023** (planning commit 2026-04-25); see § **Hook Lab v1 — sub-step backlog** in `docs/TASKS.md` for the strictly-linear 8-sub-step rollout (4.1 Smali call-graph backend → 4.8 Frida overlay + docs sweep). DEC-016 amended in the same commit to switch the call-graph store from JSON to per-app SQLite at `apps/<app_id>/.decompiled/<sha>/call_graph.sqlite`.
 - **Phase 6 polish (optional):** scrcpy stream path; richer logcat filtering in UI; RAG attachments in chat input (PDF/CSV/screenshot multimodal) — deferred to after Hook Lab.
 
 ---
