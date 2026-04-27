@@ -32,6 +32,7 @@ from androscan.web.decompile_cache import (
 from androscan.skills.resolve_ui_element import resolve as resolve_ui_element
 from androscan.web.inspect_map import map_tap_to_code
 from androscan.web.paths import apps_root, read_json, safe_child
+from androscan.web.frida_routes import build_frida_router
 from androscan.web.graph_routes import (
     build_graph_router,
     schedule_call_graph_build_after_decompile,
@@ -827,6 +828,24 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
             app_dir_resolver=_app_dir,
         )
     )
+
+    # Hook Lab routes (DEC-023, sub-step 4.5). The router factory
+    # returns ``(rest_router, ws_router)``; we mount both. The Frida
+    # client is created lazily inside the provider so a missing
+    # ``[frida]`` extra still lets the *templates* + *render* routes
+    # work (they're pure Python).
+    def _frida_provider() -> Any:
+        from androscan.adapters.frida_client import get_frida_client as _gfc
+        return _gfc(app, _current_config())
+
+    _frida_rest, _frida_ws = build_frida_router(
+        config_provider=_current_config,
+        apps_root_provider=lambda: root,
+        app_dir_resolver=_app_dir,
+        frida_client_provider=_frida_provider,
+    )
+    app.include_router(_frida_rest)
+    app.include_router(_frida_ws)
 
     # Hook Lab Frida adapter (DEC-023): detach any live sessions when uvicorn
     # tears the app down, so the next workbench start doesn't trip over a

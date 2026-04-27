@@ -48,6 +48,7 @@ from androscan.config.loader import (
     restore_defaults_yaml,
     save_raw_yaml,
 )
+from androscan.internal.app_meta import load_app_meta
 from androscan.web.per_app_settings import (
     coerce_partial_update,
     default_app_settings,
@@ -237,7 +238,8 @@ def build_settings_router(
         cfg = config_provider()
         per_app = load_app_settings(app_dir)
         gv = global_view_from_config(cfg)
-        eff = effective_settings(global_view=gv, per_app=per_app)
+        pkg = _app_package_from_meta(app_dir)
+        eff = effective_settings(global_view=gv, per_app=per_app, app_package=pkg)
         return {
             "ts": time.time(),
             "app_id": app_id,
@@ -263,11 +265,12 @@ def build_settings_router(
         invalidate_status_cache()
         cfg = config_provider()
         gv = global_view_from_config(cfg)
+        pkg = _app_package_from_meta(app_dir)
         return {
             "ok": True,
             "app_id": app_id,
             "per_app": persisted,
-            "effective": effective_settings(global_view=gv, per_app=persisted),
+            "effective": effective_settings(global_view=gv, per_app=persisted, app_package=pkg),
         }
 
     @router.post("/apps/{app_id}/reset")
@@ -282,14 +285,37 @@ def build_settings_router(
         invalidate_status_cache()
         cfg = config_provider()
         gv = global_view_from_config(cfg)
+        pkg = _app_package_from_meta(app_dir)
         return {
             "ok": True,
             "app_id": app_id,
             "per_app": persisted,
-            "effective": effective_settings(global_view=gv, per_app=persisted),
+            "effective": effective_settings(global_view=gv, per_app=persisted, app_package=pkg),
         }
 
     return router
+
+
+def _app_package_from_meta(app_dir: Path) -> Optional[str]:
+    """Return the raw manifest package id for ``app_dir`` (or ``None``).
+
+    The Hook Lab section's ``hook_target_package_prefix`` defaults to
+    this string so a freshly-imported app can be hooked without first
+    visiting the Settings tab. Best-effort: a missing or corrupt
+    ``app_meta.json`` returns ``None`` and the UI surfaces a "set
+    prefix" prompt before Inject becomes available.
+    """
+    meta = load_app_meta(app_dir)
+    if not isinstance(meta, dict):
+        return None
+    dossier = meta.get("dossier") or {}
+    apk_info = dossier.get("apk_info") if isinstance(dossier, dict) else None
+    if not isinstance(apk_info, dict):
+        return None
+    pkg = apk_info.get("package")
+    if isinstance(pkg, str) and pkg.strip():
+        return pkg.strip()
+    return None
 
 
 __all__ = [

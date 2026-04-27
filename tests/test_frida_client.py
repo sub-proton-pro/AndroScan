@@ -15,7 +15,10 @@ adapter exercises: ``get_usb_device``, ``Device.attach``,
 
 from __future__ import annotations
 
+import json
 import threading
+import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import pytest
@@ -427,3 +430,222 @@ def test_get_frida_client_clamps_below_minimum(stub_frida: _StubFridaModule) -> 
     app = _FakeApp()
     client = fc.get_frida_client(app, _BadConfig())
     assert client._ring_size >= fc.MIN_RING_SIZE  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# JSONL persistence (sub-step 4.5)
+#
+# These tests cover ``FridaSession.set_persistence_path`` and the writer
+# thread that drains the queue to disk. We rely on ``thread.join`` inside
+# ``detach`` to flush the writer synchronously before the assertions read
+# the file — racy reads would surface as flaky tests, so a small helper
+# below polls until the writer has produced ``n`` lines or times out.
+
+
+def _wait_for_lines(path: Path, expected: int, timeout: float = 2.0) -> list[dict]:
+    """Poll ``path`` until it has ``expected`` JSON lines (or raise).
+
+    Used by tests to bridge the sync producer (``script.emit``) and the
+    async writer thread without relying on hard sleeps. The writer is
+    line-buffered so each ``write + \\n`` lands atomically.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            lines = [ln for ln in text.split("\n") if ln.strip()]
+            if len(lines) >= expected:
+                return [json.loads(ln) for ln in lines]
+        time.sleep(0.02)
+    raise AssertionError(
+        f"persistence file {path} did not reach {expected} lines in {timeout}s"
+    )
+
+
+def test_persistence_writes_each_event_as_jsonl(
+    stub_frida: _StubFridaModule, tmp_path: Path,
+) -> None:
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    persist = tmp_path / "trace.jsonl"
+    session.set_persistence_path(persist)
+    script = session.load_script("rpc.exports = {};")
+
+    script.emit({"type": "send", "payload": {"hello": "world"}})
+    script.emit({"type": "log", "level": "warning", "payload": "deprecated"})
+
+    rows = _wait_for_lines(persist, 2)
+    assert [r["kind"] for r in rows] == ["send", "log"]
+    assert rows[0]["payload"] == {"hello": "world"}
+    assert rows[0]["session_id"] == session.session_id
+    # ``raw`` carries the unmodified Frida message dict.
+    assert rows[0]["raw"]["type"] == "send"
+
+    stats = session.stats()
+    assert stats["persist_path"] == str(persist)
+    assert stats["persist_dropped"] == 0
+
+
+def test_persistence_creates_parent_directory(
+    stub_frida: _StubFridaModule, tmp_path: Path,
+) -> None:
+    """A fresh ``apps/<id>/<run_ts>/frida/`` tree shouldn't need pre-creating."""
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    nested = tmp_path / "apps" / "abc" / "run_ts" / "frida" / "trace.jsonl"
+    session.set_persistence_path(nested)
+    script = session.load_script("rpc.exports = {};")
+
+    script.emit({"type": "send", "payload": "ok"})
+    rows = _wait_for_lines(nested, 1)
+    assert rows[0]["payload"] == "ok"
+
+
+def test_persistence_called_twice_raises(
+    stub_frida: _StubFridaModule, tmp_path: Path,
+) -> None:
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    session.set_persistence_path(tmp_path / "trace.jsonl")
+    with pytest.raises(RuntimeError):
+        session.set_persistence_path(tmp_path / "other.jsonl")
+
+
+def test_persistence_after_detach_raises(
+    stub_frida: _StubFridaModule, tmp_path: Path,
+) -> None:
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    session.detach()
+    with pytest.raises(RuntimeError):
+        session.set_persistence_path(tmp_path / "trace.jsonl")
+
+
+def test_persistence_drop_counter_on_unserializable_payload(
+    stub_frida: _StubFridaModule, tmp_path: Path,
+) -> None:
+    """A non-serializable payload must NOT kill the writer.
+
+    The fallback ``repr()`` should rescue this case; the explicit drop
+    counter is exercised by the unwritable-path test below. We still
+    assert the writer emits *something* so the rest of the trace
+    survives a single bad event.
+    """
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    persist = tmp_path / "trace.jsonl"
+    session.set_persistence_path(persist)
+    script = session.load_script("rpc.exports = {};")
+
+    class _Weird:
+        def __repr__(self) -> str:
+            return "<weird>"
+
+    # ``send`` payload that's not JSON-serializable.
+    script.emit({"type": "send", "payload": _Weird()})
+    script.emit({"type": "send", "payload": "after-weird"})
+
+    rows = _wait_for_lines(persist, 2)
+    assert rows[1]["payload"] == "after-weird"
+
+
+def test_persistence_unwritable_path_increments_drop_counter(
+    stub_frida: _StubFridaModule, tmp_path: Path,
+) -> None:
+    """An unwritable persistence target must not block the producer.
+
+    We point the persistence path at a file that *is* a directory — open
+    will raise ``IsADirectoryError`` — so the writer drains the queue
+    into the drop counter and the ring keeps streaming live events.
+    """
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    bad_dir = tmp_path / "bad"
+    bad_dir.mkdir()
+    session.set_persistence_path(bad_dir)
+    script = session.load_script("rpc.exports = {};")
+
+    script.emit({"type": "send", "payload": "a"})
+    script.emit({"type": "send", "payload": "b"})
+
+    # Wait for the writer to consume both queue entries (it drains and
+    # drops since it never managed to open the file).
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        stats = session.stats()
+        if stats["persist_dropped"] >= 2:
+            break
+        time.sleep(0.02)
+
+    stats = session.stats()
+    assert stats["persist_dropped"] >= 2, stats
+    # Ring buffer was unaffected.
+    assert len(session.events()) == 2
+
+
+def test_detach_flushes_persistence_writer(
+    stub_frida: _StubFridaModule, tmp_path: Path,
+) -> None:
+    """``detach`` must wait for the writer thread to finish before
+    returning, so the post-detach file read sees every event."""
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    persist = tmp_path / "trace.jsonl"
+    session.set_persistence_path(persist)
+    script = session.load_script("rpc.exports = {};")
+
+    for i in range(20):
+        script.emit({"type": "send", "payload": i})
+    session.detach()
+
+    text = persist.read_text(encoding="utf-8")
+    rows = [json.loads(ln) for ln in text.split("\n") if ln.strip()]
+    assert len(rows) == 20
+    assert [r["payload"] for r in rows] == list(range(20))
+
+
+def test_no_persistence_path_skips_writer_thread(
+    stub_frida: _StubFridaModule,
+) -> None:
+    """Default sessions must NOT spin up a writer thread — verified by
+    checking ``stats['persist_path']`` is None and the file system is
+    untouched."""
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    script = session.load_script("rpc.exports = {};")
+    script.emit({"type": "send", "payload": 1})
+
+    stats = session.stats()
+    assert stats["persist_path"] is None
+    assert stats["persist_dropped"] == 0
+    # ``_persist_thread`` stays None — no thread leak.
+    assert session._persist_thread is None  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Hook-Lab metadata + started_at (sub-step 4.5 prep for the routes layer)
+
+
+def test_session_app_id_and_template_id_default_none(
+    stub_frida: _StubFridaModule,
+) -> None:
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    assert session.app_id is None
+    assert session.template_id is None
+    # ``started_at`` is set by ``__init__``; should be a recent epoch.
+    assert session.started_at <= time.time()
+    assert session.started_at >= time.time() - 5.0
+
+
+def test_session_metadata_round_trips_through_stats(
+    stub_frida: _StubFridaModule,
+) -> None:
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example")
+    session.app_id = "com_example"
+    session.template_id = "ssl_pinning_bypass"
+    stats = session.stats()
+    assert stats["app_id"] == "com_example"
+    assert stats["template_id"] == "ssl_pinning_bypass"
+    assert stats["started_at"] == session.started_at

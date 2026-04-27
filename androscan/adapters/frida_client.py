@@ -31,12 +31,15 @@ extra) can monkeypatch the seam with a stub. On the device side,
 from __future__ import annotations
 
 import collections
+import json
 import logging
+import queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Literal, Optional
+from pathlib import Path
+from typing import Any, Callable, Iterable, Literal, Optional, Union
 
 
 logger = logging.getLogger(__name__)
@@ -92,12 +95,19 @@ class _SessionStats:
     Kept separate from :class:`FridaSession` to make the locking story
     obvious: every read/write of these counters happens under the
     session's lock.
+
+    ``persist_dropped`` is bumped by the JSONL writer thread when a
+    serialization failure forces it to drop a line; ``persist_path``
+    surfaces the active sink so the UI can show "writing to <path>".
+    Both are ``None`` / ``0`` when persistence is disabled.
     """
 
     total_events: int = 0
     dropped: int = 0
     last_ts: Optional[float] = None
     by_kind: dict[str, int] = field(default_factory=dict)
+    persist_dropped: int = 0
+    persist_path: Optional[str] = None
 
 
 class FridaSession:
@@ -124,6 +134,15 @@ class FridaSession:
         self.session_id: str = session_id or uuid.uuid4().hex[:12]
         self.package: str = package
         self.pid: int = pid
+        # Hook-Lab metadata. Both stay ``None`` for raw adapter use
+        # (e.g. unit tests that build a session without going through
+        # the route layer); 4.5's :mod:`androscan.web.frida_routes`
+        # populates them post-attach so list/export endpoints can
+        # surface "this session was launched from template X for app
+        # Y" without a parallel registry.
+        self.app_id: Optional[str] = None
+        self.template_id: Optional[str] = None
+        self.started_at: float = time.time()
         self._client = client
         self._frida_session = session
         self._ring: collections.deque[TraceEvent] = collections.deque(
@@ -133,11 +152,20 @@ class FridaSession:
         self._stats = _SessionStats()
         self._scripts: list[Any] = []
         self._detached = False
-        # 4.5 will replace this with a WebSocket pump; 4.7 may register
-        # one too. The hook fires *after* the event is in the ring so the
-        # consumer can never observe a buffer shorter than ``stats()``
-        # claims.
+        # 4.5 wires WebSocket pumps via this slot; 4.7's LLM skill may
+        # also register one. The hook fires *after* the event is in the
+        # ring so the consumer can never observe a buffer shorter than
+        # ``stats()`` claims.
         self.on_event: Optional[Callable[[TraceEvent], None]] = None
+        # JSONL persistence (set_persistence_path). The writer thread
+        # owns the file handle; the main thread only ever pushes events
+        # to the unbounded ``queue.Queue`` and reads counters under
+        # ``_lock``. ``None`` everywhere = persistence disabled, which
+        # is the default.
+        self._persist_path: Optional[Path] = None
+        self._persist_queue: Optional["queue.Queue[Optional[TraceEvent]]"] = None
+        self._persist_thread: Optional[threading.Thread] = None
+        self._persist_started = False
 
     # -- script lifecycle -------------------------------------------------
 
@@ -167,6 +195,125 @@ class FridaSession:
         self._scripts.append(script)
         return script
 
+    # -- JSONL persistence (4.5) -----------------------------------------
+
+    def set_persistence_path(self, path: Union[str, Path]) -> None:
+        """Persist every subsequent :class:`TraceEvent` to ``path`` as JSONL.
+
+        One line per event, formatted as the same
+        ``{ts, session_id, kind, payload, raw}`` shape ``events()``
+        returns. Best-effort: serialization failures bump
+        ``persist_dropped`` in :meth:`stats` and log at WARNING but
+        never raise back into the Frida message thread (which would
+        kill message delivery for the rest of the session).
+
+        Implementation note: the writer runs on a dedicated daemon
+        thread fed by an unbounded ``queue.Queue``. We pick a separate
+        queue (rather than re-using the ring buffer) so the on-disk
+        trace is loss-less even when the in-memory ring rotates — the
+        ring is for live UI, the JSONL is for forensics. ``detach``
+        sends a poison-pill ``None`` and joins the thread so the file
+        is closed cleanly.
+
+        Calling this method twice on the same session raises
+        ``RuntimeError``: switching mid-session would either lose
+        events (close-then-reopen race) or leave two open files, both
+        of which violate operator expectations. Detach + re-attach is
+        the supported way to rotate.
+        """
+
+        if self._detached:
+            raise RuntimeError(
+                f"FridaSession {self.session_id!r} is detached; persistence cannot be set"
+            )
+        if self._persist_started:
+            raise RuntimeError(
+                f"FridaSession {self.session_id!r} already has a persistence path; "
+                "re-attach to rotate"
+            )
+        target = Path(path)
+        # Create the parent directory eagerly so the writer thread's
+        # first ``open`` doesn't fail on a fresh ``apps/<id>/<run_ts>/``
+        # tree. We tolerate an existing file (append mode) so a crashed
+        # session can be resumed by the operator if they keep the
+        # session_id stable.
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        q: "queue.Queue[Optional[TraceEvent]]" = queue.Queue()
+        thread = threading.Thread(
+            target=self._persist_worker,
+            args=(target, q),
+            name=f"frida-persist-{self.session_id}",
+            daemon=True,
+        )
+        with self._lock:
+            self._persist_path = target
+            self._persist_queue = q
+            self._persist_thread = thread
+            self._persist_started = True
+            self._stats.persist_path = str(target)
+        thread.start()
+
+    def _persist_worker(
+        self,
+        path: Path,
+        q: "queue.Queue[Optional[TraceEvent]]",
+    ) -> None:
+        """Drain ``q`` to ``path`` until a ``None`` poison pill arrives.
+
+        Failures are isolated per-event: if a single payload is not
+        JSON-serializable we increment ``persist_dropped`` and continue
+        rather than aborting the whole writer (the next event might be
+        fine and the operator wants the rest of the trace). A failure
+        to *open* the file is also non-fatal — we log + bump the drop
+        counter for every queued event so ``stats()`` still tells the
+        UI something useful, but the session keeps streaming to the
+        ring + WebSocket.
+        """
+
+        try:
+            f = path.open("a", encoding="utf-8", buffering=1)  # line-buffered
+        except OSError as e:
+            logger.warning(
+                "FridaSession %s: cannot open persistence path %s: %s",
+                self.session_id, path, e,
+            )
+            # Drain and drop so producers aren't blocked forever.
+            while True:
+                item = q.get()
+                if item is None:
+                    return
+                with self._lock:
+                    self._stats.persist_dropped += 1
+            return  # pragma: no cover - unreachable but keeps type-checkers happy
+
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    return
+                try:
+                    line = json.dumps(
+                        _event_to_jsonable(item),
+                        ensure_ascii=False,
+                        default=_jsonl_fallback,
+                    )
+                    f.write(line)
+                    f.write("\n")
+                except Exception as e:  # serialization OR write
+                    logger.warning(
+                        "FridaSession %s: persist write failed (%s: %s); dropping event",
+                        self.session_id, type(e).__name__, e,
+                    )
+                    with self._lock:
+                        self._stats.persist_dropped += 1
+        finally:
+            try:
+                f.flush()
+                f.close()
+            except OSError:  # pragma: no cover - best-effort cleanup
+                pass
+
     # -- buffer access ----------------------------------------------------
 
     def events(self, limit: Optional[int] = None) -> list[TraceEvent]:
@@ -190,6 +337,9 @@ class FridaSession:
                 "session_id": self.session_id,
                 "package": self.package,
                 "pid": self.pid,
+                "app_id": self.app_id,
+                "template_id": self.template_id,
+                "started_at": self.started_at,
                 "total_events": self._stats.total_events,
                 "dropped": self._stats.dropped,
                 "last_ts": self._stats.last_ts,
@@ -197,6 +347,8 @@ class FridaSession:
                 "ring_capacity": self._ring.maxlen,
                 "by_kind": dict(self._stats.by_kind),
                 "detached": self._detached,
+                "persist_path": self._stats.persist_path,
+                "persist_dropped": self._stats.persist_dropped,
             }
 
     # -- detach -----------------------------------------------------------
@@ -206,7 +358,10 @@ class FridaSession:
 
         Idempotent — the second call is a no-op so shutdown handlers
         and explicit user-driven detach can both run without worrying
-        about ordering.
+        about ordering. If a JSONL persistence path is active, sends
+        the writer-thread poison pill and waits up to two seconds for
+        it to flush; tests with a 0-second timeout rely on this being
+        finite.
         """
         if self._detached:
             return
@@ -221,6 +376,16 @@ class FridaSession:
             self._frida_session.detach()
         except Exception as e:  # pragma: no cover - exercised on real Frida
             logger.debug("FridaSession %s: session.detach failed: %s", self.session_id, e)
+        # Flush + close the persistence writer if it was started.
+        # ``_persist_queue`` / ``_persist_thread`` are set together
+        # inside ``set_persistence_path`` so checking either is fine,
+        # but we double-check both for clarity.
+        q = self._persist_queue
+        thread = self._persist_thread
+        if q is not None:
+            q.put(None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
         self._client._forget(self)  # noqa: SLF001 — intentional bidirectional cleanup
 
     # -- internal: Frida message thread ----------------------------------
@@ -255,6 +420,12 @@ class FridaSession:
             self._stats.last_ts = ts
             self._stats.by_kind[kind] = self._stats.by_kind.get(kind, 0) + 1
             hook = self.on_event
+            persist_q = self._persist_queue
+        # Enqueue *outside* the lock — ``queue.put`` on an unbounded
+        # queue is wait-free, but we still want to keep ``_lock``
+        # tight (it's contended by every UI poll of ``stats()``).
+        if persist_q is not None:
+            persist_q.put(event)
         if hook is not None:
             try:
                 hook(event)
@@ -447,6 +618,48 @@ class FridaClient:
 
 
 # ---------------------------------------------------------------------------
+# JSONL persistence helpers (4.5).
+#
+# These are at module level so the ``frida_routes`` layer (4.5) can also
+# call ``_event_to_jsonable`` when streaming events over the WebSocket —
+# the wire format and the on-disk format are deliberately identical so
+# the export endpoint is just ``StreamingResponse(open(path))``.
+
+
+def _event_to_jsonable(event: TraceEvent) -> dict[str, Any]:
+    """Project a :class:`TraceEvent` to the JSONL line shape.
+
+    Keeps the dict order stable (``ts`` first, then identifying fields,
+    then payload + raw) so a human eyeballing the file finds the
+    timestamp without scanning right. ``raw`` is included verbatim so
+    the persisted trace is a strict superset of the WebSocket stream
+    (forensics > UI compactness).
+    """
+    return {
+        "ts": event.ts,
+        "session_id": event.session_id,
+        "kind": event.kind,
+        "payload": event.payload,
+        "raw": event.raw,
+    }
+
+
+def _jsonl_fallback(obj: Any) -> Any:
+    """Fallback for ``json.dumps(default=...)``.
+
+    Frida payloads are *usually* JSON-serializable (the binding hands
+    us dicts/lists/primitives) but operator-supplied scripts can call
+    ``send(someBuffer)`` and similar; ``repr()`` is the least-surprising
+    last-ditch path. We deliberately do **not** raise — a single bad
+    event must not kill the writer for the rest of the session.
+    """
+    try:
+        return repr(obj)
+    except Exception:  # pragma: no cover - defensive
+        return f"<unserializable {type(obj).__name__}>"
+
+
+# ---------------------------------------------------------------------------
 # Test seam: monkeypatch this in ``tests/test_frida_client.py`` to inject a
 # stub ``frida`` module without installing the ``[frida]`` extra. The seam is
 # intentionally minimal so the lazy-import semantics in :class:`FridaClient`
@@ -501,4 +714,5 @@ __all__ = [
     "TraceEvent",
     "MIN_RING_SIZE",
     "get_frida_client",
+    "_event_to_jsonable",
 ]

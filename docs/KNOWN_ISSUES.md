@@ -298,6 +298,27 @@ Use the following format for new entries:
 
 ---
 
+### ISSUE-010: Monaco editor (Hook Lab) is loaded from a CDN
+- status: Open
+- impact: Medium
+- area: web / Hook Lab / air-gap operability
+- introduced / observed: 2026-04-27 (sub-step 4.5 — Hook Lab Stage→Inject UI)
+- summary:
+  `@monaco-editor/react@^4.6.0` (used in `HookBuilder.tsx`'s read-only JS view) lazy-fetches the Monaco editor assets from the default jsdelivr CDN (`cdn.jsdelivr.net/npm/monaco-editor@…/min/vs/`). Without an internet route to that host, the Monaco view never mounts: the inline `pyjsparser` markers don't render, and the operator sees an empty editor pane (the rest of the workbench keeps working).
+- why it matters:
+  Pentester laptops are routinely run air-gapped against an emulator on the same machine; one of the workbench's selling points is that it can be operated without an outbound network. CDN-loaded Monaco breaks that posture for Hook Lab specifically — the rest of the UI is fine — and the failure mode (empty editor, no network error) is silent enough to mistake for an editor bug.
+- current workaround:
+  Allow the laptop's outbound HTTPS to `cdn.jsdelivr.net` while using Hook Lab. The Inject button itself doesn't depend on Monaco — it consumes the `parse` result returned by `POST /api/frida/render` — so an operator who allows the CDN once gets full functionality.
+- recommended fix:
+  Self-host Monaco. One-line `loader.config({paths: {vs: '/monaco/min/vs'}})` in `HookBuilder.tsx`'s module init plus a postbuild copy of `node_modules/monaco-editor/min/vs/` into `androscan/web/static/monaco/` (and a Vite static-asset rule so it ships with the bundle). Trade-off: the production bundle grows by ~3 MB on disk but the runtime gzipped payload is unchanged because the CDN load is replaced 1:1 by a same-origin load. Land alongside a Hook Lab v2 sweep (sub-step 4.7+).
+- related tasks:
+  - `docs/TASKS.md` § Hook Lab v1 — sub-step backlog (4.5 deferred this; 4.7 / 4.8 sweep can pick it up)
+- related docs:
+  - `docs/DECISIONS.md` DEC-023 (sub-step 4.5 specifics — "Frontend: Monaco editor, but with a CDN footnote.")
+  - `androscan/web/frontend/src/components/HookBuilder.tsx`
+
+---
+
 ## 7. Accepted limitations
 
 Use this section for limitations that are currently acceptable and not immediate defects.

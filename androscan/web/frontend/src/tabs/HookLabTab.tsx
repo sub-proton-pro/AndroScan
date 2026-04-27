@@ -3,44 +3,101 @@ import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { ChatDock } from "../components/ChatDock";
 import { CallGraphView, type SelectedNode } from "../components/CallGraphView";
 import { CodeView } from "../components/CodeView";
+import { FridaSessionsList } from "../components/FridaSessionsList";
+import { FridaTracePanel } from "../components/FridaTracePanel";
+import { HookBuilder } from "../components/HookBuilder";
 import { fetchSource } from "../api/code";
+import type { CreateSessionResult, FridaSessionInfo } from "../api/frida";
 import { useWorkbench } from "../context/WorkbenchContext";
 
+/**
+ * Hook Lab tab.
+ *
+ * Three-column layout (DEC-023, sub-step 4.5):
+ *
+ *   ┌──────────┬──────────────────────────┬──────────────────────┐
+ *   │          │  CodeView (top)          │  Sessions list       │
+ *   │  Call    ├──────────────────────────┤                      │
+ *   │  graph   │  HookBuilder (mid)       ├──────────────────────┤
+ *   │          ├──────────────────────────┤                      │
+ *   │          │  ChatDock (bottom)       │  Trace panel         │
+ *   └──────────┴──────────────────────────┴──────────────────────┘
+ *
+ * Cross-component wiring:
+ *
+ *   * Selecting a method in the call graph emits ``SelectedNode``;
+ *     we (a) load its decompiled source into the inline CodeView,
+ *     and (b) prefill the HookBuilder's ``class_name`` / ``method_name``
+ *     params so the operator can Inject without retyping them.
+ *   * Successful Inject creates a session; we capture its id +
+ *     ``persist_path`` and pin the right pane's trace to it.
+ *   * Picking a different session in the SessionsList swaps the
+ *     trace pane to that session's WS stream.
+ */
 export function HookLabTab() {
-  const { appId } = useWorkbench();
+  const { appId, dossier } = useWorkbench();
   const [selected, setSelected] = useState<SelectedNode | null>(null);
 
-  // Reset the selection whenever the operator switches apps so the
-  // CodeView doesn't briefly render stale source from the previous app.
+  // Active trace target. Either the most-recently-Injected session, or
+  // a session the operator picked from the SessionsList.
+  const [activeSession, setActiveSession] = useState<ActiveSession | null>(null);
+
+  // Bumped after Inject / Detach so the SessionsList re-fetches eagerly.
+  const [sessionsRefreshTick, setSessionsRefreshTick] = useState(0);
+
   useEffect(() => {
     setSelected(null);
+    setActiveSession(null);
   }, [appId]);
+
+  const defaultPackage =
+    typeof dossier?.apk_info?.package === "string" ? dossier.apk_info.package : null;
+
+  const onSessionCreated = (result: CreateSessionResult) => {
+    setActiveSession({
+      sessionId: result.session_id,
+      persistEnabled: !!result.persist_path,
+    });
+    setSessionsRefreshTick((n) => n + 1);
+  };
+
+  const onSelectSession = (info: FridaSessionInfo) => {
+    setActiveSession({
+      sessionId: info.session_id,
+      persistEnabled: !!info.persist_path,
+    });
+  };
+
+  const onDetached = (sessionId: string) => {
+    setSessionsRefreshTick((n) => n + 1);
+    if (activeSession?.sessionId === sessionId) {
+      setActiveSession(null);
+    }
+  };
 
   return (
     <PanelGroup direction="horizontal" autoSaveId="hook-h" className="tab-panels">
-      <Panel defaultSize={36} minSize={20} className="panel">
+      <Panel defaultSize={32} minSize={20} className="panel">
         <CallGraphView appId={appId} onSelectNode={setSelected} />
       </Panel>
       <PanelResizeHandle className="resize-h" />
-      <Panel defaultSize={44} minSize={28} className="panel">
+      <Panel defaultSize={46} minSize={30} className="panel">
         <PanelGroup direction="vertical" autoSaveId="hook-center-v">
-          <Panel defaultSize={55} minSize={20} className="panel">
+          <Panel defaultSize={36} minSize={18} className="panel">
             <HookLabCodeView appId={appId} selected={selected} />
           </Panel>
           <PanelResizeHandle className="resize-v" />
-          <Panel defaultSize={20} minSize={10} className="panel">
-            <div className="pane-scroll">
-              <header className="pane-head">
-                <h2>Frida script</h2>
-                <span className="muted small">staged hooks</span>
-              </header>
-              <p className="muted small">
-                Editor with explicit "Stage hook" → "Confirm &amp; run" flow per DEC-017.
-              </p>
-            </div>
+          <Panel defaultSize={44} minSize={22} className="panel">
+            <HookBuilder
+              appId={appId}
+              prefillClassName={selected?.className ?? null}
+              prefillMethodName={selected?.methodName ?? null}
+              defaultPackage={defaultPackage}
+              onSessionCreated={onSessionCreated}
+            />
           </Panel>
           <PanelResizeHandle className="resize-v" />
-          <Panel defaultSize={25} minSize={12} collapsible className="panel chat-panel">
+          <Panel defaultSize={20} minSize={10} collapsible className="panel chat-panel">
             <ChatDock
               tab="hook"
               attachments={[]}
@@ -50,35 +107,33 @@ export function HookLabTab() {
         </PanelGroup>
       </Panel>
       <PanelResizeHandle className="resize-h" />
-      <Panel defaultSize={20} minSize={12} className="panel">
+      <Panel defaultSize={22} minSize={14} className="panel">
         <PanelGroup direction="vertical" autoSaveId="hook-right-v">
-          <Panel defaultSize={55} minSize={20} className="panel">
-            <div className="pane-scroll">
-              <header className="pane-head">
-                <h2>Scope</h2>
-                <span className="muted small">live vars</span>
-              </header>
-              <p className="muted small">
-                Variable inspector: <code>this</code>, args, fields. Edits emit
-                <code> Java.use(...).$instance.field = value</code>.
-              </p>
-            </div>
+          <Panel defaultSize={36} minSize={18} className="panel">
+            <FridaSessionsList
+              selectedSessionId={activeSession?.sessionId ?? null}
+              onSelect={onSelectSession}
+              refreshTick={sessionsRefreshTick}
+              onDetached={onDetached}
+            />
           </Panel>
           <PanelResizeHandle className="resize-v" />
-          <Panel defaultSize={45} minSize={15} className="panel">
-            <div className="pane-scroll">
-              <header className="pane-head">
-                <h2>Hooks &amp; trace stats</h2>
-                <span className="muted small">step 4</span>
-              </header>
-              <p className="muted small">Active hooks, hit counts, top return values.</p>
-            </div>
+          <Panel defaultSize={64} minSize={20} className="panel">
+            <FridaTracePanel
+              sessionId={activeSession?.sessionId ?? null}
+              persistEnabled={activeSession?.persistEnabled ?? false}
+            />
           </Panel>
         </PanelGroup>
       </Panel>
     </PanelGroup>
   );
 }
+
+type ActiveSession = {
+  sessionId: string;
+  persistEnabled: boolean;
+};
 
 // ---------------------------------------------------------------------------
 // In-tab CodeView wrapper. Loads the Java source for the selected node via

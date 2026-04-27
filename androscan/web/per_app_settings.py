@@ -35,6 +35,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "inspect",
     "exploit",
     "chat",
+    "hook",
     "tags",
     "notes",
 }
@@ -46,6 +47,14 @@ _DECOMPILE_KEYS = {"auto_rebuild_on_apk_change"}
 _INSPECT_KEYS = {"default_logcat_buffer_lines", "logcat_kept_priorities"}
 _EXPLOIT_KEYS = {"allow_destructive_actions", "verification_timeout_sec"}
 _CHAT_KEYS = {"model_override", "temperature_override", "tab_overrides"}
+# Hook Lab (4.5). ``hook_target_package_prefix`` is the allowlist the
+# Inject route enforces — by default the app may only hook itself; an
+# operator widens it explicitly when they need to hook a sibling
+# package (e.g. a separate process). ``auto_attach_on_session_start``
+# is read by 4.6's session-lifecycle owner; we surface it here so the
+# Settings tab can write it once and 4.6 picks it up via the same
+# read path.
+_HOOK_KEYS = {"hook_target_package_prefix", "auto_attach_on_session_start"}
 
 
 def app_settings_path(app_dir: Path) -> Path:
@@ -62,6 +71,7 @@ def default_app_settings() -> dict[str, Any]:
         "inspect": {},
         "exploit": {},
         "chat": {},
+        "hook": {},
         "tags": [],
         "notes": "",
     }
@@ -88,7 +98,7 @@ def load_app_settings(app_dir: Path) -> dict[str, Any]:
     out = default_app_settings()
     out.update({k: v for k, v in data.items() if k in _KNOWN_TOP_LEVEL_KEYS})
     # Make sure dict-shaped sections are dicts even if the file had ``null``.
-    for sec in ("rag", "decompile", "inspect", "exploit", "chat"):
+    for sec in ("rag", "decompile", "inspect", "exploit", "chat", "hook"):
         if not isinstance(out.get(sec), dict):
             out[sec] = {}
     if not isinstance(out.get("tags"), list):
@@ -115,7 +125,7 @@ def save_app_settings(app_dir: Path, data: dict[str, Any]) -> dict[str, Any]:
         for k, v in data.items():
             cleaned[k] = v
     cleaned["schema_version"] = SCHEMA_VERSION
-    for sec in ("rag", "decompile", "inspect", "exploit", "chat"):
+    for sec in ("rag", "decompile", "inspect", "exploit", "chat", "hook"):
         if not isinstance(cleaned.get(sec), dict):
             cleaned[sec] = {}
     if not isinstance(cleaned.get("tags"), list):
@@ -184,13 +194,20 @@ def effective_settings(
     *,
     global_view: dict[str, Any],
     per_app: dict[str, Any],
+    app_package: Optional[str] = None,
 ) -> dict[str, Any]:
     """Merge ``per_app`` overrides on top of ``global_view``.
 
     ``global_view`` is the dict shape produced by
     :func:`androscan.config.loader.global_view_from_config` (a section ->
-    flat-keys dict mirroring the YAML layout). Returns a structure with
-    one entry per logical setting:
+    flat-keys dict mirroring the YAML layout). ``app_package`` is the
+    APK's manifest package id; it's used as the *default* fallback for
+    the ``hook.hook_target_package_prefix`` allowlist (other sections
+    don't need it). When omitted, the hook prefix surfaces with
+    ``value=None`` and the route layer treats that as "operator hasn't
+    set a prefix yet — block all packages".
+
+    Returns a structure with one entry per logical setting:
 
     ::
 
@@ -269,6 +286,27 @@ def effective_settings(
                 "source": "global",
             }
 
+    # ---- Hook (4.5) -----------------------------------------------------
+    # ``hook_target_package_prefix`` defaults to ``app_package`` (= the
+    # app may only hook itself). ``auto_attach_on_session_start``
+    # defaults to ``False`` — DEC-023 keeps Inject under explicit
+    # operator confirmation, so opting in is a per-app decision.
+    hk_overrides = per_app.get("hook") or {}
+    out["hook"] = {}
+    pref_ov = _pick(hk_overrides, "hook_target_package_prefix", _HOOK_KEYS)
+    if pref_ov is not None:
+        out["hook"]["hook_target_package_prefix"] = {"value": pref_ov, "source": "app"}
+    else:
+        out["hook"]["hook_target_package_prefix"] = {
+            "value": app_package,
+            "source": "default" if app_package else "default",
+        }
+    auto_raw = hk_overrides.get("auto_attach_on_session_start") if isinstance(hk_overrides, dict) else None
+    if isinstance(auto_raw, bool):
+        out["hook"]["auto_attach_on_session_start"] = {"value": auto_raw, "source": "app"}
+    else:
+        out["hook"]["auto_attach_on_session_start"] = {"value": False, "source": "default"}
+
     # ---- Free-form metadata ---------------------------------------------
     out["tags"] = list(per_app.get("tags") or [])
     out["notes"] = str(per_app.get("notes") or "")
@@ -339,9 +377,44 @@ def apk_overrides_summary(per_app: dict[str, Any]) -> list[str]:
         out.append(f"chat.model = {chat['model_override']!r}")
     if chat.get("temperature_override") is not None:
         out.append(f"chat.temperature = {chat['temperature_override']!r}")
+    hook = per_app.get("hook") or {}
+    if isinstance(hook, dict):
+        prefix = hook.get("hook_target_package_prefix")
+        if isinstance(prefix, str) and prefix.strip():
+            out.append(f"hook.target_prefix = {prefix.strip()!r}")
+        auto = hook.get("auto_attach_on_session_start")
+        if isinstance(auto, bool) and auto:
+            out.append("hook.auto_attach_on_session_start = True")
     if per_app.get("tags"):
         out.append(f"tags = {', '.join(per_app['tags'])}")
     return out
+
+
+def _validate_hook_patch(patch: dict[str, Any]) -> Optional[str]:
+    """Validate a partial update to the ``hook`` section.
+
+    ``hook_target_package_prefix`` must be a non-empty string (or
+    ``None`` to clear the override); ``auto_attach_on_session_start``
+    must be a bool. Anything else is left to the forward-compat merge —
+    we deliberately don't reject unknown sub-keys here because
+    schema-version bumps will introduce more knobs and we don't want
+    older servers refusing newer clients' patches.
+    """
+    if "hook_target_package_prefix" in patch:
+        v = patch["hook_target_package_prefix"]
+        if v is None:
+            pass  # clearing the override is allowed
+        elif not isinstance(v, str):
+            return "'hook.hook_target_package_prefix' must be a string or null"
+        elif not v.strip():
+            return "'hook.hook_target_package_prefix' must be non-empty (use null to clear)"
+        elif len(v) > 255:
+            return "'hook.hook_target_package_prefix' too long (max 255 chars)"
+    if "auto_attach_on_session_start" in patch:
+        v = patch["auto_attach_on_session_start"]
+        if v is not None and not isinstance(v, bool):
+            return "'hook.auto_attach_on_session_start' must be a boolean or null"
+    return None
 
 
 def coerce_partial_update(
@@ -360,12 +433,21 @@ def coerce_partial_update(
     for k, v in patch.items():
         if k not in _KNOWN_TOP_LEVEL_KEYS and k != "schema_version":
             return existing, f"unknown top-level key: {k!r}"
-        if k in ("rag", "decompile", "inspect", "exploit", "chat"):
+        if k in ("rag", "decompile", "inspect", "exploit", "chat", "hook"):
             if v is None:
                 out[k] = {}
                 continue
             if not isinstance(v, dict):
                 return existing, f"{k!r} must be an object or null"
+            # ``hook`` is the first section with strongly-typed fields
+            # we want to fail fast on (a malformed prefix would let
+            # the Inject route happily accept the wrong package). The
+            # other sections still flow through the generic merge so
+            # forward-compat keys aren't rejected.
+            if k == "hook":
+                err = _validate_hook_patch(v)
+                if err is not None:
+                    return existing, err
             section = dict(out.get(k) or {})
             for sk, sv in v.items():
                 section[sk] = sv

@@ -3064,3 +3064,425 @@ code { color: var(--accent); }
 .tippy-box[data-theme~="androscan-graph"] .tippy-arrow {
   color: var(--panel-2);
 }
+
+/* ============================================================================
+ * Hook Lab — sub-step 4.5 components.
+ * Scoped under explicit class names so the rest of the workbench (Inspect,
+ * Reports, Settings) doesn't pick these styles up by accident.
+ * ============================================================================ */
+
+/* ---- Shared error pill (used across HookBuilder / Sessions / Trace) ---- */
+
+.hook-error {
+  background: rgba(248, 81, 73, 0.12);
+  border: 1px solid var(--err);
+  color: var(--err);
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.78rem;
+  margin: 0.4rem 0;
+  white-space: pre-wrap;
+}
+
+/* ---- HookBuilder ---- */
+
+.hooklab-builder {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.hookbuilder-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.hookbuilder-row {
+  display: grid;
+  grid-template-columns: 7rem 1fr;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.hookbuilder-row-persist {
+  align-items: start;
+}
+
+.hookbuilder-label {
+  font-size: 0.74rem;
+  color: var(--muted);
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+  text-align: right;
+  user-select: none;
+}
+
+.hookbuilder-required {
+  color: var(--err);
+}
+
+.hookbuilder-select,
+.hookbuilder-input {
+  width: 100%;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.32rem 0.5rem;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.hookbuilder-select:focus,
+.hookbuilder-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.hookbuilder-input-bad {
+  border-color: var(--warn);
+}
+
+.hookbuilder-desc {
+  margin: -0.15rem 0 0.25rem 7.5rem;
+}
+
+.hookbuilder-persist {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.hookbuilder-callout {
+  background: var(--panel-2);
+  border: 1px dashed var(--border-strong);
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.78rem;
+}
+
+.hookbuilder-callout code {
+  background: var(--bg);
+  padding: 0 0.25rem;
+  border-radius: 3px;
+}
+
+/* Monaco container — the inner Editor takes full height of this wrap. */
+.hookbuilder-monaco-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.hookbuilder-monaco-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.hookbuilder-parse-ok {
+  color: var(--ok);
+  font-size: 0.74rem;
+}
+
+.hookbuilder-parse-bad {
+  color: var(--err);
+  font-size: 0.74rem;
+}
+
+.hookbuilder-summary {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.5rem 0.7rem;
+}
+
+.hookbuilder-summary header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.4rem;
+}
+
+.hookbuilder-summary pre {
+  margin: 0;
+  font: inherit;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  color: var(--text);
+}
+
+.hookbuilder-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding-top: 0.2rem;
+}
+
+.hookbuilder-inject {
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.4rem 1rem;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.hookbuilder-inject:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.hookbuilder-inject:disabled {
+  background: var(--panel-2);
+  color: var(--muted);
+  border-color: var(--border);
+  cursor: not-allowed;
+}
+
+/* ---- FridaSessionsList ---- */
+
+.frida-sessions-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.frida-session-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "head    actions"
+    "meta    meta";
+  gap: 0.2rem 0.5rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.frida-session-row:hover {
+  border-color: var(--border-strong);
+}
+
+.frida-session-selected {
+  border-color: var(--accent);
+  background: rgba(88, 166, 255, 0.08);
+}
+
+.frida-session-head {
+  grid-area: head;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.frida-session-template {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.frida-session-meta {
+  grid-area: meta;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.frida-session-drop {
+  color: var(--warn);
+}
+
+.frida-session-detached {
+  color: var(--err);
+}
+
+.frida-session-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+}
+
+/* ---- FridaTracePanel ---- */
+
+.trace-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.trace-status {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.trace-status-open {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.trace-status-connecting {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.trace-status-closed,
+.trace-status-error {
+  color: var(--err);
+  border-color: var(--err);
+}
+.trace-status-idle {
+  color: var(--muted);
+}
+
+.trace-drop-pill {
+  background: rgba(210, 153, 34, 0.18);
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: 3px;
+  padding: 0 0.35rem;
+  font-size: 0.7rem;
+}
+
+.trace-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.trace-filter {
+  flex: 1;
+  min-width: 8rem;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.25rem 0.5rem;
+  font: inherit;
+  font-size: 0.78rem;
+}
+
+.trace-filter:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.trace-export {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.trace-export-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.trace-counter {
+  margin-left: auto;
+}
+
+.trace-list {
+  flex: 1 1 auto;
+  min-height: 6rem;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.2rem 0.3rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.trace-row {
+  display: grid;
+  grid-template-columns: 6.5rem 3.4rem 4rem auto 1fr;
+  gap: 0.4rem;
+  align-items: baseline;
+  padding: 0.15rem 0.3rem;
+  font-size: 0.74rem;
+  border-bottom: 1px dotted rgba(48, 54, 61, 0.6);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.trace-row:last-child {
+  border-bottom: none;
+}
+
+.trace-row-error {
+  background: rgba(248, 81, 73, 0.06);
+}
+
+.trace-ts {
+  color: var(--muted);
+}
+
+.trace-kind {
+  text-transform: uppercase;
+  font-size: 0.66rem;
+  letter-spacing: 0.05em;
+  border-radius: 2px;
+  padding: 0 0.3rem;
+}
+.trace-kind-send {
+  color: var(--ok);
+  background: rgba(63, 185, 80, 0.1);
+}
+.trace-kind-error {
+  color: var(--err);
+  background: rgba(248, 81, 73, 0.12);
+}
+.trace-kind-log {
+  color: var(--accent);
+  background: rgba(88, 166, 255, 0.1);
+}
+
+.trace-phase {
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.trace-phase-entry {
+  color: var(--accent);
+}
+.trace-phase-exit {
+  color: var(--ok);
+}
+.trace-phase-error {
+  color: var(--err);
+}
+.trace-phase-ready {
+  color: var(--muted);
+}
+
+.trace-label {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.trace-payload {
+  color: var(--text);
+  font-family: inherit;
+}
