@@ -159,8 +159,15 @@ def test_list_templates_returns_v1_set(client: TestClient) -> None:
     assert r.status_code == 200
     body = r.json()
     ids = {t["id"] for t in body["templates"]}
-    # The five v1 templates from sub-step 4.4.
-    expected = {"entry_exit_log", "ssl_pinning_bypass", "crypto", "shared_preferences", "intent"}
+    # v1 templates: 4.4 shipped 5, 4.6 added scope_inspector.
+    expected = {
+        "entry_exit_log",
+        "scope_inspector",
+        "ssl_pinning_bypass",
+        "crypto",
+        "shared_preferences",
+        "intent",
+    }
     assert expected <= ids
     # Wire shape never includes raw JS.
     for t in body["templates"]:
@@ -499,6 +506,245 @@ def test_ws_unknown_session_closes(client: TestClient) -> None:
         msg = ws.receive_json()
         assert msg["type"] == "error"
         assert msg["error"] == "unknown_session"
+
+
+# ---------------------------------------------------------------------------
+# /api/frida/sessions/{id}/hooks  +  /scope  (sub-step 4.6 introspection)
+#
+# These are pure aggregations over the ring buffer; we drive the ring
+# the same way the ``/events`` test does (``script.emit({...})`` runs
+# ``_on_message`` synchronously) and assert on the response shape.
+
+
+def _emit_entry(script: Any, *, class_name: str, method: str, args: list[str], label: str = "scope-1") -> None:
+    """Helper: emit a `phase=entry` event without ``this_fields`` —
+    matches what ``entry_exit_log`` produces."""
+    script.emit({
+        "type": "send",
+        "payload": {
+            "label": label,
+            "phase": "entry",
+            "class": class_name,
+            "method": method,
+            "args": args,
+        },
+    })
+
+
+def _emit_exit(script: Any, *, class_name: str, method: str, return_value: str, label: str = "scope-1") -> None:
+    script.emit({
+        "type": "send",
+        "payload": {
+            "label": label,
+            "phase": "exit",
+            "class": class_name,
+            "method": method,
+            "return": return_value,
+        },
+    })
+
+
+def _emit_scope_entry(
+    script: Any, *, class_name: str, method: str, args: list[str], fields: dict[str, str], this_class: str | None = None,
+) -> None:
+    """Helper: emit a `phase=entry` event WITH ``this_fields`` —
+    matches what ``scope_inspector`` produces."""
+    script.emit({
+        "type": "send",
+        "payload": {
+            "label": "scope-1",
+            "phase": "entry",
+            "class": class_name,
+            "method": method,
+            "args": args,
+            "this_class": this_class or class_name,
+            "this_fields": fields,
+        },
+    })
+
+
+def _emit_scope_exit(
+    script: Any, *, class_name: str, method: str, return_value: str, fields: dict[str, str],
+) -> None:
+    script.emit({
+        "type": "send",
+        "payload": {
+            "label": "scope-1",
+            "phase": "exit",
+            "class": class_name,
+            "method": method,
+            "return": return_value,
+            "this_fields": fields,
+        },
+    })
+
+
+def test_hooks_endpoint_empty_session(
+    client: TestClient, app_id: str, app_package: str,
+) -> None:
+    create_resp = client.post("/api/frida/sessions", json=_ok_session_body(app_id, app_package))
+    session_id = create_resp.json()["session_id"]
+    r = client.get(f"/api/frida/sessions/{session_id}/hooks")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session_id"] == session_id
+    assert body["hooks"] == []
+
+
+def test_hooks_endpoint_aggregates_by_class_method(
+    client: TestClient, app_id: str, app_package: str,
+) -> None:
+    """Three entries + two exits for one (class, method); one entry for
+    a second (class, method); exit/return tally is grouped + sorted by
+    count desc."""
+    create_resp = client.post("/api/frida/sessions", json=_ok_session_body(app_id, app_package))
+    session_id = create_resp.json()["session_id"]
+    app_client = client.app.state.frida_client  # type: ignore[attr-defined]
+    session = app_client.get_session(session_id)
+    assert session is not None
+    script = session._scripts[0]  # noqa: SLF001 - test introspection
+
+    # Class A.foo: 3 entries, 2 exits returning "ok" and one "fail".
+    _emit_entry(script, class_name="com.example.A", method="foo", args=["1"])
+    _emit_exit(script, class_name="com.example.A", method="foo", return_value="ok")
+    _emit_entry(script, class_name="com.example.A", method="foo", args=["2"])
+    _emit_exit(script, class_name="com.example.A", method="foo", return_value="ok")
+    _emit_entry(script, class_name="com.example.A", method="foo", args=["3"])
+    _emit_exit(script, class_name="com.example.A", method="foo", return_value="fail")
+    # Class B.bar: 1 entry, 0 exits.
+    _emit_entry(script, class_name="com.example.B", method="bar", args=[])
+
+    r = client.get(f"/api/frida/sessions/{session_id}/hooks")
+    assert r.status_code == 200
+    hooks = r.json()["hooks"]
+    assert len(hooks) == 2
+    by_key = {(h["class"], h["method"]): h for h in hooks}
+
+    a = by_key[("com.example.A", "foo")]
+    assert a["hits"] == 3
+    assert a["template_id"] == "entry_exit_log"  # session's template
+    # Top return values, sorted by count desc, with stable insertion-
+    # order tiebreak.
+    returns = [(r["value"], r["count"]) for r in a["top_returns"]]
+    assert returns == [("ok", 2), ("fail", 1)]
+    assert isinstance(a["last_seen_ts"], (int, float))
+
+    b = by_key[("com.example.B", "bar")]
+    assert b["hits"] == 1
+    assert b["top_returns"] == []
+    # Sort order: A.foo (3 hits) before B.bar (1 hit).
+    assert hooks[0]["class"] == "com.example.A"
+
+
+def test_hooks_endpoint_ignores_malformed_payloads(
+    client: TestClient, app_id: str, app_package: str,
+) -> None:
+    """Non-dict payloads, missing class/method, log/error events all
+    pass through without crashing the aggregator."""
+    create_resp = client.post("/api/frida/sessions", json=_ok_session_body(app_id, app_package))
+    session_id = create_resp.json()["session_id"]
+    app_client = client.app.state.frida_client  # type: ignore[attr-defined]
+    session = app_client.get_session(session_id)
+    script = session._scripts[0]  # noqa: SLF001
+
+    script.emit({"type": "send", "payload": "scalar-not-a-dict"})
+    script.emit({"type": "send", "payload": {"phase": "entry"}})  # missing class/method
+    script.emit({"type": "log", "level": "info", "payload": "log line"})
+    script.emit({"type": "error", "description": "boom"})
+    # Plus one well-formed event so we have something to assert against.
+    _emit_entry(script, class_name="com.example.C", method="ok", args=[])
+
+    r = client.get(f"/api/frida/sessions/{session_id}/hooks")
+    assert r.status_code == 200
+    hooks = r.json()["hooks"]
+    assert len(hooks) == 1
+    assert hooks[0]["class"] == "com.example.C"
+    assert hooks[0]["hits"] == 1
+
+
+def test_hooks_endpoint_unknown_session_404(client: TestClient) -> None:
+    r = client.get("/api/frida/sessions/does_not_exist/hooks")
+    assert r.status_code == 404
+
+
+def test_scope_endpoint_empty_session(
+    client: TestClient, app_id: str, app_package: str,
+) -> None:
+    create_resp = client.post("/api/frida/sessions", json=_ok_session_body(app_id, app_package))
+    session_id = create_resp.json()["session_id"]
+    r = client.get(f"/api/frida/sessions/{session_id}/scope")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session_id"] == session_id
+    assert body["snapshots"] == []
+
+
+def test_scope_endpoint_filters_events_without_this_fields(
+    client: TestClient, app_id: str, app_package: str,
+) -> None:
+    """A session running an `entry_exit_log` hook (no this_fields)
+    should produce an empty scope payload — the panel can't claim it
+    has data when the trace doesn't carry the discriminator."""
+    create_resp = client.post("/api/frida/sessions", json=_ok_session_body(app_id, app_package))
+    session_id = create_resp.json()["session_id"]
+    app_client = client.app.state.frida_client  # type: ignore[attr-defined]
+    session = app_client.get_session(session_id)
+    script = session._scripts[0]  # noqa: SLF001
+
+    _emit_entry(script, class_name="com.example.A", method="foo", args=["1"])
+    _emit_exit(script, class_name="com.example.A", method="foo", return_value="ok")
+
+    r = client.get(f"/api/frida/sessions/{session_id}/scope")
+    assert r.status_code == 200
+    assert r.json()["snapshots"] == []
+
+
+def test_scope_endpoint_keeps_latest_entry_and_exit_per_method(
+    client: TestClient, app_id: str, app_package: str,
+) -> None:
+    create_resp = client.post("/api/frida/sessions", json=_ok_session_body(app_id, app_package))
+    session_id = create_resp.json()["session_id"]
+    app_client = client.app.state.frida_client  # type: ignore[attr-defined]
+    session = app_client.get_session(session_id)
+    script = session._scripts[0]  # noqa: SLF001
+
+    # Two entry/exit pairs for the same method — only the latest pair
+    # should land in the snapshot.
+    _emit_scope_entry(
+        script, class_name="com.example.S", method="step",
+        args=["v1"], fields={"counter": "0"}, this_class="com.example.S$Sub",
+    )
+    _emit_scope_exit(
+        script, class_name="com.example.S", method="step",
+        return_value="r1", fields={"counter": "1"},
+    )
+    _emit_scope_entry(
+        script, class_name="com.example.S", method="step",
+        args=["v2"], fields={"counter": "1"},
+    )
+    _emit_scope_exit(
+        script, class_name="com.example.S", method="step",
+        return_value="r2", fields={"counter": "2"},
+    )
+
+    r = client.get(f"/api/frida/sessions/{session_id}/scope")
+    assert r.status_code == 200
+    snaps = r.json()["snapshots"]
+    assert len(snaps) == 1
+    snap = snaps[0]
+    assert snap["class"] == "com.example.S"
+    assert snap["method"] == "step"
+    # Last entry: args=v2, this_fields.counter="1" (pre-call).
+    assert snap["last_entry"]["args"] == ["v2"]
+    assert snap["last_entry"]["this_fields"] == {"counter": "1"}
+    # Last exit: return=r2, this_fields.counter="2" (post-call).
+    assert snap["last_exit"]["return"] == "r2"
+    assert snap["last_exit"]["this_fields"] == {"counter": "2"}
+
+
+def test_scope_endpoint_unknown_session_404(client: TestClient) -> None:
+    r = client.get("/api/frida/sessions/does_not_exist/scope")
+    assert r.status_code == 404
 
 
 # ---------------------------------------------------------------------------

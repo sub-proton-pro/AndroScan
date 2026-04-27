@@ -241,6 +241,74 @@ export function exportSessionUrl(sessionId: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Introspection: hooks summary + scope snapshots (sub-step 4.6).
+//
+// Both are pure aggregations over the in-memory ring buffer; the
+// frontend polls them every ``REFRESH_MS`` (2.5s) rather than running
+// a parallel WS, because:
+//  * the data is already in the ring (no extra Frida I/O),
+//  * the panels are *summary* views (a 2.5s lag is invisible to a
+//    human eye scanning the table), and
+//  * polling means a paused trace WS doesn't also pause hooks/scope.
+
+export type HookStatTopReturn = {
+  value: string;
+  count: number;
+};
+
+export type HookStat = {
+  class: string;
+  method: string;
+  /** The session's template id at create-time. ``null`` only on
+   *  legacy sessions created before sub-step 4.5 (none in v1, but the
+   *  shape is permissive so a future template-less session shape
+   *  doesn't break the panel). */
+  template_id: string | null;
+  hits: number;
+  /** Unix epoch seconds (float). ``null`` until the first event lands. */
+  last_seen_ts: number | null;
+  top_returns: HookStatTopReturn[];
+};
+
+/** Last-known entry / exit snapshot for a single ``(class, method)``
+ *  watched by a ``scope_inspector`` template. The ``last_entry`` and
+ *  ``last_exit`` fields are independently updated, so a method that's
+ *  mid-call (entered, not yet returned) can show entry data without
+ *  exit data. */
+export type ScopeSnapshotSide = {
+  ts: number | null;
+  this_fields: Record<string, string>;
+};
+
+export type ScopeSnapshotEntry = ScopeSnapshotSide & {
+  args: string[] | null;
+  this_class: string | null;
+};
+
+export type ScopeSnapshotExit = ScopeSnapshotSide & {
+  return: string | null;
+};
+
+export type ScopeSnapshot = {
+  class: string;
+  method: string;
+  last_entry: ScopeSnapshotEntry | null;
+  last_exit: ScopeSnapshotExit | null;
+};
+
+export function getSessionHooks(sessionId: string) {
+  return _read<{ session_id: string; hooks: HookStat[] }>(
+    `/api/frida/sessions/${encodeURIComponent(sessionId)}/hooks`,
+  );
+}
+
+export function getSessionScope(sessionId: string) {
+  return _read<{ session_id: string; snapshots: ScopeSnapshot[] }>(
+    `/api/frida/sessions/${encodeURIComponent(sessionId)}/scope`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // useFridaTrace — WS hook
 //
 // Wraps the connect/disconnect lifecycle of ``/ws/frida/sessions/:id/trace``.

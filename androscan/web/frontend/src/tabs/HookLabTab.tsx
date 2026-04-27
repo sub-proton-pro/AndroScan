@@ -6,6 +6,8 @@ import { CodeView } from "../components/CodeView";
 import { FridaSessionsList } from "../components/FridaSessionsList";
 import { FridaTracePanel } from "../components/FridaTracePanel";
 import { HookBuilder } from "../components/HookBuilder";
+import { HookStatsPanel } from "../components/HookStatsPanel";
+import { ScopeInspectorPanel } from "../components/ScopeInspectorPanel";
 import { fetchSource } from "../api/code";
 import type { CreateSessionResult, FridaSessionInfo } from "../api/frida";
 import { useWorkbench } from "../context/WorkbenchContext";
@@ -13,14 +15,14 @@ import { useWorkbench } from "../context/WorkbenchContext";
 /**
  * Hook Lab tab.
  *
- * Three-column layout (DEC-023, sub-step 4.5):
+ * Three-column layout (DEC-023, sub-steps 4.5 + 4.6):
  *
  *   ┌──────────┬──────────────────────────┬──────────────────────┐
  *   │          │  CodeView (top)          │  Sessions list       │
  *   │  Call    ├──────────────────────────┤                      │
  *   │  graph   │  HookBuilder (mid)       ├──────────────────────┤
- *   │          ├──────────────────────────┤                      │
- *   │          │  ChatDock (bottom)       │  Trace panel         │
+ *   │          ├──────────────────────────┤  [ Trace | Hooks |   │
+ *   │          │  ChatDock (bottom)       │    Scope ] panel     │
  *   └──────────┴──────────────────────────┴──────────────────────┘
  *
  * Cross-component wiring:
@@ -32,8 +34,15 @@ import { useWorkbench } from "../context/WorkbenchContext";
  *   * Successful Inject creates a session; we capture its id +
  *     ``persist_path`` and pin the right pane's trace to it.
  *   * Picking a different session in the SessionsList swaps the
- *     trace pane to that session's WS stream.
+ *     trace / hooks / scope panes to that session's data.
+ *
+ * Right-pane bottom slot is a tab strip (sub-step 4.6): default
+ * "Trace" preserves 4.5's behaviour; "Hooks" surfaces the per-
+ * (class, method) hit counts + top return values; "Scope" shows
+ * captured ``this_fields`` snapshots from the ``scope_inspector``
+ * template. All three panels share the same ``activeSession``.
  */
+type RightPaneTab = "trace" | "hooks" | "scope";
 export function HookLabTab() {
   const { appId, dossier } = useWorkbench();
   const [selected, setSelected] = useState<SelectedNode | null>(null);
@@ -44,6 +53,10 @@ export function HookLabTab() {
 
   // Bumped after Inject / Detach so the SessionsList re-fetches eagerly.
   const [sessionsRefreshTick, setSessionsRefreshTick] = useState(0);
+
+  // Right-pane bottom tab. Defaults to "trace" so existing operators
+  // see the same surface they had in 4.5.
+  const [rightTab, setRightTab] = useState<RightPaneTab>("trace");
 
   useEffect(() => {
     setSelected(null);
@@ -119,10 +132,55 @@ export function HookLabTab() {
           </Panel>
           <PanelResizeHandle className="resize-v" />
           <Panel defaultSize={64} minSize={20} className="panel">
-            <FridaTracePanel
-              sessionId={activeSession?.sessionId ?? null}
-              persistEnabled={activeSession?.persistEnabled ?? false}
-            />
+            <div className="right-pane-tabs">
+              <nav className="right-pane-tabs-nav" role="tablist" aria-label="Trace / Hooks / Scope">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={rightTab === "trace"}
+                  className={`right-pane-tab ${rightTab === "trace" ? "right-pane-tab-active" : ""}`}
+                  onClick={() => setRightTab("trace")}
+                >
+                  Trace
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={rightTab === "hooks"}
+                  className={`right-pane-tab ${rightTab === "hooks" ? "right-pane-tab-active" : ""}`}
+                  onClick={() => setRightTab("hooks")}
+                  disabled={!activeSession}
+                  title={activeSession ? undefined : "Inject a hook to see per-method stats"}
+                >
+                  Hooks
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={rightTab === "scope"}
+                  className={`right-pane-tab ${rightTab === "scope" ? "right-pane-tab-active" : ""}`}
+                  onClick={() => setRightTab("scope")}
+                  disabled={!activeSession}
+                  title={activeSession ? undefined : "Inject a scope_inspector hook to see field snapshots"}
+                >
+                  Scope
+                </button>
+              </nav>
+              <div className="right-pane-tab-body">
+                {rightTab === "trace" && (
+                  <FridaTracePanel
+                    sessionId={activeSession?.sessionId ?? null}
+                    persistEnabled={activeSession?.persistEnabled ?? false}
+                  />
+                )}
+                {rightTab === "hooks" && (
+                  <HookStatsPanel sessionId={activeSession?.sessionId ?? null} />
+                )}
+                {rightTab === "scope" && (
+                  <ScopeInspectorPanel sessionId={activeSession?.sessionId ?? null} />
+                )}
+              </div>
+            </div>
           </Panel>
         </PanelGroup>
       </Panel>

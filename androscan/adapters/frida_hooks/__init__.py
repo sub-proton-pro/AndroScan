@@ -159,6 +159,7 @@ class RenderedHook:
 # template by accident.
 _TEMPLATE_MODULES: tuple[str, ...] = (
     "androscan.adapters.frida_hooks.entry_exit_log",
+    "androscan.adapters.frida_hooks.scope_inspector",
     "androscan.adapters.frida_hooks.ssl_pinning_bypass",
     "androscan.adapters.frida_hooks.crypto",
     "androscan.adapters.frida_hooks.shared_preferences",

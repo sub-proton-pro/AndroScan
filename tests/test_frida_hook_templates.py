@@ -423,3 +423,43 @@ class TestTemplates:
         # extras-not-captured caveat.
         assert "deep-link" in s or "navigation" in s
         assert "extras" in s
+
+    def test_scope_inspector_renders(self):
+        result = render_by_id(
+            "scope_inspector",
+            {
+                "class_name": "com.example.SessionManager",
+                "method_name": "refreshToken",
+                "event_label": "scope-1",
+            },
+        )
+        # JS body — every parameter substituted, plus the structural
+        # markers the aggregator + UI rely on.
+        assert "com.example.SessionManager" in result.js
+        assert "refreshToken" in result.js
+        assert "scope-1" in result.js
+        # Field-snapshot machinery must be present (this is the bit
+        # that makes scope_inspector different from entry_exit_log).
+        assert "getDeclaredFields" in result.js
+        assert "setAccessible" in result.js
+        assert "this_fields" in result.js
+        assert "snapshotFields" in result.js
+        # Both phases emit the discriminator the aggregator pattern-
+        # matches on.
+        assert '"phase": "entry"' in result.js
+        assert '"phase": "exit"' in result.js
+        assert '"phase": "ready"' in result.js
+        # Summary surfaces the read-only contract + the fields concept
+        # so an operator picking from the dropdown understands what
+        # this template captures.
+        s = result.summary.lower()
+        assert "read-only" in s
+        assert "field" in s
+        assert "this_fields" in s
+        assert "scope-1" in result.summary
+        # Sensitive-APIs metadata is the operator-facing audit hint.
+        from androscan.adapters.frida_hooks import get_template
+
+        tmpl = get_template("scope_inspector")
+        assert "Class.getDeclaredFields" in tmpl.sensitive_apis
+        assert "Field.setAccessible" in tmpl.sensitive_apis

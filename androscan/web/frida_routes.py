@@ -403,6 +403,44 @@ def build_frida_router(
             "events": [_event_to_jsonable(e) for e in events],
         }
 
+    # -- introspection: hooks summary + scope snapshots (sub-step 4.6) ---
+    #
+    # Both endpoints are pure aggregations over the in-memory ring
+    # buffer; they perform no Frida I/O. That means they keep working
+    # after a session detach (until the server restarts) and they can
+    # be polled cheaply by the UI without a WebSocket. The aggregation
+    # functions live at module level so tests can exercise them
+    # directly with a synthetic event list, independent of FastAPI.
+
+    @router.get("/sessions/{session_id}/hooks")
+    def get_session_hooks(session_id: str) -> dict[str, Any]:
+        """Per-(class, method) hit count + last seen + top return values.
+
+        The summary is derived from the session's current ring buffer
+        snapshot — events that have already rotated out of the ring
+        will not be counted. This is intentional: the UI uses this for
+        a "what's actively firing" panel, *not* a forensic audit log;
+        forensic data belongs in the persisted JSONL exposed by
+        ``/export``.
+        """
+        session = _require_session(frida_client_provider(), session_id)
+        hooks = _summarize_hooks(session)
+        return {"session_id": session_id, "hooks": hooks}
+
+    @router.get("/sessions/{session_id}/scope")
+    def get_session_scope(session_id: str) -> dict[str, Any]:
+        """Most-recent scope-inspector entry/exit snapshot per (class, method).
+
+        Filters the ring buffer for events that carry a ``this_fields``
+        block (i.e. came from the ``scope_inspector`` template). Other
+        templates (e.g. ``entry_exit_log``) emit ``entry`` / ``exit``
+        phases without ``this_fields``; those are ignored here so the
+        Scope Inspector pane doesn't pretend it has data it doesn't.
+        """
+        session = _require_session(frida_client_provider(), session_id)
+        snapshots = _summarize_scope(session)
+        return {"session_id": session_id, "snapshots": snapshots}
+
     @router.get("/sessions/{session_id}/export")
     def export_session_jsonl(session_id: str) -> StreamingResponse:
         session = _require_session(frida_client_provider(), session_id)
@@ -547,6 +585,242 @@ def _require_session(client: FridaClient, session_id: str) -> FridaSession:
     if session is None:
         raise HTTPException(status_code=404, detail=f"unknown session_id: {session_id}")
     return session
+
+
+# ---------------------------------------------------------------------------
+# Aggregation helpers consumed by /sessions/{id}/{hooks,scope} (sub-step 4.6)
+#
+# These are pure functions over a ``FridaSession`` (or, in tests, over a
+# synthetic event list via ``_summarize_*_events``). Keeping the
+# event-list form pure means tests don't need a real Frida runtime — we
+# build a list of ``TraceEvent``-shaped objects, hand it to the helper,
+# and assert on the dict. The route wrappers above just call
+# ``session.events()`` and feed the result through.
+#
+# The aggregation contract is intentionally narrow:
+#
+# * *Hooks summary* groups by ``(payload.class, payload.method)`` — the
+#   shape every entry/exit-style template emits. Events with malformed
+#   payloads (non-dict, missing class/method) are silently ignored
+#   rather than crashing the panel; the operator just sees fewer rows.
+# * *Scope snapshots* additionally require ``this_fields`` to be a
+#   dict, which is the discriminator the ``scope_inspector`` template
+#   sets. Other templates' entry/exit events are filtered out so the
+#   Scope pane doesn't claim data it can't produce.
+#
+# Top-N return values use a stable insertion-order tiebreak (i.e. the
+# first time a value appears determines its position when counts tie),
+# mirroring how the trace panel renders the events.
+
+
+_TOP_RETURNS_LIMIT = 5
+_SCOPE_FIELDS_KEY = "this_fields"
+
+
+def _payload_dict(event: Any) -> Optional[dict[str, Any]]:
+    """Extract a dict-shaped payload from a :class:`TraceEvent`-shaped object.
+
+    Defensive: tolerates raw dicts (test fixtures) *and* the live
+    :class:`TraceEvent` dataclass; returns ``None`` for anything the
+    aggregator should skip (non-dict payloads, missing payload).
+    """
+    payload: Any
+    if hasattr(event, "payload"):
+        payload = event.payload
+    elif isinstance(event, dict):
+        payload = event.get("payload")
+    else:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _event_ts(event: Any) -> Optional[float]:
+    if hasattr(event, "ts"):
+        ts = getattr(event, "ts")
+    elif isinstance(event, dict):
+        ts = event.get("ts")
+    else:
+        return None
+    return float(ts) if isinstance(ts, (int, float)) else None
+
+
+def _summarize_hooks(session: FridaSession) -> list[dict[str, Any]]:
+    """Public wrapper: snapshot + delegate to the pure aggregator."""
+    return _summarize_hooks_events(
+        session.events(),
+        template_id=session.template_id,
+    )
+
+
+def _summarize_hooks_events(
+    events: list[Any],
+    *,
+    template_id: Optional[str],
+) -> list[dict[str, Any]]:
+    """Aggregate `(class, method) -> {hits, last_seen_ts, top_returns}`.
+
+    Counts ``phase=="entry"`` events as hits; collects ``return``
+    values from ``phase=="exit"`` events into a tally. Errors / ready
+    / log events don't increment hits but *do* update ``last_seen_ts``
+    so a long-running hook that's only seeing errors still surfaces in
+    the panel (the UI distinguishes hits=0 from "hasn't fired yet").
+    """
+
+    # Group state: (class, method) -> dict
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in events:
+        payload = _payload_dict(event)
+        if payload is None:
+            continue
+        class_name = payload.get("class")
+        method_name = payload.get("method")
+        if not isinstance(class_name, str) or not isinstance(method_name, str):
+            continue
+        key = (class_name, method_name)
+        slot = groups.get(key)
+        if slot is None:
+            slot = {
+                "class": class_name,
+                "method": method_name,
+                "template_id": template_id,
+                "hits": 0,
+                "last_seen_ts": None,
+                "top_returns": [],
+                "_returns": {},  # value -> count, dropped before return
+                "_first_seen_order": {},  # value -> insertion index for tiebreak
+            }
+            groups[key] = slot
+
+        ts = _event_ts(event)
+        if ts is not None:
+            prev = slot["last_seen_ts"]
+            if prev is None or ts > prev:
+                slot["last_seen_ts"] = ts
+
+        phase = payload.get("phase")
+        if phase == "entry":
+            slot["hits"] = int(slot["hits"]) + 1
+        elif phase == "exit":
+            rv = payload.get("return")
+            if isinstance(rv, str):
+                # Cap individual return values so a `String(rv)` of a
+                # 200 KB byte buffer doesn't blow up the response. The
+                # JSONL trace keeps the full string; this is the
+                # summary view's compact projection.
+                rv_short = rv if len(rv) <= 256 else rv[:253] + "..."
+                slot["_returns"][rv_short] = slot["_returns"].get(rv_short, 0) + 1
+                if rv_short not in slot["_first_seen_order"]:
+                    slot["_first_seen_order"][rv_short] = len(slot["_first_seen_order"])
+
+    # Finalise: turn ``_returns`` into a stable top-N list.
+    out: list[dict[str, Any]] = []
+    for slot in groups.values():
+        returns = slot.pop("_returns")
+        order = slot.pop("_first_seen_order")
+        ranked = sorted(
+            returns.items(),
+            key=lambda kv: (-kv[1], order.get(kv[0], 0)),
+        )
+        slot["top_returns"] = [
+            {"value": v, "count": c} for v, c in ranked[:_TOP_RETURNS_LIMIT]
+        ]
+        out.append(slot)
+    # Sort rows by hit count desc, then last_seen desc, so the most
+    # interesting hooks float to the top of the panel.
+    out.sort(
+        key=lambda r: (
+            -int(r.get("hits", 0)),
+            -(r.get("last_seen_ts") or 0.0),
+            r.get("class") or "",
+            r.get("method") or "",
+        )
+    )
+    return out
+
+
+def _summarize_scope(session: FridaSession) -> list[dict[str, Any]]:
+    """Public wrapper: snapshot + delegate to the pure aggregator."""
+    return _summarize_scope_events(session.events())
+
+
+def _summarize_scope_events(events: list[Any]) -> list[dict[str, Any]]:
+    """Most-recent entry + most-recent exit per (class, method) with `this_fields`.
+
+    The scope panel needs both: entry shows the args + initial field
+    values, exit shows the return value + post-call field values, and
+    the operator's diff between them is the actual signal. We keep
+    them independently last-seen so a method that's mid-call (entered
+    but not yet exited) still shows useful entry data.
+    """
+
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in events:
+        payload = _payload_dict(event)
+        if payload is None:
+            continue
+        fields = payload.get(_SCOPE_FIELDS_KEY)
+        if not isinstance(fields, dict):
+            continue
+        class_name = payload.get("class")
+        method_name = payload.get("method")
+        if not isinstance(class_name, str) or not isinstance(method_name, str):
+            continue
+        key = (class_name, method_name)
+        slot = groups.setdefault(
+            key,
+            {
+                "class": class_name,
+                "method": method_name,
+                "last_entry": None,
+                "last_exit": None,
+            },
+        )
+        ts = _event_ts(event)
+        phase = payload.get("phase")
+        if phase == "entry":
+            existing = slot["last_entry"]
+            if existing is None or (ts is not None and ts >= (existing.get("ts") or 0.0)):
+                args = payload.get("args")
+                slot["last_entry"] = {
+                    "ts": ts,
+                    "args": list(args) if isinstance(args, list) else None,
+                    "this_class": payload.get("this_class"),
+                    "this_fields": dict(fields),
+                }
+        elif phase == "exit":
+            existing = slot["last_exit"]
+            if existing is None or (ts is not None and ts >= (existing.get("ts") or 0.0)):
+                rv = payload.get("return")
+                slot["last_exit"] = {
+                    "ts": ts,
+                    "return": rv if isinstance(rv, str) else None,
+                    "this_fields": dict(fields),
+                }
+
+    out = list(groups.values())
+    # Most-recently-active (by max(entry.ts, exit.ts)) first; stable
+    # alphabetical tiebreak so polling doesn't shuffle rows under the
+    # operator's cursor.
+    def _max_ts(row: dict[str, Any]) -> float:
+        candidates: list[float] = []
+        for sub_key in ("last_entry", "last_exit"):
+            sub = row.get(sub_key)
+            if isinstance(sub, dict):
+                ts = sub.get("ts")
+                if isinstance(ts, (int, float)):
+                    candidates.append(float(ts))
+        return max(candidates) if candidates else 0.0
+
+    out.sort(
+        key=lambda r: (
+            -_max_ts(r),
+            r.get("class") or "",
+            r.get("method") or "",
+        )
+    )
+    return out
 
 
 def _resolve_target_prefix(per_app: dict[str, Any], app_dir: Path) -> Optional[str]:
