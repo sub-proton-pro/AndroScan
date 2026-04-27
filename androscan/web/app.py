@@ -828,6 +828,23 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
         )
     )
 
+    # Hook Lab Frida adapter (DEC-023): detach any live sessions when uvicorn
+    # tears the app down, so the next workbench start doesn't trip over a
+    # stale frida.core.Session referencing a process that no longer exists.
+    # Guarded so the import is a no-op when ``[frida]`` isn't installed.
+    @app.on_event("shutdown")
+    async def _detach_frida_sessions() -> None:  # pragma: no cover - shutdown path
+        try:
+            from androscan.adapters.frida_client import FridaClient
+        except Exception:
+            return
+        client = getattr(app.state, "frida_client", None)
+        if isinstance(client, FridaClient):
+            try:
+                client.detach_all()
+            except Exception as e:
+                logger.debug("frida detach_all on shutdown raised: %s", e)
+
     # Vite places hashed bundles under /assets (do not mount "/" — would shadow /api).
     from starlette.staticfiles import StaticFiles
 

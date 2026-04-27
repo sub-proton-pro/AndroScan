@@ -207,6 +207,151 @@ async def probe_frida_version(frida_cmd: str = "frida") -> dict[str, Any]:
     return await probe_tool_version(frida_cmd, "--version", parse_first_token=True)
 
 
+async def probe_frida_server(
+    adb_cmd: str = "adb",
+    timeout: float = SHORT_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    """Is ``frida-server`` running on the connected device?
+
+    Strategy: ``adb shell pidof frida-server`` (cheap, no root needed for
+    ``pidof`` on standard emulator images). Returns ``{ok, running, pid,
+    error}``. Probe never raises; falls back to ``ok=False`` when adb
+    itself is unreachable so the Settings card can show the same red dot
+    for "no device" and "no frida-server" without the aggregator
+    needing special-case logic.
+
+    The Hook Lab adapter (:mod:`androscan.adapters.frida_client`) talks
+    to ``frida-server`` over the standard host-to-device USB transport;
+    if this probe is red there is no point hammering the device with
+    ``frida.attach`` calls.
+    """
+    rc, out, err = await _run(adb_cmd, "shell", "pidof", "frida-server", timeout=timeout)
+    tok = (out or "").strip().split()
+    pid: Optional[int] = None
+    if tok:
+        try:
+            pid = int(tok[0])
+        except ValueError:
+            pid = None
+    running = pid is not None and rc == 0
+    return {
+        "ok": running,
+        "running": running,
+        "pid": pid,
+        "error": None if running else ((err or "").strip()[:300] or "frida-server not running on device"),
+    }
+
+
+def _normalize_frida_version(raw: Optional[str]) -> Optional[str]:
+    """Strip the ``"frida X.Y.Z"`` banner down to the bare ``"X.Y.Z"`` token.
+
+    The host CLI prints just ``"16.4.10"`` for ``frida --version``; the
+    on-device server prints ``"frida-server 16.4.10\\n"``. We normalise
+    both so :func:`_compare_major_minor` doesn't have to care.
+    """
+    if not raw:
+        return None
+    for tok in str(raw).split():
+        if any(c.isdigit() for c in tok):
+            return tok.strip(",;()")
+    return None
+
+
+def _major_minor(v: Optional[str]) -> Optional[tuple[int, int]]:
+    """Best-effort ``(major, minor)`` parse; returns ``None`` for nonsense input.
+
+    Frida version strings are dotted ints (e.g. ``"16.4.10"``); we ignore
+    everything past minor because the wire-protocol contract Frida
+    advertises is "compatible across same major" (with very rare
+    exceptions during pre-release minors, which we surface as a warning).
+    """
+    if not v:
+        return None
+    parts = v.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+async def probe_frida_version_skew(
+    host: dict[str, Any],
+    adb_cmd: str = "adb",
+    timeout: float = SHORT_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    """Compare host ``frida`` CLI version with device ``frida-server`` version.
+
+    ``host`` is the dict returned by :func:`probe_frida_version` — we
+    read ``host["version"]`` and compare to ``adb shell frida-server
+    --version``. A major-version mismatch is fatal (Frida's wire
+    protocol is not stable across majors); a minor mismatch is a
+    warning.
+
+    Returns ``{ok, host_version, device_version, severity, error}``
+    where ``severity`` ∈ ``{None, "minor", "major"}``. ``ok`` is
+    ``False`` when severity is ``"major"`` or when the device probe
+    fails — the SettingsTab card uses ``ok`` to choose the dot colour.
+    """
+    host_version = _normalize_frida_version(host.get("version") if isinstance(host, dict) else None)
+
+    rc, out, err = await _run(
+        adb_cmd, "shell", "frida-server", "--version", timeout=timeout
+    )
+    raw_dev = (out or err or "").strip()
+    device_version = _normalize_frida_version(raw_dev)
+    if rc != 0 or not device_version:
+        return {
+            "ok": False,
+            "host_version": host_version,
+            "device_version": None,
+            "severity": None,
+            "error": (err or out or "could not read frida-server --version on device").strip()[:300],
+        }
+
+    h = _major_minor(host_version)
+    d = _major_minor(device_version)
+    if h is None or d is None:
+        # Couldn't parse one side; report what we got but don't claim ok.
+        return {
+            "ok": False,
+            "host_version": host_version,
+            "device_version": device_version,
+            "severity": None,
+            "error": "unparsable version string",
+        }
+    if h[0] != d[0]:
+        return {
+            "ok": False,
+            "host_version": host_version,
+            "device_version": device_version,
+            "severity": "major",
+            "error": (
+                f"major version mismatch (host {host_version}, device {device_version}); "
+                "Frida wire protocol is incompatible — upgrade one side"
+            ),
+        }
+    if h[1] != d[1]:
+        return {
+            "ok": True,  # functional, but flag in the card
+            "host_version": host_version,
+            "device_version": device_version,
+            "severity": "minor",
+            "error": (
+                f"minor version skew (host {host_version}, device {device_version}); "
+                "instrumentation should still work but consider matching"
+            ),
+        }
+    return {
+        "ok": True,
+        "host_version": host_version,
+        "device_version": device_version,
+        "severity": None,
+        "error": None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Ollama / LLM probes
 

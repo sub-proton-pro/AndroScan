@@ -76,6 +76,7 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     "rag_embed_provider":          ("rag",      "embed_provider",    "ANDROSCAN_RAG_PROVIDER"),
     "rag_embed_model":             ("rag",      "embed_model",       "ANDROSCAN_RAG_MODEL"),
     "rag_top_k_default":           ("rag",      "top_k_default",     "ANDROSCAN_RAG_TOP_K"),
+    "frida_trace_ring_buffer_size":("frida",    "trace_ring_buffer_size", "ANDROSCAN_FRIDA_TRACE_RING"),
 }
 
 
@@ -103,6 +104,9 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
     "rag_embed_model",
     "rag_top_k_default",
     "web_screencap_interval_ms",
+    # frida.trace_ring_buffer_size only takes effect on new FridaSession
+    # instances; nothing in flight needs to be torn down to pick up a change.
+    "frida_trace_ring_buffer_size",
 })
 
 
@@ -134,6 +138,7 @@ class Config:
     rag_embed_provider: str
     rag_embed_model: str
     rag_top_k_default: int
+    frida_trace_ring_buffer_size: int
 
     @classmethod
     def default(cls) -> "Config":
@@ -161,6 +166,7 @@ class Config:
             rag_embed_provider="fastembed",
             rag_embed_model="",
             rag_top_k_default=8,
+            frida_trace_ring_buffer_size=5000,
         )
 
     @property
@@ -265,6 +271,10 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["rag_embed_provider"] = (rag.get("embed_provider") or "fastembed").strip() or "fastembed"
     out["rag_embed_model"] = (rag.get("embed_model") or "").strip()
     out["rag_top_k_default"] = _safe_int(rag.get("top_k_default"), 8, "rag.top_k_default")
+    frida = config_dict.get("frida") or {}
+    out["frida_trace_ring_buffer_size"] = _safe_int(
+        frida.get("trace_ring_buffer_size"), 5000, "frida.trace_ring_buffer_size"
+    )
     return out
 
 
@@ -332,6 +342,16 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 f"Warning: ANDROSCAN_RAG_TOP_K={os.environ['ANDROSCAN_RAG_TOP_K']!r} invalid; using default.",
                 file=sys.stderr,
             )
+    if os.environ.get("ANDROSCAN_FRIDA_TRACE_RING"):
+        try:
+            merged["frida_trace_ring_buffer_size"] = max(
+                100, int(os.environ["ANDROSCAN_FRIDA_TRACE_RING"].strip())
+            )
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_FRIDA_TRACE_RING={os.environ['ANDROSCAN_FRIDA_TRACE_RING']!r} invalid; using default.",
+                file=sys.stderr,
+            )
     if os.environ.get("ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"):
         try:
             merged["web_screencap_interval_ms"] = max(50, int(os.environ["ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"].strip()))
@@ -365,6 +385,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         rag_embed_provider=str(merged.get("rag_embed_provider") or "fastembed").strip() or "fastembed",
         rag_embed_model=str(merged.get("rag_embed_model") or "").strip(),
         rag_top_k_default=max(1, int(merged.get("rag_top_k_default", 8))),
+        frida_trace_ring_buffer_size=max(100, int(merged.get("frida_trace_ring_buffer_size", 5000))),
     )
 
 
@@ -479,6 +500,7 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
         rag_embed_provider=str(flat["rag_embed_provider"] or "fastembed").strip() or "fastembed",
         rag_embed_model=str(flat["rag_embed_model"] or "").strip(),
         rag_top_k_default=max(1, int(flat["rag_top_k_default"])),
+        frida_trace_ring_buffer_size=max(100, int(flat["frida_trace_ring_buffer_size"])),
     )
 
 
@@ -496,6 +518,7 @@ def coerce_yaml_value(field: str, raw: Any) -> Any:
         "section_rule_length",
         "web_port", "web_screencap_interval_ms",
         "rag_top_k_default",
+        "frida_trace_ring_buffer_size",
     }
     float_fields = {"ollama_temperature", "cloud_temperature"}
     bool_fields = {"per_component_analysis"}

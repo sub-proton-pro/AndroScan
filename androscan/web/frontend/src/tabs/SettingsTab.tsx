@@ -691,6 +691,22 @@ function StatusPanel() {
             <StatusCardView card={globalStatus.tools.jadx} />
             <StatusCardView card={globalStatus.tools.apktool} />
             <StatusCardView card={globalStatus.tools.frida} />
+            <StatusCardView card={globalStatus.tools.frida_server} extras={[
+              globalStatus.tools.frida_server.running
+                ? `pid ${globalStatus.tools.frida_server.pid ?? "?"}`
+                : "not running",
+              globalStatus.tools.frida_server.device_version
+                ? `device ${globalStatus.tools.frida_server.device_version}`
+                : "",
+              globalStatus.tools.frida_server.host_version
+                ? `host ${globalStatus.tools.frida_server.host_version}`
+                : "",
+              globalStatus.tools.frida_server.version_skew === "major"
+                ? "version skew: major (incompatible)"
+                : globalStatus.tools.frida_server.version_skew === "minor"
+                ? "version skew: minor"
+                : "",
+            ]}/>
             <StatusCardView card={globalStatus.device} extras={[
               globalStatus.device.connected
                 ? `state: ${globalStatus.device.state ?? "unknown"}`

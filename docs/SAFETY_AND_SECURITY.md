@@ -380,6 +380,104 @@ dump, the apk SHA, etc.). Both deserve named guardrails:
 the LAN would expose the YAML editor too, which is one of the stronger reasons
 to keep the default bind local-only.**
 
+### 12.6 Frida adapter scope (v1; Hook Lab sub-step 4.3)
+
+The Frida adapter (`androscan/adapters/frida_client.py`, landed in Hook Lab
+sub-step 4.3 — see DEC-023) is intentionally headless and conservatively
+scoped. §12.2 sets the high-level Frida policy (adapter boundary + LLM-hook
+confirmation per DEC-017); this section pins down the v1 scope decisions so
+later sub-steps (4.4 templates, 4.5 Inject UI + WS + JSONL persistence, 4.6
+scope inspector, 4.7 LLM-tier `generate_frida_hook` skill) inherit them
+explicitly rather than re-litigating the safety surface.
+
+**Operator-managed `frida-server` (no auto-push):**
+- Androscan does **not** push, start, or stop `frida-server` on the device.
+  The on-device binary is the operator's responsibility — same posture as
+  `adb`, `jadx`, `apktool`, and the Ollama daemon.
+- Two readiness probes surface the device-side state in Settings → Status:
+  `probe_frida_server` (`adb shell pidof frida-server`; returns
+  `{ok, running, pid, error}` — never raises) and `probe_frida_version_skew`
+  (compares host `frida` CLI version with `frida-server --version` on the
+  device; severity `None` / `"minor"` / `"major"`). A version skew of
+  `"major"` is a blocker (Frida wire protocol breaks across majors); minor is
+  a warning. Both probes inherit §12.5's "pure async, hard timeout, never
+  raise, return a `{ok, label, ...}` dict" contract — a wedged adb adds at
+  most 1 s to the status fan-out, never the sum.
+- **No auto-provisioning helper exists in v1** (e.g. no `adb push frida-server`
+  step). Adding one would mean Androscan picks the matching `frida-server`
+  build for the device's arch + Frida version, which varies per OEM /
+  Magisk / userspace-gadget configurations and is genuinely complex. v2 may
+  revisit if operator demand justifies it; until then the Settings card is
+  the only mitigation and the README pointer to `frida-server` install docs
+  is the documented escape hatch.
+
+**No device-touching code in the default `pytest` suite:**
+- Real `frida` Python imports happen only inside the `_frida_python()` seam.
+  `FridaClient.__init__` calls it lazily; on `ImportError` it raises
+  `FridaUnavailableError("frida not installed. Install with: pip install -e
+  '.[frida]'")` — same install-hint shape as `EmbedProviderError` in the RAG
+  path (DEC-018).
+- The default test suite (`pytest -q`, equivalent to `pytest -m "not
+  device"`) **does not** install the `[frida]` extra and **does not** import
+  the real `frida`. `tests/test_frida_client.py` covers the entire adapter
+  surface against a stub `frida` module installed via
+  `monkeypatch.setattr(frida_client, "_frida_python", lambda: stub)` — so
+  attach / load / on_message / ring eviction / detach / FridaUnavailableError
+  all run in CI without a connected device.
+- The new `device` pytest marker is registered in `pyproject.toml` but no
+  tests carry it in 4.3. 4.4–4.7 will use it to opt **into** real-device
+  runs; CI continues to pass `-m "not device"` and stays hermetic.
+
+**In-memory ring buffer only — no persistence in 4.3:**
+- Each `FridaSession` carries a `collections.deque(maxlen=N)` of
+  `TraceEvent`s (`N = config.frida_trace_ring_buffer_size`, default 5000,
+  clamped `>= 100`). Events that overflow the deque are silently dropped;
+  the count is exposed via `FridaSession.stats()["dropped"]`.
+- **No JSONL persistence to `apps/<app_id>/<run_ts>/frida/<session>.jsonl`
+  in 4.3** — that lands in 4.5 alongside the Inject UI, which owns the
+  `<run_ts>` allocator and the session lifecycle naturally. In 4.3 traces
+  survive only until the FastAPI app shuts down; `detach_all()` is invoked
+  from a guarded `@app.on_event("shutdown")` handler in
+  `androscan/web/app.py` so sessions are torn down cleanly on Ctrl-C and
+  the deque is GC'd.
+- **Trace contents are sensitive by default** (auth tokens, crypto material,
+  PII — see §12.2). Once 4.5 adds JSONL persistence, the persisted file
+  inherits §8 (logging/reporting): default permissions match the
+  surrounding `apps/<app_id>/<run_ts>/` tree (single-user local), and
+  `.jsonl` lines must not be quoted into chat / report attachments without
+  `androscan/web/chat.py::sanitize_text` — same treatment as RAG hits in
+  §12.4. The 4.3 in-memory ring buffer is *not* logged in plain text; only
+  `FridaSession.stats()` is exposed (event counts + dropped count + last
+  timestamp), never event payloads.
+
+**Per-app `hook_target_package_prefix` is not enforced yet:**
+- DEC-023 specifies a per-app `hook_target_package_prefix` knob (default =
+  the app's own package id) that **rejects hook targets outside the prefix
+  server-side before the Inject button can fire**. v1's intent is to
+  prevent "accidentally hook Chrome" footguns.
+- **In 4.3 this knob is intentionally not added** to
+  `androscan/web/per_app_settings.py`. There is no Inject endpoint yet, so
+  enforcement has no call-site; adding the key without a consumer would be
+  dead code, would silently appear in the per-app Settings UI as an
+  unconsumed field, and would create the false impression that v1 already
+  guards against off-target hooks.
+- The knob (and `auto_attach_on_session_start`) lands in 4.5 with the
+  Inject route it gates. Until then, `FridaClient.attach(package)` accepts
+  any package the operator types — operators are trusted (§1) and 4.3 has
+  no UI surface that could call `attach()` without the operator typing the
+  package by hand.
+
+**No `/api/frida/*` HTTP routes in 4.3:**
+- The adapter has no HTTP callers in 4.3 — readiness flows through the
+  existing `/api/status/global` enrichment, and the adapter is reached
+  internally via `app.state.frida_client`. Any `/api/frida/*` surface that
+  lands in 4.5+ inherits §12.1 (bind 127.0.0.1) and the §12.5 pattern of
+  "validate before touching disk / device, atomic where applicable, never
+  raise raw subprocess output to the wire".
+- The `Inject` action specifically inherits §12.2 / DEC-017's
+  user-confirmation requirement and DEC-023's deterministic-pentester-summary
+  Option A UX — landing in 4.5 with the `pyjsparser` pre-validation gate.
+
 ---
 
 ## 13. Summary

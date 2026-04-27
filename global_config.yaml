@@ -37,3 +37,10 @@ rag:
   embed_provider: "fastembed"
   embed_model: ""
   top_k_default: 8
+
+# Hook Lab dynamic instrumentation (Phase 6 step 4 / DEC-023).
+# trace_ring_buffer_size caps the in-memory live-trace buffer per Frida session.
+# Persistent traces will land at apps/<app_id>/<run_ts>/frida/<session>.jsonl
+# (sub-step 4.5). Min clamp = 100 events.
+frida:
+  trace_ring_buffer_size: 5000

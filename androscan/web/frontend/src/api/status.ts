@@ -32,7 +32,22 @@ export type GlobalStatus = {
     adb: StatusCard;
     jadx: StatusCard;
     apktool: StatusCard;
+    /** Host-side `frida` CLI (Python bindings entry point). */
     frida: StatusCard;
+    /**
+     * Hook Lab device-side readiness card (Phase 6 step 4 / DEC-023):
+     * combines `pidof frida-server` reachability with the host↔device
+     * version-skew check. `version_skew` is `null` when versions match
+     * exactly, `"minor"` for differing minors (works but flag), or
+     * `"major"` for incompatible majors (card goes red).
+     */
+    frida_server: StatusCard & {
+      running: boolean;
+      pid: number | null;
+      host_version: string | null;
+      device_version: string | null;
+      version_skew: null | "minor" | "major";
+    };
   };
   device: StatusCard & {
     connected: boolean;
@@ -115,6 +130,10 @@ export function rollupGlobal(g: GlobalStatus): "green" | "yellow" | "red" {
   if (typeof fs.low_space === "boolean" && fs.low_space) return "red";
   if (!g.tools.jadx.ok || !g.rag_provider.ok) return "yellow";
   if (!g.tools.apktool.ok || !g.tools.frida.ok) return "yellow";
+  // Hook Lab readiness is non-critical for the offline / static workflows
+  // (Reports / Inspect): yellow it instead of red. Major version skew is
+  // surfaced as the card error message; the dot simply tracks "ok".
+  if (!g.tools.frida_server.ok) return "yellow";
   if (!g.device.ok) return "yellow";
   return "green";
 }

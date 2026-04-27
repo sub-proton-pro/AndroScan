@@ -203,6 +203,106 @@ def test_probe_pkg_running_actually_running(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # ---------------------------------------------------------------------------
+# probe_frida_server + probe_frida_version_skew (Hook Lab readiness)
+
+
+def test_probe_frida_server_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``adb shell pidof frida-server`` returning a pid → ok=True, running=True."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"4321\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is True
+    assert out["running"] is True
+    assert out["pid"] == 4321
+    assert out["error"] is None
+
+
+def test_probe_frida_server_not_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty stdout from ``pidof`` → not running, error surfaced."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(1, b"", b"")}),
+    )
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is False
+    assert out["running"] is False
+    assert out["pid"] is None
+    assert "frida-server" in out["error"]
+
+
+def test_probe_frida_server_no_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """adb itself errors (no device) → not ok, stderr forwarded."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(1, b"", b"adb: no devices/emulators found\n")}),
+    )
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is False
+    assert out["running"] is False
+    assert "no devices" in out["error"]
+
+
+def test_probe_frida_version_skew_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same major+minor on host and device → ok, no severity."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"16.4.10\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_frida_version_skew(
+        {"version": "16.4.10"}, "adb",
+    ))
+    assert out["ok"] is True
+    assert out["severity"] is None
+    assert out["host_version"] == "16.4.10"
+    assert out["device_version"] == "16.4.10"
+    assert out["error"] is None
+
+
+def test_probe_frida_version_skew_minor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same major, different minor → ok=True but severity='minor'."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"16.5.0\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_frida_version_skew(
+        {"version": "16.4.10"}, "adb",
+    ))
+    assert out["ok"] is True
+    assert out["severity"] == "minor"
+    assert "minor version skew" in out["error"]
+
+
+def test_probe_frida_version_skew_major(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Major mismatch → ok=False, severity='major', error explains why."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"15.2.0\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_frida_version_skew(
+        {"version": "16.4.10"}, "adb",
+    ))
+    assert out["ok"] is False
+    assert out["severity"] == "major"
+    assert "incompatible" in out["error"].lower() or "wire protocol" in out["error"].lower()
+
+
+def test_probe_frida_version_skew_device_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``adb shell frida-server --version`` errors → ok=False, no skew opinion."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(127, b"", b"frida-server: not found\n")}),
+    )
+    out = asyncio.run(hp.probe_frida_version_skew(
+        {"version": "16.4.10"}, "adb",
+    ))
+    assert out["ok"] is False
+    assert out["severity"] is None
+    assert out["device_version"] is None
+
+
+# ---------------------------------------------------------------------------
 # Ollama probes
 
 

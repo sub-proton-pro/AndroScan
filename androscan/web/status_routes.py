@@ -46,7 +46,9 @@ from androscan.web.health_probes import (
     probe_disk,
     probe_embed_provider,
     probe_foreground_activity,
+    probe_frida_server,
     probe_frida_version,
+    probe_frida_version_skew,
     probe_jadx_version,
     probe_ollama_tags,
     probe_path_writable,
@@ -103,6 +105,7 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
     jadx_p = probe_jadx_version(getattr(config, "jadx_cmd", "jadx"))
     apktool_p = probe_apktool_version(getattr(config, "apktool_cmd", "apktool"))
     frida_p = probe_frida_version("frida")
+    frida_server_p = probe_frida_server("adb")
     device_p = probe_adb_device()
     ollama_p = probe_ollama_tags(getattr(config, "ollama_base_url", "http://localhost:11434"))
     embed_p = probe_embed_provider(
@@ -111,10 +114,26 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
         getattr(config, "ollama_base_url", "http://localhost:11434"),
     )
 
-    (adb_v, jadx_v, apktool_v, frida_v, device_v, ollama_t, embed_s) = await asyncio.gather(
-        adb_p, jadx_p, apktool_p, frida_p, device_p, ollama_p, embed_p,
+    (adb_v, jadx_v, apktool_v, frida_v, frida_server_v, device_v, ollama_t, embed_s) = await asyncio.gather(
+        adb_p, jadx_p, apktool_p, frida_p, frida_server_p, device_p, ollama_p, embed_p,
         return_exceptions=False,
     )
+
+    # Version-skew probe is sequenced after the host CLI + device probes
+    # (it consumes ``frida_v`` and only meaningfully runs when the device
+    # half is up). Cheap when frida-server is not running — the probe
+    # short-circuits on the ``adb shell frida-server --version`` failure
+    # so we don't pay an extra ~1s on the common "no device" case.
+    if frida_server_v.get("running"):
+        skew_v = await probe_frida_version_skew(frida_v, "adb")
+    else:
+        skew_v = {
+            "ok": False,
+            "host_version": frida_v.get("version"),
+            "device_version": None,
+            "severity": None,
+            "error": frida_server_v.get("error") or "frida-server not running on device",
+        }
 
     # LLM model presence check piggy-backs on the ollama tags response.
     chat_model = getattr(config, "ollama_model", "")
@@ -155,7 +174,23 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
             "adb":     {**adb_v,     "label": "adb"},
             "jadx":    {**jadx_v,    "label": "jadx"},
             "apktool": {**apktool_v, "label": "apktool"},
-            "frida":   {**frida_v,   "label": "frida (Hook Lab)"},
+            "frida":   {**frida_v,   "label": "frida (host CLI)"},
+            # Hook Lab device-side readiness (Phase 6 step 4 / DEC-023):
+            # combines the ``pidof frida-server`` reachability probe with
+            # the host↔device version-skew comparison. The card is green
+            # only when the device half is running *and* the wire-protocol
+            # is compatible (same major). Closes DEC-021's "Hook Lab
+            # readiness rollup probe" follow-up.
+            "frida_server": {
+                "ok": bool(frida_server_v.get("ok")) and bool(skew_v.get("ok")),
+                "label": "frida-server (device)",
+                "running": bool(frida_server_v.get("running")),
+                "pid": frida_server_v.get("pid"),
+                "host_version": skew_v.get("host_version") or frida_v.get("version"),
+                "device_version": skew_v.get("device_version"),
+                "version_skew": skew_v.get("severity"),
+                "error": frida_server_v.get("error") or skew_v.get("error"),
+            },
         },
         "device": {
             **device_v,

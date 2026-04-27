@@ -26,7 +26,7 @@ def run_first_time_setup(
     runner: Optional[_RunCommand] = None,
     npm_path: Optional[str] = None,
 ) -> int:
-    """Run ``pip install -e ".[dev,rag]"`` and (if Node available) ``npm ci`` + ``npm run build``.
+    """Run ``pip install -e ".[dev,rag,frida]"`` and (if Node available) ``npm ci`` + ``npm run build``.
 
     The ``[rag]`` extra pulls in ``fastembed`` + ``numpy`` so semantic retrieval
     (Inspect-tab chat enrichment, ``search_decompiled_sources`` skill, Settings →
@@ -34,6 +34,12 @@ def run_first_time_setup(
     ``hash`` embed provider is available, which is fine for tests but useless
     for real semantic search. The first ``Build now`` click in the UI will then
     download the fastembed ONNX model (~130 MB) into the per-user cache.
+
+    The ``[frida]`` extra pulls in the host-side ``frida`` + ``frida-tools``
+    Python bindings used by the Hook Lab adapter
+    (:mod:`androscan.adapters.frida_client`) plus ``pyjsparser`` for the
+    Inject-button JS pre-validation that lands in sub-step 4.5. The device-side
+    ``frida-server`` is operator-managed -- see ``docs/SAFETY_AND_SECURITY.md``.
 
     Returns 0 on success, 1 on the first failed required step. The npm step is
     skipped (with a warning, exit 1) only if ``npm`` is not on PATH; otherwise
@@ -55,9 +61,10 @@ def run_first_time_setup(
     print(file=out)
 
     # Step 1 -- editable install + dev deps (pytest, httpx for TestClient) +
-    # rag deps (fastembed, numpy) so semantic retrieval works out of the box.
-    pip_cmd = [sys.executable, "-m", "pip", "install", "-e", ".[dev,rag]"]
-    print(green("Step 1/2: pip install -e \".[dev,rag]\""), file=out)
+    # rag deps (fastembed, numpy) so semantic retrieval works out of the box +
+    # frida deps (frida, frida-tools, pyjsparser) for the Hook Lab adapter.
+    pip_cmd = [sys.executable, "-m", "pip", "install", "-e", ".[dev,rag,frida]"]
+    print(green("Step 1/2: pip install -e \".[dev,rag,frida]\""), file=out)
     print(grey(f"    $ {' '.join(pip_cmd)}"), file=out)
     rc = run(pip_cmd, repo_root)
     if rc != 0:

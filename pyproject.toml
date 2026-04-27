@@ -30,6 +30,18 @@ rag = [
     "fastembed>=0.3",
     "numpy>=1.26",
 ]
+# Hook Lab dynamic instrumentation (Phase 6 step 4 / DEC-023).
+# `frida` + `frida-tools` are the host-side Python bindings; the device-side
+# frida-server is operator-managed (see docs/SAFETY_AND_SECURITY.md). The
+# adapter (androscan/adapters/frida_client.py) lazy-imports `frida` so this
+# extra is only required when running Hook Lab features.
+# `pyjsparser` is reserved for sub-step 4.5's Inject-button JS pre-validation
+# and is pinned here so 4.5 doesn't need to touch first-run setup.
+frida = [
+    "frida>=16",
+    "frida-tools>=12",
+    "pyjsparser>=2.7",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -38,3 +50,6 @@ include = ["androscan*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "device: marks tests requiring a connected emulator/device (deselect with '-m \"not device\"')",
+]
