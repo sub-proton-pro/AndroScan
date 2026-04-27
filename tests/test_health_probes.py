@@ -303,6 +303,74 @@ def test_probe_frida_version_skew_device_unreachable(monkeypatch: pytest.MonkeyP
 
 
 # ---------------------------------------------------------------------------
+# probe_device_cpu_abi (drives the Settings tab's frida-server install hint)
+
+
+def test_probe_device_cpu_abi_arm64(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Standard 64-bit ARM emulator/device → maps to ``android-arm64``."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"arm64-v8a\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_device_cpu_abi("adb"))
+    assert out["ok"] is True
+    assert out["abi"] == "arm64-v8a"
+    assert out["frida_arch"] == "android-arm64"
+    assert out["error"] is None
+
+
+def test_probe_device_cpu_abi_x86_64(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Intel HAXM emulator → ``android-x86_64``."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"x86_64\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_device_cpu_abi("adb"))
+    assert out["ok"] is True
+    assert out["abi"] == "x86_64"
+    assert out["frida_arch"] == "android-x86_64"
+
+
+def test_probe_device_cpu_abi_armv7(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy 32-bit ARM device → ``android-arm`` (Frida only ships one 32-bit ARM build)."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"armeabi-v7a\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_device_cpu_abi("adb"))
+    assert out["ok"] is True
+    assert out["abi"] == "armeabi-v7a"
+    assert out["frida_arch"] == "android-arm"
+
+
+def test_probe_device_cpu_abi_unknown_abi(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unrecognised ABI → ABI surfaced but ``frida_arch`` is None and ``ok`` is False."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"riscv64\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_device_cpu_abi("adb"))
+    assert out["ok"] is False
+    assert out["abi"] == "riscv64"
+    assert out["frida_arch"] is None
+    assert out["error"] is not None
+    assert "riscv64" in out["error"]
+
+
+def test_probe_device_cpu_abi_no_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """adb errors (no device) → ok=False, abi=None, error forwarded."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(1, b"", b"adb: no devices/emulators found\n")}),
+    )
+    out = asyncio.run(hp.probe_device_cpu_abi("adb"))
+    assert out["ok"] is False
+    assert out["abi"] is None
+    assert out["frida_arch"] is None
+    assert out["error"] is not None
+
+
+# ---------------------------------------------------------------------------
 # Ollama probes
 
 

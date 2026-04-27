@@ -408,8 +408,18 @@ explicitly rather than re-litigating the safety surface.
   build for the device's arch + Frida version, which varies per OEM /
   Magisk / userspace-gadget configurations and is genuinely complex. v2 may
   revisit if operator demand justifies it; until then the Settings card is
-  the only mitigation and the README pointer to `frida-server` install docs
-  is the documented escape hatch.
+  the primary mitigation. As of the post-v1 polish pass the card now also
+  surfaces an **ABI-aware install playbook** (`<FridaServerInstallHint>`)
+  when `running` is False: `probe_device_cpu_abi` reads
+  `getprop ro.product.cpu.abi` over adb and maps it through a fixed
+  `_ABI_TO_FRIDA_ARCH` table to the Frida release-filename arch suffix
+  (`arm64-v8a → android-arm64`, etc.); the hint then synthesises the exact
+  download URL (host `frida` CLI version + arch) and prints copy-pasteable
+  commands for download → decompress → push → start → verify. This is
+  **operator guidance only** — the workbench still does not run any of
+  those commands itself. The README pointer remains the documented
+  escape hatch when the synthesised hint isn't applicable (unmapped ABI,
+  missing host CLI, custom ROMs, Magisk modules, etc.).
 
 **No device-touching code in the default `pytest` suite:**
 - Real `frida` Python imports happen only inside the `_frida_python()` seam.
@@ -557,15 +567,20 @@ place without cross-referencing five DEC-023 sub-bullets.
 - **Operator-managed `frida-server` posture (unchanged from 4.3 — no
   auto-push, no auto-pull):** Hook Lab v1 still does **not** push, start,
   stop, or update `frida-server` on the device. Same posture as `adb` /
-  `jadx` / `apktool` / Ollama. The two readiness probes shipped in 4.3
-  (`probe_frida_server` + `probe_frida_version_skew`) remain the only
+  `jadx` / `apktool` / Ollama. The readiness probes shipped in 4.3
+  (`probe_frida_server` + `probe_frida_version_skew`) remain the
   visibility surface — the README points operators at upstream
   `frida-server` install docs, and the Settings → Status card surfaces
   device state in `tools.frida_server` (yellow on missing, red on major
-  version skew). v2 may revisit auto-provisioning if operator demand
-  justifies the per-OEM / Magisk / userspace-gadget complexity; v1
-  closes with the explicit position that this is *not* a missing feature
-  but a deliberate trust-boundary choice.
+  version skew). The post-v1 polish pass added a third probe
+  (`probe_device_cpu_abi`) and an ABI-aware install playbook on the
+  same card; the playbook is **operator guidance only** — the
+  synthesised commands are rendered as copy-pasteable `<code>` blocks
+  with a click-to-copy button, never executed by the workbench. v2 may
+  revisit auto-provisioning if operator demand justifies the per-OEM /
+  Magisk / userspace-gadget complexity; v1 closes with the explicit
+  position that this is *not* a missing feature but a deliberate
+  trust-boundary choice.
 - **LLM-tier `generate_frida_hook` is structurally prep-only (4.7 — first
   consumer of DEC-022's `requires_confirmation=True`):** the skill calls
   `frida_hooks.render_by_id` and returns rendered JS + deterministic

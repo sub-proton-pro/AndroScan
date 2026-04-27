@@ -2709,6 +2709,115 @@ code { color: var(--accent); }
   font-style: italic;
 }
 
+/* ABI-aware frida-server install playbook (Settings → Status card).
+ * Rendered inside the existing .status-card-actions slot when the
+ * device half is down — a collapsible <details> with copy-pasteable
+ * commands. Kept compact so it doesn't dominate the card grid. */
+.frida-install-hint {
+  width: 100%;
+  font-size: 0.72rem;
+}
+
+.frida-install-hint summary {
+  cursor: pointer;
+  color: var(--accent);
+  user-select: none;
+  padding: 2px 0;
+}
+
+.frida-install-hint summary:hover {
+  filter: brightness(1.15);
+}
+
+.frida-install-hint[open] summary {
+  margin-bottom: 6px;
+}
+
+.frida-install-body {
+  border-left: 2px solid var(--border);
+  padding: 4px 0 4px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.frida-install-detect {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.frida-install-detect code {
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 0.95em;
+}
+
+.frida-install-detect a {
+  color: var(--accent);
+}
+
+.frida-install-warn {
+  color: var(--warn);
+}
+
+.frida-install-steps {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.frida-install-steps li {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.frida-install-step-label {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.frida-install-cmd {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.frida-install-cmd code {
+  flex: 1;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg);
+  background: transparent;
+  font-size: 0.7rem;
+}
+
+.frida-install-copy-btn {
+  flex-shrink: 0;
+  font-size: 0.65rem;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg, var(--bg));
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.frida-install-copy-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .diag-json {
   background: var(--bg);
   border: 1px solid var(--border);

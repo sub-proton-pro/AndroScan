@@ -46,6 +46,7 @@ from androscan.web.health_probes import (
     probe_disk,
     probe_embed_provider,
     probe_foreground_activity,
+    probe_device_cpu_abi,
     probe_frida_server,
     probe_frida_version,
     probe_frida_version_skew,
@@ -106,6 +107,13 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
     apktool_p = probe_apktool_version(getattr(config, "apktool_cmd", "apktool"))
     frida_p = probe_frida_version("frida")
     frida_server_p = probe_frida_server("adb")
+    # Always probe the device ABI in parallel — used by the Settings
+    # tab's frida-server card to synthesise an ABI-aware install
+    # playbook when the on-device server isn't running. Cheap when no
+    # device is attached (fails fast with the same SHORT_TIMEOUT_SEC as
+    # the other adb probes), so we don't bother gating it on
+    # ``probe_adb_device``.
+    abi_p = probe_device_cpu_abi("adb")
     device_p = probe_adb_device()
     ollama_p = probe_ollama_tags(getattr(config, "ollama_base_url", "http://localhost:11434"))
     embed_p = probe_embed_provider(
@@ -114,8 +122,8 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
         getattr(config, "ollama_base_url", "http://localhost:11434"),
     )
 
-    (adb_v, jadx_v, apktool_v, frida_v, frida_server_v, device_v, ollama_t, embed_s) = await asyncio.gather(
-        adb_p, jadx_p, apktool_p, frida_p, frida_server_p, device_p, ollama_p, embed_p,
+    (adb_v, jadx_v, apktool_v, frida_v, frida_server_v, device_v, ollama_t, embed_s, abi_v) = await asyncio.gather(
+        adb_p, jadx_p, apktool_p, frida_p, frida_server_p, device_p, ollama_p, embed_p, abi_p,
         return_exceptions=False,
     )
 
@@ -190,6 +198,12 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
                 "device_version": skew_v.get("device_version"),
                 "version_skew": skew_v.get("severity"),
                 "error": frida_server_v.get("error") or skew_v.get("error"),
+                # Device ABI + Frida release-arch suffix so the Settings
+                # card can synthesise an install playbook when the
+                # server isn't running. Both are ``null`` when no device
+                # is attached or the ABI isn't in our mapping table.
+                "device_abi": abi_v.get("abi"),
+                "frida_arch": abi_v.get("frida_arch"),
             },
         },
         "device": {

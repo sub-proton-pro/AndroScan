@@ -55,6 +55,14 @@ def client(cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Test
         # need to think about adb at all).
         return {"ok": False, "running": False, "pid": None,
                 "error": "frida-server not running on device"}
+    async def _abi_arm64(*a, **kw):
+        # Default fixture: pretend the attached emulator reports the
+        # standard 64-bit ARM ABI so the frida-server install playbook
+        # is fully populated (matches the real device used during
+        # development; tests that need the "unknown ABI" or "no device"
+        # paths override via monkeypatch).
+        return {"ok": True, "abi": "arm64-v8a", "frida_arch": "android-arm64",
+                "error": None}
     # Patch via the *consumer* module — status_routes binds the names at
     # import time, so patching the producer module wouldn't take effect.
     from androscan.web import status_routes as sr
@@ -64,6 +72,7 @@ def client(cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Test
     monkeypatch.setattr(sr, "probe_apktool_version", _missing)
     monkeypatch.setattr(sr, "probe_frida_version", _missing)
     monkeypatch.setattr(sr, "probe_frida_server", _frida_server_off)
+    monkeypatch.setattr(sr, "probe_device_cpu_abi", _abi_arm64)
     monkeypatch.setattr(sr, "probe_adb_device", _device_ok)
     monkeypatch.setattr(sr, "probe_uiautomator_dump", _empty_dump)
     monkeypatch.setattr(sr, "probe_foreground_activity", _fg)
@@ -353,15 +362,17 @@ def test_global_status_exposes_frida_server_card_contract(client: TestClient) ->
 
     The frontend (`src/api/status.ts` ``GlobalStatus.tools.frida_server``)
     relies on this exact field set: ``ok``, ``label``, ``running``, ``pid``,
-    ``host_version``, ``device_version``, ``version_skew``, ``error``.
-    Locking the keys here means any backend rename that drifts the contract
-    breaks pytest before it ever ships to the UI.
+    ``host_version``, ``device_version``, ``version_skew``, ``error``,
+    ``device_abi``, ``frida_arch``. Locking the keys here means any
+    backend rename that drifts the contract breaks pytest before it
+    ever ships to the UI.
     """
     body = client.get("/api/status/global").json()
     card = body["tools"]["frida_server"]
     expected_keys = {
         "ok", "label", "running", "pid",
         "host_version", "device_version", "version_skew", "error",
+        "device_abi", "frida_arch",
     }
     assert expected_keys.issubset(card.keys()), (
         f"missing keys: {expected_keys - card.keys()}"
@@ -373,6 +384,53 @@ def test_global_status_exposes_frida_server_card_contract(client: TestClient) ->
     assert card["version_skew"] is None
     assert card["label"] == "frida-server (device)"
     assert "frida-server" in (card["error"] or "")
+    # Default fixture pretends an arm64 emulator is attached, so the
+    # install playbook fields must be populated and self-consistent.
+    assert card["device_abi"] == "arm64-v8a"
+    assert card["frida_arch"] == "android-arm64"
+
+
+def test_global_status_frida_server_card_unknown_abi(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unmapped device ABI → ``device_abi`` surfaced but ``frida_arch`` is null.
+
+    The Settings tab uses ``frida_arch is None`` as the gate for "we
+    can't synthesise a download URL — link the operator to the releases
+    page directly". Locking the contract so the UI degrades gracefully.
+    """
+    from androscan.web import status_routes as sr
+    from androscan.web.status_routes import invalidate_status_cache
+
+    async def _exotic_abi(*a, **kw):
+        return {"ok": False, "abi": "riscv64", "frida_arch": None,
+                "error": "unknown ABI 'riscv64' (no Frida arch mapping)"}
+
+    monkeypatch.setattr(sr, "probe_device_cpu_abi", _exotic_abi)
+    invalidate_status_cache()
+
+    card = client.get("/api/status/global").json()["tools"]["frida_server"]
+    assert card["device_abi"] == "riscv64"
+    assert card["frida_arch"] is None
+
+
+def test_global_status_frida_server_card_no_device_abi(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No device attached → both ABI fields are null (not raising / 500-ing)."""
+    from androscan.web import status_routes as sr
+    from androscan.web.status_routes import invalidate_status_cache
+
+    async def _no_device_abi(*a, **kw):
+        return {"ok": False, "abi": None, "frida_arch": None,
+                "error": "adb: no devices/emulators found"}
+
+    monkeypatch.setattr(sr, "probe_device_cpu_abi", _no_device_abi)
+    invalidate_status_cache()
+
+    card = client.get("/api/status/global").json()["tools"]["frida_server"]
+    assert card["device_abi"] is None
+    assert card["frida_arch"] is None
 
 
 def test_global_status_frida_server_card_running_with_skew(

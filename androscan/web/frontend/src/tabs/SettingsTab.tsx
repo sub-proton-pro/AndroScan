@@ -692,22 +692,7 @@ function StatusPanel() {
             <StatusCardView card={globalStatus.tools.jadx} />
             <StatusCardView card={globalStatus.tools.apktool} />
             <StatusCardView card={globalStatus.tools.frida} />
-            <StatusCardView card={globalStatus.tools.frida_server} extras={[
-              globalStatus.tools.frida_server.running
-                ? `pid ${globalStatus.tools.frida_server.pid ?? "?"}`
-                : "not running",
-              globalStatus.tools.frida_server.device_version
-                ? `device ${globalStatus.tools.frida_server.device_version}`
-                : "",
-              globalStatus.tools.frida_server.host_version
-                ? `host ${globalStatus.tools.frida_server.host_version}`
-                : "",
-              globalStatus.tools.frida_server.version_skew === "major"
-                ? "version skew: major (incompatible)"
-                : globalStatus.tools.frida_server.version_skew === "minor"
-                ? "version skew: minor"
-                : "",
-            ]}/>
+            <FridaServerStatusCard card={globalStatus.tools.frida_server} />
             <StatusCardView card={globalStatus.device} extras={[
               globalStatus.device.connected
                 ? `state: ${globalStatus.device.state ?? "unknown"}`
@@ -1003,6 +988,178 @@ function CallGraphStatusCard({
         </>
       }
     />
+  );
+}
+
+/**
+ * Hook Lab readiness card — wraps the generic ``StatusCardView`` with an
+ * ABI-aware install playbook for ``frida-server`` (DEC-023 follow-up).
+ *
+ * When the on-device server isn't running, the card adds a collapsible
+ * `<details>` block with the exact download URL + push / install / verify
+ * commands the operator needs. The download URL is synthesised from
+ * (a) the host frida CLI version returned by the backend (so the device
+ * binary will match the host wire-protocol — same major.minor avoids the
+ * "version skew: major" failure mode the card already warns about) and
+ * (b) the device ABI from ``getprop ro.product.cpu.abi`` mapped to the
+ * Frida release filename arch suffix (``arm64-v8a → android-arm64``,
+ * etc.). When the ABI is unmapped or no device is attached, we degrade
+ * gracefully: link the operator to the releases page rather than build
+ * a broken URL.
+ *
+ * Each command is rendered with a tiny "copy" button next to it
+ * (``navigator.clipboard.writeText``) so operators can paste straight
+ * into a terminal — preferred over per-line install scripts because the
+ * commands need to interleave with their own checks (e.g. ``adb root``
+ * succeeded before ``chmod``).
+ *
+ * Card stays green when the server is running — the playbook is hidden.
+ */
+function FridaServerStatusCard({
+  card,
+}: {
+  card: GlobalStatus["tools"]["frida_server"];
+}) {
+  const extras: (string | undefined)[] = [
+    card.running ? `pid ${card.pid ?? "?"}` : "not running",
+    card.device_version ? `device ${card.device_version}` : "",
+    card.host_version ? `host ${card.host_version}` : "",
+    card.device_abi ? `abi ${card.device_abi}` : "",
+    card.version_skew === "major"
+      ? "version skew: major (incompatible)"
+      : card.version_skew === "minor"
+      ? "version skew: minor"
+      : "",
+  ];
+
+  // Only surface the install hint when the device half is down. When
+  // running we keep the card terse — the existing version-skew badge
+  // already handles the "running but mismatched" case.
+  const hint = !card.running ? <FridaServerInstallHint card={card} /> : null;
+
+  return <StatusCardView card={card} extras={extras} actions={hint} />;
+}
+
+/**
+ * Install playbook details — only rendered when ``frida-server`` isn't
+ * running. Synthesises the download URL when we have both the host
+ * version and a known device ABI; otherwise points at the releases
+ * page. Push path follows Frida's documented convention
+ * (``/data/local/tmp/frida-server``); ``adb root`` is included because
+ * the standard AOSP / Android Studio emulator images need it for the
+ * background-fork to actually keep the server alive.
+ */
+function FridaServerInstallHint({
+  card,
+}: {
+  card: GlobalStatus["tools"]["frida_server"];
+}) {
+  const version = card.host_version ?? null;
+  const fridaArch = card.frida_arch ?? null;
+  const abi = card.device_abi ?? null;
+
+  // When we have both halves, build the canonical filename + URL the
+  // operator would paste into curl / their browser. The URL pattern is
+  // the one Frida advertises on
+  // https://github.com/frida/frida/releases — releases are uploaded
+  // there with the exact ``frida-server-X.Y.Z-android-<arch>.xz`` shape.
+  const filename = version && fridaArch
+    ? `frida-server-${version}-android-${fridaArch.replace(/^android-/, "")}.xz`
+    : null;
+  const downloadUrl = version && fridaArch
+    ? `https://github.com/frida/frida/releases/download/${version}/${filename}`
+    : null;
+  const releaseTagUrl = version
+    ? `https://github.com/frida/frida/releases/tag/${version}`
+    : "https://github.com/frida/frida/releases/latest";
+
+  // Strip the trailing ``.xz`` for the push step — operators decompress
+  // first. Falls back to a placeholder when the version/arch isn't
+  // known, but the placeholder is still copy-pasteable as a template.
+  const decompressed = filename ? filename.replace(/\.xz$/, "") : "frida-server-<version>-android-<arch>";
+
+  return (
+    <details className="frida-install-hint">
+      <summary>How to install <code>frida-server</code> on the device</summary>
+      <div className="frida-install-body">
+        <p className="frida-install-detect">
+          {abi ? <>Detected device ABI: <code>{abi}</code>{fridaArch ? <> → Frida release arch <code>{fridaArch}</code></> : null}.</> : <>No device detected — start an emulator (or attach a device) and refresh, then come back here for an ABI-aware playbook.</>}
+          {version ? <> Match host CLI: <code>frida {version}</code> (same major.minor avoids the "version skew" warning).</> : null}
+        </p>
+        {!fridaArch && abi && (
+          <p className="frida-install-detect frida-install-warn">
+            We don't have a Frida arch mapping for <code>{abi}</code> — pick the closest match by hand from the <a href={releaseTagUrl} target="_blank" rel="noopener noreferrer">releases page</a>.
+          </p>
+        )}
+        <ol className="frida-install-steps">
+          <li>
+            <span className="frida-install-step-label">Download the matching release binary</span>
+            {downloadUrl ? (
+              <FridaInstallCmd cmd={`curl -L -o ${filename} ${downloadUrl}`} />
+            ) : (
+              <p className="frida-install-detect">
+                Browse <a href={releaseTagUrl} target="_blank" rel="noopener noreferrer">{releaseTagUrl}</a> and download the asset whose filename starts with <code>frida-server-</code> and ends with <code>-android-&lt;arch&gt;.xz</code>.
+              </p>
+            )}
+          </li>
+          <li>
+            <span className="frida-install-step-label">Decompress (host-side, one-time)</span>
+            <FridaInstallCmd cmd={`xz -d ${filename ?? decompressed + ".xz"}`} />
+          </li>
+          <li>
+            <span className="frida-install-step-label">Push to the device</span>
+            <FridaInstallCmd cmd={`adb push ${decompressed} /data/local/tmp/frida-server`} />
+          </li>
+          <li>
+            <span className="frida-install-step-label">Make it executable & start it (root needed; emulators run as root)</span>
+            <FridaInstallCmd cmd={`adb root`} />
+            <FridaInstallCmd cmd={`adb shell "chmod 755 /data/local/tmp/frida-server"`} />
+            <FridaInstallCmd cmd={`adb shell "/data/local/tmp/frida-server &" >/dev/null 2>&1 &`} />
+          </li>
+          <li>
+            <span className="frida-install-step-label">Verify it's running</span>
+            <FridaInstallCmd cmd={`adb shell pidof frida-server`} />
+            <p className="frida-install-detect">
+              A non-empty PID means the device half is up — refresh this page and the card should turn green.
+            </p>
+          </li>
+        </ol>
+      </div>
+    </details>
+  );
+}
+
+/**
+ * One install command rendered with a click-to-copy affordance. Keeps
+ * the playbook readable (each command is its own line, monospaced)
+ * without forcing operators to triple-click-select.
+ */
+function FridaInstallCmd({ cmd }: { cmd: string }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(cmd);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Clipboard API may be unavailable (insecure context, sandboxed
+      // browser, etc.) — fall back to a no-op + brief flash so the
+      // operator can still triple-click-select the rendered <code>.
+      setCopied(false);
+    }
+  };
+  return (
+    <div className="frida-install-cmd">
+      <code>{cmd}</code>
+      <button
+        type="button"
+        className="frida-install-copy-btn"
+        onClick={onCopy}
+        title="Copy command to clipboard"
+      >
+        {copied ? "copied" : "copy"}
+      </button>
+    </div>
   );
 }
 

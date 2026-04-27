@@ -17,6 +17,10 @@ Categories
 * Device reachability (``probe_adb_device``) — gates the per-app device
   probes so we don't fan out 5 doomed adb-shell calls when no emulator is
   attached.
+* Device CPU ABI (``probe_device_cpu_abi``) — surfaces the
+  ``ro.product.cpu.abi`` value plus its mapping to the Frida release
+  filename arch suffix so the Settings tab can render an ABI-aware
+  ``frida-server`` install playbook.
 * Network services (``probe_ollama_tags`` / ``probe_ollama_embed_model``).
 * Embed provider (``probe_fastembed_available`` / ``probe_embed_provider``).
 * Filesystem (``probe_disk`` / ``probe_path_writable``).
@@ -239,6 +243,68 @@ async def probe_frida_server(
         "running": running,
         "pid": pid,
         "error": None if running else ((err or "").strip()[:300] or "frida-server not running on device"),
+    }
+
+
+# Mapping from Android primary ABI (``ro.product.cpu.abi``) to the
+# architecture suffix used by Frida release filenames
+# (``frida-server-X.Y.Z-android-<ARCH>.xz`` on
+# https://github.com/frida/frida/releases). Used by the Settings tab to
+# synthesise an ABI-aware install playbook when ``frida-server`` isn't
+# running on the device. ``armeabi`` (legacy 32-bit ARM v5/v6) maps to
+# the same Frida arch as ``armeabi-v7a`` because Frida only ships an
+# ``android-arm`` binary for 32-bit ARM.
+_ABI_TO_FRIDA_ARCH: dict[str, str] = {
+    "arm64-v8a": "android-arm64",
+    "armeabi-v7a": "android-arm",
+    "armeabi": "android-arm",
+    "x86_64": "android-x86_64",
+    "x86": "android-x86",
+}
+
+
+async def probe_device_cpu_abi(
+    adb_cmd: str = "adb",
+    timeout: float = SHORT_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    """Read the device's primary ABI via ``getprop ro.product.cpu.abi``.
+
+    Used by the Settings tab's ``frida-server`` card to synthesise an
+    ABI-aware install playbook (download URL + push / install / verify
+    commands) when the on-device server isn't running. We deliberately
+    keep this as its own probe rather than folding it into
+    :func:`probe_frida_server` so the aggregator can still know the
+    device ABI even on a green card — useful for diagnostics and for a
+    future "the device ABI changed since the last run" warning.
+
+    Returns ``{ok, abi, frida_arch, error}``. ``frida_arch`` is the
+    suffix used in Frida release filenames (e.g. ``android-arm64`` for
+    ``arm64-v8a``); it is ``None`` when the ABI is not in our mapping
+    table (in which case ``error`` carries the unmapped ABI string so
+    the UI can degrade to "see https://github.com/frida/frida/releases"
+    instead of a synthesised download link). Probe never raises;
+    ``ok=False`` whenever we couldn't read the ABI off the device for
+    any reason — the UI's hint render checks ``device_abi`` directly
+    rather than relying on ``ok``.
+    """
+    rc, out, err = await _run(
+        adb_cmd, "shell", "getprop", "ro.product.cpu.abi", timeout=timeout
+    )
+    abi = (out or "").strip() or None
+    if rc != 0 or not abi:
+        return {
+            "ok": False,
+            "abi": None,
+            "frida_arch": None,
+            "error": (err or out or "could not read ro.product.cpu.abi").strip()[:300] or "no device",
+        }
+    frida_arch = _ABI_TO_FRIDA_ARCH.get(abi)
+    return {
+        "ok": frida_arch is not None,
+        "abi": abi,
+        "frida_arch": frida_arch,
+        "error": None if frida_arch is not None
+                 else f"unknown ABI {abi!r} (no Frida arch mapping)",
     }
 
 

@@ -47,6 +47,17 @@ export type GlobalStatus = {
       host_version: string | null;
       device_version: string | null;
       version_skew: null | "minor" | "major";
+      /**
+       * Device CPU ABI from ``getprop ro.product.cpu.abi`` (e.g.
+       * ``"arm64-v8a"``) and its mapping to the Frida release
+       * filename arch suffix (``"android-arm64"``). Both ``null``
+       * when no device is attached; ``frida_arch`` may also be
+       * ``null`` for ABIs we don't have a mapping for (in which
+       * case the install hint links to the releases page rather
+       * than synthesising a download URL).
+       */
+      device_abi: string | null;
+      frida_arch: string | null;
     };
   };
   device: StatusCard & {
