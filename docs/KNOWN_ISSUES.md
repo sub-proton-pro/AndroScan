@@ -319,6 +319,27 @@ Use the following format for new entries:
 
 ---
 
+### ISSUE-011: FastAPI `@app.on_event("shutdown")` is deprecated
+- status: Open
+- impact: Low
+- area: web / FastAPI compatibility
+- introduced / observed: 2026-04-27 (surfaced in `tests/test_frida_routes.py` under FastAPI 0.110+; the call site itself landed in Hook Lab 4.3 with `detach_all()` on uvicorn shutdown — `androscan/web/app.py:854`)
+- summary:
+  `androscan/web/app.py` registers a `@app.on_event("shutdown")` handler that calls `FridaClient.detach_all()` so live Frida sessions are cleanly torn down on uvicorn stop. FastAPI emits a `DeprecationWarning` per registered handler (currently 24 warnings × 2 handlers across `tests/test_frida_routes.py`'s `TestClient` instantiations) — the recommended replacement is a `lifespan=…` async context manager passed to `FastAPI(...)`. Functionally fine today; the warning is a pure DeprecationWarning, not a behaviour change.
+- why it matters:
+  Pure tech-debt: the warnings clutter test output and a future FastAPI major bump may eventually drop `on_event` entirely. There is no functional impact on session cleanup right now.
+- current workaround:
+  None needed — the shutdown hook still fires and `detach_all()` runs as designed. Test output is noisy but not failing.
+- recommended fix:
+  Single-shot conversion of the existing `@app.on_event("startup")` / `@app.on_event("shutdown")` handlers in `androscan/web/app.py` to a `lifespan=…` async context manager passed to `FastAPI(...)`. Net change is small (~20 lines), but it is its own atomic refactor — better tracked as a standalone task than folded into a Hook Lab sub-step (Hook Lab 4.6+ keeps a clean, focused diff). Land alongside Hook Lab 4.8's docs sweep or any future "FastAPI compatibility" sweep, whichever comes first.
+- related tasks:
+  - `docs/TASKS.md` (no dedicated row yet; capture as a P3 cleanup when it surfaces again)
+- related docs:
+  - `androscan/web/app.py` (`@app.on_event("shutdown")` at line ~854; mirror logcat WS pattern when refactoring)
+  - https://fastapi.tiangolo.com/advanced/events/ (lifespan context manager pattern)
+
+---
+
 ## 7. Accepted limitations
 
 Use this section for limitations that are currently acceptable and not immediate defects.
