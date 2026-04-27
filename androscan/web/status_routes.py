@@ -236,6 +236,39 @@ def _rag_card(app_dir: Path, decompile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _call_graph_card(app_dir: Path, decompile: dict[str, Any]) -> dict[str, Any]:
+    """Wrap the static-call-graph status into a card.
+
+    Parallels :func:`_rag_card` — same "wait for decompile, then surface
+    the sub-index's status" contract. Kept as a separate card rather than
+    folded into ``rag`` because the two indexes have independent lifecycles
+    (one can be ready while the other is still pending / failed).
+    """
+    sha = decompile.get("sha")
+    if not sha or decompile.get("status") != "ready":
+        return {
+            "ok": False,
+            "label": "Call graph",
+            "status": "missing",
+            "hint": "build decompile cache first",
+            "error": None,
+        }
+    cache_dir = decompile_cache_root(app_dir, sha)
+    from androscan.analysis.call_graph import get_status as cg_status
+    st = cg_status(cache_dir).to_dict()
+    return {
+        "ok": st.get("status") == "ready",
+        "label": "Call graph",
+        **st,
+        "hint": {
+            "missing":  "auto-build kicks in after decompile completes; or POST /api/graph/{app_id}/rebuild",
+            "pending":  "apktool/parser worker is running…",
+            "failed":   "see error; check apktool is on PATH",
+            "ready":    None,
+        }.get(st.get("status"), None),
+    }
+
+
 def _meta_card(app_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return ``(meta_dict, card_dict)`` derived from ``app_meta.json``."""
     meta = load_app_meta(app_dir) or {}
@@ -290,6 +323,7 @@ async def _gather_per_app(app_dir: Path, app_id: str) -> dict[str, Any]:
 
     decompile_card = _decompile_card(app_dir)
     rag_card = _rag_card(app_dir, decompile_card)
+    call_graph_card = _call_graph_card(app_dir, decompile_card)
 
     device = await probe_adb_device()
     device_reason = device.get("error") or "no device attached"
@@ -360,6 +394,7 @@ async def _gather_per_app(app_dir: Path, app_id: str) -> dict[str, Any]:
         "meta": meta_card,
         "decompile": decompile_card,
         "rag": rag_card,
+        "call_graph": call_graph_card,
         "device": device_block,
         "overrides": {
             "ok": True,

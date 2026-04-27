@@ -32,6 +32,10 @@ from androscan.web.decompile_cache import (
 from androscan.skills.resolve_ui_element import resolve as resolve_ui_element
 from androscan.web.inspect_map import map_tap_to_code
 from androscan.web.paths import apps_root, read_json, safe_child
+from androscan.web.graph_routes import (
+    build_graph_router,
+    schedule_call_graph_build_after_decompile,
+)
 from androscan.web.rag_routes import build_rag_router, schedule_rag_build_after_decompile
 from androscan.web.settings_routes import build_settings_router
 from androscan.web.status_routes import build_status_router
@@ -297,8 +301,9 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
         jadx_cmd = getattr(config, "jadx_cmd", "jadx") or "jadx"
         app_dir = _app_dir(app_id)
 
-        # Chain RAG build: jadx success -> embed + persist SQLite index.
-        # Failure is logged inside the RAG worker; never bubbles up here.
+        # Chain RAG build + static call-graph build after jadx success.
+        # Both auto-builders are best-effort — failures log but never
+        # bubble up to the HTTP caller.
         def _on_decompile_done(success: bool) -> None:
             if not success:
                 return
@@ -306,14 +311,23 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
                 schedule_rag_build_after_decompile(app_dir, config)
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("RAG auto-build hookup failed: %s", e)
+            try:
+                schedule_call_graph_build_after_decompile(app_dir, config)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("call-graph auto-build hookup failed: %s", e)
 
         result = start_decompile(app_dir, jadx_cmd=jadx_cmd, on_done=_on_decompile_done)
-        # If the cache was already ready from a previous run, kick the index now too.
+        # If the cache was already ready from a previous run, kick the
+        # downstream indexers now too.
         if result.get("status") == "ready":
             try:
                 schedule_rag_build_after_decompile(app_dir, config)
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("RAG auto-build (cached decompile) failed: %s", e)
+            try:
+                schedule_call_graph_build_after_decompile(app_dir, config)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("call-graph auto-build (cached decompile) failed: %s", e)
         return result
 
     @app.get("/api/code/{app_id}/tree")
@@ -797,6 +811,7 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
         )
 
     app.include_router(build_rag_router(config, _app_dir))
+    app.include_router(build_graph_router(config, _app_dir))
     app.include_router(
         build_status_router(
             config_provider=_current_config,
