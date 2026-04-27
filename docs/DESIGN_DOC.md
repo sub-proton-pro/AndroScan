@@ -361,19 +361,19 @@ Skills use a three-tier model: **pipeline** (orchestration only: extract_manifes
 
 **Deliverables (target):** `POST /api/tap`, `GET /api/source/{class}`; optional LLM-assisted fallback; new **llm** skill `resolve_ui_element` (catalog + tests). Deterministic path preferred; LLM is advisory when tracing is ambiguous.
 
-### Phase 8 — Static call graph from Smali
+### Phase 8 — Static call graph from Smali  *(landed 2026-04-27 via Hook Lab v1)*
 
-**Goal:** Offline graph from apktool Smali: methods as nodes, `invoke-*` as edges; optional class hierarchy; artifact `apps/<app_id>/call_graph.json`; graph APIs for neighbors/paths and LLM-assisted queries; Cytoscape.js in the UI.
+**Goal:** Offline graph from apktool Smali: methods as nodes, `invoke-*` as edges; optional class hierarchy; graph APIs for neighbors/paths and LLM-assisted queries; Cytoscape.js in the UI.
 
-**Deliverables (target):** `androscan/analysis/` (or equivalent) builder; paginated/filtered `GET /api/graph/...`; new **llm** skill `query_call_graph` for subgraph + question → candidate paths (validated against graph where possible).
+**Status:** Landed in **Hook Lab v1** sub-steps **4.1** (Smali parser + dispatch resolver + per-app SQLite store + REST routes) and **4.2** (Cytoscape pane with package-overview / focus-subgraph layouts + click-to-source). DEC-016 was amended to switch the call-graph store from a single `apps/<app_id>/call_graph.json` to per-app SQLite at `apps/<app_id>/.decompiled/<sha>/call_graph.sqlite` (schema_version 1). Routes shipped: `GET /api/graph/{app_id}` (paginated), `GET /api/graph/{app_id}/neighbors/{node_ref}`, `GET /api/graph/{app_id}/paths`, `GET /api/graph/{app_id}/status`, `POST /api/graph/{app_id}/rebuild`. The LLM-assisted query path is the **`query_call_graph`** llm-tier skill (sub-step 4.7 — `overview` / `neighbors` / `paths` modes with parameter clamping; fail-open when the cache is unbuilt). See `docs/STATE.md` (Hook Lab 4.1, 4.2, 4.7) for the as-built reality.
 
-### Phase 9 — Frida integration
+### Phase 9 — Frida integration  *(landed 2026-04-27 via Hook Lab v1)*
 
-**Goal:** Attach to package on device/emulator; load parameterized hook scripts; stream trace events to UI; optional integration with exploit verification (new signal type e.g. `frida_trace` in `vuln_module_skills_signals.json`).
+**Goal:** Attach to package on device/emulator; load parameterized hook scripts; stream trace events to UI; gate LLM-generated hooks behind operator confirmation; show live hits on the call graph.
 
-**Deliverables (target):** Frida adapter behind tool-adapter boundaries; hook template library; user confirmation before deploying LLM-generated hooks; new **llm** skill `generate_frida_hook`; tests use mocks; device tests opt-in.
+**Status:** Landed in **Hook Lab v1** sub-steps **4.3** (headless Frida adapter behind a single import seam; readiness probes for `frida-server` + version-skew), **4.4** + **4.6** (hook template library — `entry_exit_log`, `ssl_pinning_bypass`, `crypto`, `shared_preferences`, `intent`, `scope_inspector`; locked renderer contract; fail-closed registry walk), **4.5** (Stage→Inject UI with `pyjsparser` pre-validation, WS trace, JSONL persistence at `apps/<app_id>/<run_ts>/frida/<session>.jsonl`, per-app `hook_target_package_prefix` server-side allowlist, **403 hook_blocked** when violated), **4.7** (`generate_frida_hook` llm-tier skill — first consumer of DEC-022's `SkillMeta.requires_confirmation=True` consent class; render-only, never injects), and **4.8** (live Cytoscape overlay — fired methods render in bold cyan with hit counts on hover; static = muted grey per DEC-023). Optional integration with exploit verification (new `frida_trace` signal type) is **deferred** beyond v1; v1 surfaces the trace through the Hook Lab tab only. Modify-return / mutation hooks, self-hosted Monaco (ISSUE-010), and `frida-server` auto-provisioning are **explicitly out of scope** for v1 (`frida-server` is operator-managed by design — same posture as `adb` / `jadx` / `apktool`). See `docs/STATE.md` Hook Lab 4.1–4.8 sub-bullets and `docs/DECISIONS.md` DEC-023 for the as-built reality + rationale.
 
-**Full sub-task checklists:** `docs/TASKS.md` § Interactive RE Workbench.
+**Full sub-task checklists:** `docs/TASKS.md` § Interactive RE Workbench → § Hook Lab v1 — sub-step backlog (now flagged "v1 complete").
 
 ---
 

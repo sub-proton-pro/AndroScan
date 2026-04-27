@@ -340,6 +340,29 @@ Use the following format for new entries:
 
 ---
 
+### ISSUE-012: Frida overlay aggregates hits across method overloads
+- status: Open (intentional v1 trade-off — captured for v2 follow-up)
+- impact: Low
+- area: web / Hook Lab / call-graph overlay
+- introduced / observed: 2026-04-27 (sub-step 4.8 — Frida overlay on call graph)
+- summary:
+  The call graph keys nodes by `(class_name, method_name, descriptor)` (the full Smali signature is preserved on each node so `Foo.bar(String)` and `Foo.bar(int, String)` are distinct nodes). The Frida overlay's `hitsByMethod` prop, however, keys by `${class}::${method}` only — Frida's hook templates (`entry_exit_log`, `scope_inspector`, etc.) iterate `Java.use(class).method.overloads.forEach` and emit events with `{class, method}` only; the overload arity / descriptor isn't on the wire. Net effect: when *any* overload of `Foo.bar` fires, **every** node named `Foo.bar` in the graph (regardless of arity) lights up cyan with the same hit count. An operator looking at a hit on `Foo.bar(String)` cannot tell from the overlay alone whether it was the 1-arg or the 2-arg overload that actually fired.
+- why it matters:
+  For most v1 hook templates the operator's mental model is "I hooked `Foo.bar`" (the JS template's `Java.use(class)[method].overloads.forEach` makes that promise true at the runtime level), so over-attribution at the graph level matches the hook's own granularity. The caveat surfaces only on apps that have multiple overloads of the same method name — common enough in real Android apps (e.g. `String.format`, builder patterns) that an operator deep in the graph could mis-read attribution.
+- current workaround:
+  Cross-reference the overlay against the **Hooks panel** (sub-step 4.6) which renders one row per `(class, method)` plus per-overload context if the hook's payload includes args. The Trace WS / JSONL persistence carries the full args dict per event, so `apps/<app_id>/<run_ts>/frida/<session>.jsonl` is the durable record when per-overload attribution matters.
+- recommended fix:
+  Two-part change for v2: (1) extend `frida_hooks/entry_exit_log.py` (and `scope_inspector.py`) JS templates to emit `descriptor` (or `arity` + arg-type-list) in the payload — needs a wire-format bump in `_summarize_hooks`'s `(class, method)` group-by to `(class, method, descriptor)`; (2) update `CallGraphView.tsx`'s `hitKey` helper to take the descriptor as an optional third arg, and `HookLabTab.tsx`'s `useMemo` builder to populate it when present. Backwards-compatible default: if a hook event omits `descriptor`, fall back to the v1 `${class}::${method}` keying so old JSONL files replay correctly. Defer to Hook Lab v2 alongside per-overload hook-builder UI.
+- related tasks:
+  - `docs/TASKS.md` § Hook Lab v1 — sub-step backlog (v1 complete; capture as v2 follow-up when v2 backlog opens)
+- related docs:
+  - `docs/DECISIONS.md` DEC-023 (sub-step 4.8 specifics — "Method-overload precision caveat (intentional, documented in KNOWN_ISSUES ISSUE-012)")
+  - `androscan/web/frontend/src/components/CallGraphView.tsx` (`hitKey` helper + overlay element builders)
+  - `androscan/web/frontend/src/tabs/HookLabTab.tsx` (`hitsByMethod` `useMemo` derivation from `chatHooks`)
+  - `androscan/adapters/frida_hooks/entry_exit_log.py` / `scope_inspector.py` (hook templates emitting `{class, method}` only)
+
+---
+
 ## 7. Accepted limitations
 
 Use this section for limitations that are currently acceptable and not immediate defects.
@@ -356,15 +379,6 @@ Keep these explicit so they are not mistaken for bugs or forgotten assumptions.
   - `androscan/web/frontend/README.md`
   - `docs/DECISIONS.md` DEC-015
 
-### LIMIT-002: No static call graph or Frida in-repo yet
-- status: Accepted Limitation
-- reason: Phases 8–9 specify Smali-based graphs and Frida adapter; work not started.
-- impact: Medium for “interactive RE” vision only; static APK + LLM + ADB verification path remains the supported workflow.
-- revisit when: Phase 8 / Phase 9 implementation begins.
-- related docs:
-  - `docs/DESIGN_DOC.md` (Phases 8–9)
-  - `docs/DECISIONS.md` DEC-016, DEC-017
-
 ---
 
 ## 8. Resolved issues
@@ -379,7 +393,17 @@ Format:
 - resolution summary:
 - related tasks/docs:
 
-Leave empty until needed.
+### LIMIT-002: No static call graph or Frida in-repo yet
+- status: Resolved
+- resolved date: 2026-04-27 (Hook Lab v1 complete — sub-steps 4.1 → 4.8 all landed)
+- resolution summary:
+  Phases 8 (static call graph from Smali) and 9 (Frida integration) both landed in **Hook Lab v1** between April 25–27 2026. The static call graph ships as: Smali parser + virtual-dispatch resolver in `androscan/analysis/call_graph.py`, per-app SQLite store at `apps/<app_id>/.decompiled/<sha>/call_graph.sqlite` (DEC-016 amended by DEC-023 — the original `call_graph.json` blob clause was superseded), five REST routes (`GET /api/graph/{app_id}` + paginated neighbors / paths / status + `POST .../rebuild`), a Cytoscape.js pane in `CallGraphView.tsx` with package-overview / focus-subgraph layouts, and the `query_call_graph` LLM-tier skill (sub-step 4.7) for agentic graph queries. The Frida integration ships as: a headless adapter in `androscan/adapters/frida.py` behind a single import seam (`[frida]` extra is opt-in), six hook templates (`entry_exit_log`, `ssl_pinning_bypass`, `crypto`, `shared_preferences`, `intent`, `scope_inspector`) with deterministic pentester summaries, a Stage→Inject UI in `HookLabTab.tsx` with `pyjsparser`-driven JS pre-validation, WS trace + JSONL persistence to `apps/<app_id>/<run_ts>/frida/<session>.jsonl`, server-side `hook_target_package_prefix` allowlist (403 `hook_blocked` on violation), the `generate_frida_hook` LLM-tier skill (sub-step 4.7 — first real consumer of DEC-022's `requires_confirmation=True` consent class), and a live Cytoscape overlay (sub-step 4.8 — fired methods render in bold cyan with hit counts on hover; static = muted grey per DEC-023). Open follow-ups captured separately: ISSUE-010 (Monaco from CDN — air-gap), ISSUE-011 (FastAPI `on_event` deprecation — pure tech-debt), ISSUE-012 (Frida overlay aggregates hits across method overloads — intentional v1 trade-off, queued for v2). Free-form LLM JS, reflection-based dispatch, modify-return / mutation hooks, and `frida-server` auto-provisioning are explicitly v2 / v3 scope.
+- related tasks/docs:
+  - `docs/STATE.md` (Hook Lab 4.1 → 4.8 sub-bullets)
+  - `docs/TASKS.md` § Hook Lab v1 — sub-step backlog (v1 complete 2026-04-27)
+  - `docs/DESIGN_DOC.md` (Phases 8 + 9 — both annotated "landed 2026-04-27 via Hook Lab v1")
+  - `docs/DECISIONS.md` DEC-016 (Smali-first call graph; storage clause amended by DEC-023), DEC-017 (Frida user-confirmation requirement — fulfilled by Option A + deterministic pentester summary), DEC-023 (Hook Lab v1 — eight sub-step specifics + Hook-Lab-complete closing note)
+  - `docs/SAFETY_AND_SECURITY.md` §12 (Hook Lab v1 — what now-shipped controls do)
 
 ---
 

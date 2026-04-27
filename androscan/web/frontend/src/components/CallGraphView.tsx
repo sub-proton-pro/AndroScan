@@ -17,6 +17,17 @@
  * with ``may_have_unresolved_reflection`` get an ``[R]`` suffix and a
  * coloured outline. Tippy.js tooltips on hover; right-click opens a
  * context menu; left-click on a method node fires ``onSelectNode``.
+ *
+ * **Frida overlay (sub-step 4.8 — DEC-023's "graph hits = bold cyan,
+ *  static = muted grey"):** when the parent passes ``hitsByMethod``
+ *  (a map of ``"${class}::${method}" → hit_count`` derived from the
+ *  active session's hooks aggregate), nodes whose ``(class, method)``
+ *  matches a key are rendered in bold cyan and their hit count is
+ *  shown in the tippy tooltip + label suffix. Non-matching nodes are
+ *  dimmed so the overlay is visually obvious. ``null`` (no session
+ *  pinned) reverts to the unaltered 4.2 styling — operators get the
+ *  static graph back the moment they detach. Package-overview mode
+ *  aggregates hit counts per package and dims packages with no hits.
  */
 import {
   useCallback,
@@ -79,7 +90,25 @@ type Props = {
   /** Selected node — drives the in-tab CodeView in HookLabTab. The graph
    *  pane never reads this back; it only fires the callback on click. */
   onSelectNode: (sel: SelectedNode | null) => void;
+  /** Frida hit overlay (sub-step 4.8). ``null`` means no active Frida
+   *  session is pinned — the graph renders in its plain 4.2 style.
+   *  A ``Map`` (possibly empty) means overlay is active: keys are
+   *  ``hitKey(className, methodName)``; values are hit counts. Empty
+   *  map → every node is dimmed (overlay on, no hits yet). The map is
+   *  intentionally typed read-only so the parent can hand us the same
+   *  reference across renders without us mutating it; we recompute
+   *  Cytoscape elements on identity change like every other input. */
+  hitsByMethod?: ReadonlyMap<string, number> | null;
 };
+
+// Stable, dollar-aware join used by both the overlay-builder side
+// (``HookLabTab``) and the consumer side (this component). Inner-class
+// boundaries surface differently in Smali ("com.example.Foo$Inner") vs.
+// some Java reflection paths (sometimes ".") — keeping the format
+// explicit avoids silent miss-mapping when the key crosses tiers.
+export function hitKey(className: string, methodName: string): string {
+  return `${className}::${methodName}`;
+}
 
 export type SelectedNode = {
   nodeId: number;
@@ -103,7 +132,7 @@ type ContextMenu = {
 // Component
 // ---------------------------------------------------------------------------
 
-export function CallGraphView({ appId, onSelectNode }: Props) {
+export function CallGraphView({ appId, onSelectNode, hitsByMethod }: Props) {
   const { setPendingCodeNav, setTab } = useWorkbench();
 
   // Status / data state -----------------------------------------------------
@@ -243,6 +272,12 @@ export function CallGraphView({ appId, onSelectNode }: Props) {
   }, [cgState]);
 
   // -------- Render Cytoscape elements when data changes --------------------
+  // ``hitsByMethod`` is intentionally in the dep array: a fresh hooks
+  // poll (every 2.5 s in HookLabTab) updates the same Map reference
+  // identity-wise, so re-rendering on identity change keeps the overlay
+  // live without re-laying out unless the underlying data actually
+  // moved. We *do* recompute layout when overlay turns on/off because
+  // that's a structural visual change, not just a count refresh.
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
@@ -253,6 +288,7 @@ export function CallGraphView({ appId, onSelectNode }: Props) {
       filter,
       showExternal,
       focusNodeId,
+      hitsByMethod: hitsByMethod ?? null,
     });
     destroyAllTippies(tippiesRef.current);
     cy.batch(() => {
@@ -266,7 +302,7 @@ export function CallGraphView({ appId, onSelectNode }: Props) {
         : ({ name: "dagre", rankDir: "LR", animate: false, fit: true, padding: 24 } as LayoutOptions);
     cy.layout(layout).run();
     attachTippies(cy, built.tooltipFor, tippiesRef.current);
-  }, [graph, neighbors, viewMode, filter, showExternal, focusNodeId]);
+  }, [graph, neighbors, viewMode, filter, showExternal, focusNodeId, hitsByMethod]);
 
   // -------- Cytoscape event wiring -----------------------------------------
   useEffect(() => {
@@ -614,21 +650,38 @@ function buildElementsForView(args: {
   filter: string;
   showExternal: boolean;
   focusNodeId: number | null;
+  /** ``null`` means "no overlay" — render plain 4.2 styling.
+   *  An empty ``Map`` means "overlay on, but no hits yet" — every
+   *  node renders as ``unhit`` so the operator sees that the session
+   *  is wired but nothing has fired. */
+  hitsByMethod: ReadonlyMap<string, number> | null;
 }): BuildResult {
   if (args.viewMode === "package") {
-    return buildPackageOverviewElements(args.graph, args.filter, args.showExternal);
+    return buildPackageOverviewElements(
+      args.graph,
+      args.filter,
+      args.showExternal,
+      args.hitsByMethod,
+    );
   }
-  return buildFocusElements(args.neighbors, args.filter, args.focusNodeId);
+  return buildFocusElements(
+    args.neighbors,
+    args.filter,
+    args.focusNodeId,
+    args.hitsByMethod,
+  );
 }
 
 function buildPackageOverviewElements(
   graph: GraphListResponse | null,
   filter: string,
   showExternal: boolean,
+  hitsByMethod: ReadonlyMap<string, number> | null,
 ): BuildResult {
   const tooltipFor = new Map<string, string>();
   if (!graph) return { elements: [], tooltipFor };
   const classMap = buildClassMap(graph.classes);
+  const overlayActive = hitsByMethod != null;
 
   // Aggregate: package name → counts + first node id for drill-in.
   type PackageAgg = {
@@ -637,6 +690,10 @@ function buildPackageOverviewElements(
     methods: number;
     reflection: number;
     firstNodeId: number;
+    /** Number of methods in the package that matched a hit key. */
+    hitMethods: number;
+    /** Sum of hit counts across all matched methods in the package. */
+    totalHits: number;
   };
   const aggs = new Map<string, PackageAgg>();
   const nodePkg = new Map<number, string>();
@@ -659,6 +716,8 @@ function buildPackageOverviewElements(
         methods: 0,
         reflection: 0,
         firstNodeId: n.id,
+        hitMethods: 0,
+        totalHits: 0,
       };
       aggs.set(pkg, agg);
     }
@@ -666,26 +725,57 @@ function buildPackageOverviewElements(
     agg.methods += 1;
     if (n.may_have_unresolved_reflection) agg.reflection += 1;
     nodePkg.set(n.id, pkg);
+    if (overlayActive) {
+      const hits = hitsByMethod.get(hitKey(cls.class_name, n.method_name));
+      if (hits && hits > 0) {
+        agg.hitMethods += 1;
+        agg.totalHits += hits;
+      }
+    }
   }
 
   const nodes: NodeDefinition[] = [];
   for (const a of aggs.values()) {
     const id = `pkg:${a.pkg}`;
+    const hasHits = a.totalHits > 0;
+    const overlayLabel = overlayActive
+      ? hasHits
+        ? `\n• ${a.totalHits} hit${a.totalHits === 1 ? "" : "s"} in ${a.hitMethods} method${a.hitMethods === 1 ? "" : "s"}`
+        : ""
+      : "";
+    const overlayClass = overlayActive
+      ? hasHits
+        ? "has-hits"
+        : "no-hits"
+      : "";
     nodes.push({
       data: {
         id,
         kind: "package",
-        label: `${a.pkg}\n${a.classes.size} classes · ${a.methods} methods`,
+        label:
+          `${a.pkg}\n${a.classes.size} classes · ${a.methods} methods` +
+          overlayLabel,
         firstNodeId: a.firstNodeId,
         hasReflection: a.reflection > 0,
+        hitMethods: a.hitMethods,
+        totalHits: a.totalHits,
       },
-      classes: a.reflection > 0 ? "pkgnode reflective" : "pkgnode",
+      classes:
+        ["pkgnode", a.reflection > 0 ? "reflective" : "", overlayClass]
+          .filter(Boolean)
+          .join(" "),
     });
+    const overlayTooltip =
+      overlayActive && hasHits
+        ? `<br/><b style='color:${HIT_CYAN}'>frida: ${a.totalHits} hit${
+            a.totalHits === 1 ? "" : "s"
+          } across ${a.hitMethods} method${a.hitMethods === 1 ? "" : "s"}</b>`
+        : "";
     tooltipFor.set(
       id,
       `<b>${escapeHtml(a.pkg)}</b><br/>${a.classes.size} classes · ${a.methods} methods${
         a.reflection > 0 ? `<br/>${a.reflection} with reflection sentinels` : ""
-      }`,
+      }${overlayTooltip}`,
     );
   }
 
@@ -733,10 +823,12 @@ function buildFocusElements(
   neighbors: GraphNeighborsResponse | null,
   filter: string,
   focusNodeId: number | null,
+  hitsByMethod: ReadonlyMap<string, number> | null,
 ): BuildResult {
   const tooltipFor = new Map<string, string>();
   if (!neighbors) return { elements: [], tooltipFor };
   const classMap = buildClassMap(neighbors.classes);
+  const overlayActive = hitsByMethod != null;
 
   const allNodes = new Map<number, GraphNode>();
   allNodes.set(neighbors.node.id, neighbors.node);
@@ -753,6 +845,11 @@ function buildFocusElements(
     );
   };
 
+  const lookupHits = (n: GraphNode, klass: GraphClass | undefined): number => {
+    if (!overlayActive || !klass) return 0;
+    return hitsByMethod.get(hitKey(klass.class_name, n.method_name)) ?? 0;
+  };
+
   const nodeDefs: NodeDefinition[] = [];
   const visibleIds = new Set<number>();
   for (const n of allNodes.values()) {
@@ -761,15 +858,17 @@ function buildFocusElements(
     if (n.id !== focusNodeId && !matchesFilter(n, cls)) continue;
     visibleIds.add(n.id);
     const isRoot = n.id === focusNodeId;
+    const hits = lookupHits(n, cls);
     const cssClasses = [
       "methodnode",
       isRoot ? "focusroot" : "",
       n.is_external ? "external" : "",
       n.may_have_unresolved_reflection ? "reflective" : "",
+      overlayActive ? (hits > 0 ? "hit" : "unhit") : "",
     ]
       .filter(Boolean)
       .join(" ");
-    const label = renderNodeLabel(n, cls);
+    const label = renderNodeLabel(n, cls, hits);
     nodeDefs.push({
       data: {
         id: `n:${n.id}`,
@@ -777,10 +876,11 @@ function buildFocusElements(
         label,
         node: n,
         class: cls,
+        hits,
       },
       classes: cssClasses,
     });
-    tooltipFor.set(`n:${n.id}`, renderNodeTooltipHtml(n, cls));
+    tooltipFor.set(`n:${n.id}`, renderNodeTooltipHtml(n, cls, hits));
   }
 
   const edgeDefs: EdgeDefinition[] = [];
@@ -819,15 +919,24 @@ function edgeCssClasses(e: GraphEdge): string {
   return parts.join(" ");
 }
 
-function renderNodeLabel(n: GraphNode, klass: GraphClass | undefined): string {
+function renderNodeLabel(
+  n: GraphNode,
+  klass: GraphClass | undefined,
+  hits: number,
+): string {
   const sn = klass?.simple_name ?? klass?.class_name?.split(".").pop() ?? "?";
   const refl = n.may_have_unresolved_reflection ? "  [R]" : "";
-  return `${sn}.${n.method_name}${refl}`;
+  // Hit count is appended only when overlay is active *and* hits > 0;
+  // ``unhit`` nodes keep their original two-token label so the dim
+  // styling — not extra noise — communicates "no fires here yet".
+  const hitSuffix = hits > 0 ? `  ×${hits}` : "";
+  return `${sn}.${n.method_name}${refl}${hitSuffix}`;
 }
 
 function renderNodeTooltipHtml(
   n: GraphNode,
   klass: GraphClass | undefined,
+  hits: number,
 ): string {
   const sig = formatMethodSignature(n, klass);
   const flags: string[] = [];
@@ -840,9 +949,15 @@ function renderNodeTooltipHtml(
   const reflLine = n.may_have_unresolved_reflection
     ? "<br/><span style='color:#f0883e'>uses reflection (Class.forName / Method.invoke)</span>"
     : "";
+  // Hit count goes last so it visually dominates the tooltip — operators
+  // skim for "did this fire?" before they read the signature.
+  const hitLine =
+    hits > 0
+      ? `<br/><b style='color:${HIT_CYAN}'>frida: ${hits} hit${hits === 1 ? "" : "s"}</b>`
+      : "";
   return `<b>${escapeHtml(sig)}</b><br/>${flagLine}returns ${escapeHtml(
     n.return_type,
-  )}${reflLine}`;
+  )}${reflLine}${hitLine}`;
 }
 
 function escapeHtml(s: string): string {
@@ -1057,7 +1172,30 @@ function ContextMenuBox(props: {
 // own selector engine. Honours DEC-023's edge styling spec: dashed for
 // virtual_dispatch / interface_dispatch / external; reflection nodes get an
 // orange outline.
+//
+// **Frida overlay (sub-step 4.8).** DEC-023 calls for "graph hits = bold
+// cyan, static = muted grey". The overlay layers four extra rules on top
+// of the existing styling:
+//   * ``node.methodnode.hit``         — bold cyan border + glow + brighter
+//                                       background; method has fired in
+//                                       the active session.
+//   * ``node.methodnode.unhit``       — opacity ~0.45 so the eye is drawn
+//                                       to ``.hit`` first; rendered only
+//                                       when overlay is active.
+//   * ``node.pkgnode.has-hits``       — same bold cyan treatment for the
+//                                       package overview (one or more
+//                                       methods inside fired).
+//   * ``node.pkgnode.no-hits``        — dimmed package node, overlay-only.
+// Reflection / focusroot styling still wins for border colour where they
+// overlap by virtue of selector order (``.hit`` declared *after* the
+// reflection / focusroot rules so its bold cyan border takes precedence
+// when both apply — operators care about "did it fire?" more than "is it
+// reflective?" when a hook has just landed).
 // ---------------------------------------------------------------------------
+
+/** Cytoscape stylesheets are JS-strings; this is the single colour token
+ *  shared with the tooltip HTML so the overlay reads as one visual unit. */
+const HIT_CYAN = "#56d4dd";
 
 const GRAPH_STYLE: cytoscape.StylesheetStyle[] = [
   {
@@ -1171,6 +1309,42 @@ const GRAPH_STYLE: cytoscape.StylesheetStyle[] = [
       "target-arrow-color": "#444c56",
       opacity: 0.6,
     } as cytoscape.Css.Edge,
+  },
+  // -------- Frida overlay (sub-step 4.8) ----------------------------------
+  {
+    selector: "node.methodnode.hit",
+    style: {
+      "background-color": "#0c3a3f",
+      "border-color": HIT_CYAN,
+      "border-width": 3,
+      color: HIT_CYAN,
+      "font-weight": "bold",
+      "shadow-blur": 16,
+      "shadow-color": HIT_CYAN,
+      "shadow-opacity": 0.6,
+    } as cytoscape.Css.Node,
+  },
+  {
+    selector: "node.methodnode.unhit",
+    style: {
+      opacity: 0.45,
+    } as cytoscape.Css.Node,
+  },
+  {
+    selector: "node.pkgnode.has-hits",
+    style: {
+      "background-color": "#0c3a3f",
+      "border-color": HIT_CYAN,
+      "border-width": 3,
+      color: HIT_CYAN,
+      "font-weight": "bold",
+    } as cytoscape.Css.Node,
+  },
+  {
+    selector: "node.pkgnode.no-hits",
+    style: {
+      opacity: 0.5,
+    } as cytoscape.Css.Node,
   },
 ];
 

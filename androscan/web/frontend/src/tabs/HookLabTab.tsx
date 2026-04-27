@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { ChatDock } from "../components/ChatDock";
-import { CallGraphView, type SelectedNode } from "../components/CallGraphView";
+import {
+  CallGraphView,
+  hitKey,
+  type SelectedNode,
+} from "../components/CallGraphView";
 import { CodeView } from "../components/CodeView";
 import { FridaSessionsList } from "../components/FridaSessionsList";
 import { FridaTracePanel } from "../components/FridaTracePanel";
@@ -43,6 +47,14 @@ import { useWorkbench } from "../context/WorkbenchContext";
  *     ``persist_path`` and pin the right pane's trace to it.
  *   * Picking a different session in the SessionsList swaps the
  *     trace / hooks / scope panes to that session's data.
+ *   * **Frida overlay on the call graph (sub-step 4.8):** the same
+ *     ``chatHooks`` polled for the chat ``frida_summary`` attachment
+ *     is reduced into a ``hitsByMethod`` map and threaded into
+ *     ``<CallGraphView />`` so methods that fired in the active
+ *     session render in bold cyan (DEC-023) with their hit count in
+ *     the label / tooltip; everything else dims. No new poll cadence —
+ *     the chat-attachment loop already runs every 2.5s, so the
+ *     overlay refreshes cohesively with hooks/scope/chat context.
  *
  * Right-pane bottom slot is a tab strip (sub-step 4.6): default
  * "Trace" preserves 4.5's behaviour; "Hooks" surfaces the per-
@@ -168,10 +180,45 @@ export function HookLabTab() {
     [appId, selected, selectedSource, activeSession, chatHooks, chatTraceTail],
   );
 
+  // -------------------------------------------------------------------------
+  // Frida → Cytoscape overlay map (sub-step 4.8).
+  //
+  // The overlay is "on" exactly when an active session is pinned. While
+  // ``chatHooks`` is still loading (``null``) we deliberately pass an empty
+  // Map rather than ``null`` so the overlay turns on immediately — the
+  // graph renders dimmed and the hits flow in on the next 2.5s poll. That
+  // matches the rest of the right pane (HookStatsPanel / FridaTracePanel
+  // both surface "session active, no events yet" affordances rather than
+  // hiding their UI). When there's no session, we pass ``null`` so the
+  // graph reverts to its plain 4.2 styling — operators get the static
+  // graph back the moment they detach.
+  //
+  // Keying by class.class_name + method_name matches the call_graph DB's
+  // dotted form (Smali → ".") to the Frida runtime's ``Java.use(name).$className``
+  // (also dotted, with ``$`` for inner-class boundaries on both sides). If
+  // method overloads ever caused an ambiguous hit (same name, different
+  // signatures), the count attached to the node would *under*-count rather
+  // than mis-attribute — hooks attribute by class+method, not by full
+  // descriptor, in 4.6's aggregator. Tracked as an overlay-precision
+  // follow-up in KNOWN_ISSUES (ISSUE-012 in 4.8 docs sweep).
+  // -------------------------------------------------------------------------
+  const hitsByMethod = useMemo<ReadonlyMap<string, number> | null>(() => {
+    if (!activeSession) return null;
+    const out = new Map<string, number>();
+    for (const h of chatHooks ?? []) {
+      out.set(hitKey(h.class, h.method), h.hits);
+    }
+    return out;
+  }, [activeSession, chatHooks]);
+
   return (
     <PanelGroup direction="horizontal" autoSaveId="hook-h" className="tab-panels">
       <Panel defaultSize={32} minSize={20} className="panel">
-        <CallGraphView appId={appId} onSelectNode={setSelected} />
+        <CallGraphView
+          appId={appId}
+          onSelectNode={setSelected}
+          hitsByMethod={hitsByMethod}
+        />
       </Panel>
       <PanelResizeHandle className="resize-h" />
       <Panel defaultSize={46} minSize={30} className="panel">

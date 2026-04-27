@@ -478,6 +478,137 @@ explicitly rather than re-litigating the safety surface.
   user-confirmation requirement and DEC-023's deterministic-pentester-summary
   Option A UX — landing in 4.5 with the `pyjsparser` pre-validation gate.
 
+**v1 complete: what now-shipped controls do (Hook Lab sub-steps 4.4 → 4.8 — closed 2026-04-27):**
+
+The deferred items above (§12.6's "not in 4.3" notes — Inject route, JSONL
+persistence, `hook_target_package_prefix` enforcement, `/api/frida/*` HTTP
+surface, LLM-driven hook generation, live overlay) all landed across
+sub-steps 4.4 → 4.8. This subsection consolidates the as-built safety surface
+so an operator (or auditor) can see Hook Lab's complete control list in one
+place without cross-referencing five DEC-023 sub-bullets.
+
+- **Server-side `hook_target_package_prefix` allowlist (4.5, hard fail-closed):**
+  `POST /api/frida/sessions` resolves
+  `effective_settings(global_view, per_app, app_package=…)` (via
+  `_app_package_from_meta` reading `apps/<app_id>/app_meta.json`) **before**
+  it touches `FridaClient.attach()`. The default prefix is the app's own
+  package id; if the body's `target_package` doesn't `startswith(prefix)`,
+  the request is rejected with **HTTP 403 `hook_blocked`** + a structured
+  `{detail: {code: "hook_blocked", attempted, allowed_prefix}}` body. The
+  per-app Settings UI can widen the prefix (e.g. `com.target` to also match
+  `com.target.staging`) but cannot narrow it below the package-id default
+  without explicit operator action — and the gate sits *before* attach, so
+  a misconfigured request never produces a half-attached session that needs
+  cleanup. **Why server-side, not advisory:** the LLM-tier
+  `generate_frida_hook` skill (4.7) returns rendered JS that the operator
+  could paste into a UI driving this endpoint directly; gating in the
+  frontend would leave a hole the LLM-generated payload could drive
+  through. The 403 path has dedicated coverage in
+  `tests/test_frida_routes.py::test_create_session_blocks_off_prefix`.
+- **JSONL trace persistence at `apps/<app_id>/<run_ts>/frida/<session>.jsonl` (4.5):**
+  Frida `message` events stream to (a) the in-memory ring buffer (§12.6
+  4.3 entry, capped via `frida.trace_ring_buffer_size`, default 5000) **and**
+  (b) a per-session JSONL file under the same `<run_ts>` namespace as chat
+  transcripts (`apps/<app_id>/<run_ts>/chat/<tab>.jsonl`) and
+  exploit-verification artifacts (`apps/<app_id>/<run_ts>/exploit_verification/…`).
+  Inherits §8 (logging/reporting) defaults — same single-user-local file
+  permissions as the surrounding run-folder tree. The writer-thread design
+  guarantees three things: (1) a slow disk cannot block the Frida message
+  thread or the asyncio loop (producer is `put_nowait` onto an unbounded
+  `queue.Queue`); (2) a single bad event bumps `persist_dropped` (via
+  `_jsonl_fallback`'s `default=str` retry) instead of killing the session;
+  (3) the wire format on the trace WS and the on-disk JSONL are
+  byte-identical — both go through `_event_to_jsonable`, so
+  `GET /api/frida/sessions/{id}/export` is a thin `StreamingResponse` over
+  the file. `detach()` poisons the queue and `join`s the writer so all
+  events flush before the route returns. **Persistence is opt-in per
+  session** (`persist=True` is the default in the create body, but hook
+  authoring with `persist=False` is supported and leaves no breadcrumbs).
+  Operators who Detach right after Inject still get a complete
+  `<session>.jsonl`; chat / reports can cite exact frida observations later
+  by `<run_ts>` + `<session_id>` without inventing a third namespace.
+- **Trace contents are sensitive by default — same sanitization rules as
+  RAG / chat (§12.4):** `.jsonl` lines must not be quoted into chat
+  attachments or report bodies without `androscan/web/chat.py::sanitize_text`.
+  The chat-attachment payload composition in `HookLabTab.tsx` (4.7) sends
+  the **last 30** trace events as the `frida_summary` attachment — the
+  remainder stays in the on-disk JSONL where the operator can find it but
+  the LLM cannot scan it casually. The Hook Lab UI never renders a hook's
+  `js` body in the same component as a `text` attachment that an LLM might
+  inadvertently echo back — Monaco's read-only mode + the deterministic
+  `pentester_summary` (DEC-023's Option A) are the only consent surfaces.
+- **JS pre-validation gate (`pyjsparser`, 4.5):** rendered JS is parsed
+  with `pyjsparser.PyJsParser().parse()` before the Inject button enables.
+  When `pyjsparser` is available (the `[frida]` extra is installed),
+  `POST /api/frida/render` returns a `parse: {ok, error, line, column,
+  available}` block alongside the rendered JS — the frontend attaches
+  inline Monaco markers via `setModelMarkers(model, "androscan-jsparse",
+  …)`; `POST /api/frida/sessions` runs the **same** parser server-side
+  and rejects with **HTTP 400 `render_parse_error`** + `{message, line,
+  column}` if it fails, so an LLM-generated payload cannot sneak past a UI
+  that ignores its own markers. When `pyjsparser` is missing (default
+  install without the `[frida]` extra) the gate degrades open with
+  `available=false` — we don't gate on a tool we don't have, but the
+  Inject button stays enabled because Frida's runtime would surface the
+  same error one step later. **The point of the gate is UX (precise
+  line/column on a renderer bug), not security** — the security gate is
+  the `hook_target_package_prefix` allowlist plus DEC-017's user
+  confirmation.
+- **Operator-managed `frida-server` posture (unchanged from 4.3 — no
+  auto-push, no auto-pull):** Hook Lab v1 still does **not** push, start,
+  stop, or update `frida-server` on the device. Same posture as `adb` /
+  `jadx` / `apktool` / Ollama. The two readiness probes shipped in 4.3
+  (`probe_frida_server` + `probe_frida_version_skew`) remain the only
+  visibility surface — the README points operators at upstream
+  `frida-server` install docs, and the Settings → Status card surfaces
+  device state in `tools.frida_server` (yellow on missing, red on major
+  version skew). v2 may revisit auto-provisioning if operator demand
+  justifies the per-OEM / Magisk / userspace-gadget complexity; v1
+  closes with the explicit position that this is *not* a missing feature
+  but a deliberate trust-boundary choice.
+- **LLM-tier `generate_frida_hook` is structurally prep-only (4.7 — first
+  consumer of DEC-022's `requires_confirmation=True`):** the skill calls
+  `frida_hooks.render_by_id` and returns rendered JS + deterministic
+  pentester summary + sensitive-APIs list + an "Operator action required:
+  review the JS + summary above, then stage / inject from the Hook Lab UI.
+  This skill does not attach to a process or inject the script." footer.
+  **It does not call `attach`, does not call `load_script`, does not call
+  `set_persistence_path`** — the operator-driven Stage→Inject UI (4.5) is
+  the **only** mechanism that turns rendered JS into a running hook. This
+  is the strongest possible interpretation of DEC-023's Option-A
+  confirmation UX: even with the chat-loop refactor (DEC-022) still
+  pending and the `skill_pending` SSE event vocabulary not yet wired, an
+  LLM call to `generate_frida_hook` cannot side-effect the device. When
+  the consent SSE flow eventually lands, `requires_confirmation=True`
+  becomes belt-and-braces over what is already a non-side-effecting
+  surface. `tests/test_skills.py` invariant-checks that pipeline +
+  exploit-tier skills cannot accidentally opt into the consent class
+  (DEC-022's consent class is scoped to the LLM-driven loop only).
+- **Frida overlay on call graph is read-only-by-design (4.8):** the live
+  overlay derives `hitsByMethod` from the same `chatHooks` payload the
+  chat attachment uses — no second API surface, no second polling loop,
+  no new auth-sensitive data path. The Cytoscape pane mutates only its
+  own DOM (cyan styling, hit-count labels, tooltips); it has no callbacks
+  that touch the device, no WebSocket of its own, no persistence writes.
+  Method-overload precision is intentionally aggregated (ISSUE-012) — a
+  hit on `Foo.bar` lights up every `Foo.bar` overload node — but this is
+  a UX trade-off, not a safety trade-off (the JSONL file in
+  `apps/<app_id>/<run_ts>/frida/<session>.jsonl` carries the full args
+  dict so per-overload attribution is recoverable from durable storage
+  when needed).
+- **What v1 explicitly does *not* ship (deferred to v2 per DEC-023):**
+  free-form LLM JS (templates + parameter-fill only — DEC-023's "Hook
+  source policy"); modify-return / mutation hooks (the
+  `scope_inspector` template walks fields *read-only* — `setAccessible(true)`
+  + `Field.get(this)`, never `Field.set`); reflection-based dispatch in
+  the call graph (v1 ships solid-edge direct invokes + dashed-edge
+  virtual-dispatch hierarchy walks; full taint analysis on string concat
+  is v3); self-hosted Monaco (ISSUE-010 — air-gap workaround documented);
+  per-overload hit attribution (ISSUE-012 — JSONL is the durable
+  fallback); auto-provisioned `frida-server`. None of these are missing
+  *safety* features — they are scope choices that v2 may re-open with the
+  benefit of operator telemetry from real Hook Lab use.
+
 ---
 
 ## 13. Summary
