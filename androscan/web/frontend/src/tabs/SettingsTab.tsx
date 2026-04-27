@@ -32,6 +32,7 @@ import {
   type StatusCard,
 } from "../api/status";
 import { rebuildRagIndex } from "../api/rag";
+import { rebuildGraph } from "../api/graph";
 import { useWorkbench } from "../context/WorkbenchContext";
 
 type Section = "global" | "perApp" | "status" | "diagnostics";
@@ -750,6 +751,12 @@ function StatusPanel() {
               decompileReady={appStatus.decompile.status === "ready"}
               onChanged={reload}
             />
+            <CallGraphStatusCard
+              appId={appStatus.app_id}
+              graphCard={appStatus.call_graph}
+              decompileReady={appStatus.decompile.status === "ready"}
+              onChanged={reload}
+            />
             <StatusCardView card={appStatus.device.package_installed} />
             <StatusCardView card={appStatus.device.package_running} />
             <StatusCardView card={appStatus.device.package_uid} />
@@ -876,6 +883,122 @@ function RagStatusCard({
           >
             {busy ? "Kicking off…" : config.label}
           </button>
+          {msg && <span className="status-card-msg">{msg}</span>}
+        </>
+      }
+    />
+  );
+}
+
+/**
+ * Static call-graph status card with build / rebuild + drop-apktool action.
+ *
+ * Parallels :func:`RagStatusCard` — same "wait for decompile, then offer
+ * a manual rebuild knob" contract — but with a second secondary action
+ * (``Rebuild + re-decompile``) that maps to ``POST
+ * /api/graph/{app_id}/rebuild?drop_apktool=true``. The auto-builder
+ * already kicks in after the decompile cache flips to ready (see
+ * ``schedule_call_graph_build_after_decompile`` in
+ * ``androscan/web/graph_routes.py``); this button is mostly for the
+ * "I changed apktool / parser / Smali" cases where the operator wants
+ * to force a re-parse from scratch.
+ *
+ * Status → button label/intent:
+ *   missing  → "Build now"     (primary; auto-build usually beats us to it)
+ *   failed   → "Retry build"   (warn)
+ *   pending  → "Building…"     (disabled, shows progress)
+ *   ready    → "Rebuild"       (subtle; secondary "Re-decompile" wipes apktool)
+ */
+function CallGraphStatusCard({
+  appId,
+  graphCard,
+  decompileReady,
+  onChanged,
+}: {
+  appId: string;
+  graphCard: AppStatus["call_graph"];
+  decompileReady: boolean;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const status = graphCard.status;
+
+  const config: { label: string; className: string; disabled: boolean; title?: string } =
+    !decompileReady
+      ? {
+          label: "Build now",
+          className: "primary",
+          disabled: true,
+          title: "Build the decompile cache first (Decompile cache card → POST /api/decompile)",
+        }
+      : status === "missing"
+      ? { label: "Build now", className: "primary", disabled: false }
+      : status === "failed"
+      ? { label: "Retry build", className: "warn", disabled: false }
+      : status === "pending"
+      ? { label: "Building…", className: "", disabled: true }
+      : { label: "Rebuild", className: "", disabled: false };
+
+  const kick = async (dropApktool: boolean) => {
+    setBusy(true);
+    setMsg(null);
+    const r = await rebuildGraph(appId, { dropApktool });
+    setBusy(false);
+    if (!r.ok) {
+      setMsg(`Rebuild failed: ${r.error}`);
+      return;
+    }
+    setMsg(
+      r.data.kicked
+        ? dropApktool
+          ? "Re-decompile + rebuild kicked off…"
+          : "Build kicked off…"
+        : "Build already in progress.",
+    );
+    onChanged();
+  };
+
+  const extras: (string | undefined)[] = [graphCard.status];
+  if (status === "ready") {
+    if (typeof graphCard.node_count === "number" && typeof graphCard.edge_count === "number") {
+      extras.push(`${graphCard.node_count} nodes / ${graphCard.edge_count} edges`);
+    }
+    if (typeof graphCard.class_count === "number") {
+      const ext = graphCard.external_class_count ?? 0;
+      extras.push(`${graphCard.class_count} classes (${ext} external)`);
+    }
+    if (graphCard.fidelity_level) {
+      extras.push(`fidelity: ${graphCard.fidelity_level}`);
+    }
+  }
+
+  return (
+    <StatusCardView
+      card={graphCard}
+      extras={extras}
+      actions={
+        <>
+          <button
+            type="button"
+            className={`status-card-btn ${config.className}`}
+            onClick={() => kick(false)}
+            disabled={config.disabled || busy}
+            title={config.title}
+          >
+            {busy ? "Kicking off…" : config.label}
+          </button>
+          {decompileReady && status === "ready" && (
+            <button
+              type="button"
+              className="status-card-btn"
+              onClick={() => kick(true)}
+              disabled={busy}
+              title="Drops the apktool/Smali cache and rebuilds the call graph from scratch. Use after replacing the APK or upgrading apktool."
+            >
+              Re-decompile
+            </button>
+          )}
           {msg && <span className="status-card-msg">{msg}</span>}
         </>
       }

@@ -74,6 +74,28 @@ export type AppStatus = {
   meta: StatusCard & { package: string; apk_path: string | null; apk_sha256: string | null };
   decompile: StatusCard & { status: string; sha: string | null; file_count?: number };
   rag: StatusCard & { status: string };
+  /**
+   * Static call graph status (Hook Lab v1 / DEC-023). Mirrors the shape of
+   * ``androscan.analysis.call_graph.IndexStatus.to_dict()``: ``status`` is
+   * one of ``missing | pending | ready | failed`` plus build-time counts /
+   * timestamps once the SQLite index is populated. Auto-builds in the
+   * background after the decompile cache flips to ``ready``; the Settings
+   * card exposes a manual rebuild knob (incl. drop-apktool re-decompile)
+   * for the rare case where parser drift or APK swap demands a hard reset.
+   */
+  call_graph: StatusCard & {
+    status: "missing" | "pending" | "ready" | "failed";
+    sha?: string | null;
+    fidelity_level?: string | null;
+    parser_version?: string | null;
+    built_at?: number | null;
+    finished_at?: number | null;
+    class_count?: number | null;
+    external_class_count?: number | null;
+    node_count?: number | null;
+    edge_count?: number | null;
+    db_path?: string | null;
+  };
   device: {
     /** True when adb get-state returned a usable device state. */
     connected: boolean;
