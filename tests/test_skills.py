@@ -130,6 +130,45 @@ def test_list_llm_skills_returns_only_llm_tier():
         assert meta.tier == "llm"
 
 
+def test_list_llm_skills_includes_4_7_skills():
+    """Sub-step 4.7 / DEC-023: query_call_graph and generate_frida_hook are
+    LLM-tier and must be visible in the prompt catalog so the chat agentic
+    loop can pick them."""
+    names = {m.name for m in list_llm_skills()}
+    assert "query_call_graph" in names
+    assert "generate_frida_hook" in names
+
+
+def test_skill_meta_has_requires_confirmation_field():
+    """SkillMeta carries DEC-022's consent-class flag. Default False keeps every
+    pre-4.7 read-only skill unchanged; only generate_frida_hook ships True in v1."""
+    by_name = {m.name: m for m in list_llm_skills()}
+    # Sample existing read-only skills — all default-False.
+    for name in ("get_decompiled_class", "search_decompiled_sources",
+                 "resolve_ui_element", "query_call_graph"):
+        assert name in by_name, f"expected {name!r} in LLM catalog"
+        assert by_name[name].requires_confirmation is False
+    # Hook Lab's renderer is the first real True consumer.
+    assert by_name["generate_frida_hook"].requires_confirmation is True
+
+
+def test_consent_class_skills_are_not_pipeline_or_exploit():
+    """DEC-022 only applies to the LLM-driven loop; pipeline + exploit-tier
+    skills (orchestrated, not LLM-picked) must not be flagged."""
+    pipeline = list_skills_by_tier("pipeline")
+    exploit = list_exploit_skills()
+    for meta in pipeline:
+        assert meta.requires_confirmation is False, (
+            f"pipeline skill {meta.name!r} unexpectedly flagged "
+            "requires_confirmation=True"
+        )
+    for meta in exploit:
+        assert meta.requires_confirmation is False, (
+            f"exploit skill {meta.name!r} unexpectedly flagged "
+            "requires_confirmation=True"
+        )
+
+
 def test_list_skills_by_tier():
     """list_skills_by_tier returns only skills with the given tier."""
     llm = list_skills_by_tier("llm")

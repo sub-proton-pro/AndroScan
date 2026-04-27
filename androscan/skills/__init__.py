@@ -23,6 +23,8 @@ _SKILL_MODULES = [
     "androscan.skills.list_classes_in_package",
     "androscan.skills.search_decompiled_sources",
     "androscan.skills.resolve_ui_element",
+    "androscan.skills.query_call_graph",
+    "androscan.skills.generate_frida_hook",
     "androscan.skills.app_env_check",
     "androscan.skills.build_exploit_command",
     "androscan.skills.capture_signals",

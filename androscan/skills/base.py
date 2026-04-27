@@ -10,12 +10,21 @@ from typing import Any, Literal, Optional
 
 @dataclass(frozen=True)
 class SkillMeta:
-    """Metadata for a skill: name, description, params schema, tier."""
+    """Metadata for a skill: name, description, params schema, tier, consent class.
+
+    ``requires_confirmation`` (DEC-022) flags side-effecting skills the chat
+    agentic loop must gate on operator approval before executing. False by
+    default so every existing read-only skill (decompile / RAG / fuser) is
+    unchanged. Hook Lab's ``generate_frida_hook`` is the first real consumer
+    in v1; future device-mutating skills (``adb`` shell drivers, etc.) will
+    set this flag too.
+    """
 
     name: str
     description: str
     params_schema: dict[str, Any]  # e.g. {"component_ref": "dossier path", ...}
     tier: Literal["pipeline", "llm", "exploit"]
+    requires_confirmation: bool = False
 
 
 @dataclass
