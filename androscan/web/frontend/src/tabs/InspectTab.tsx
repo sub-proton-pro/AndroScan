@@ -28,7 +28,7 @@ import type { ChatAttachment } from "../types";
 const PENDING_POLL_MS = 4000;
 
 export function InspectTab() {
-  const { appId, dossier } = useWorkbench();
+  const { appId, dossier, pendingCodeNav, setPendingCodeNav } = useWorkbench();
   const packageName = useMemo<string | null>(() => {
     const apk = (dossier as Record<string, unknown> | null)?.apk_info as
       | { package?: string }
@@ -120,6 +120,24 @@ export function InspectTab() {
       setOpenClassSource(text ?? "(failed to load)");
     }
   };
+
+  // Cross-tab "Open in Inspect" — Hook Lab (CallGraphView's right-click menu)
+  // writes ``pendingCodeNav`` and switches the tab; we consume it here and
+  // clear it so the next click re-fires correctly. Keyed on ``ts`` to force
+  // re-fire when the same node is opened twice in a row.
+  useEffect(() => {
+    if (!pendingCodeNav) return;
+    if (!appId || pendingCodeNav.appId !== appId) return;
+    void handleSelect({
+      rel_path: pendingCodeNav.relPath,
+      class_name: pendingCodeNav.className,
+      method: pendingCodeNav.method,
+    });
+    setPendingCodeNav(null);
+    // ``handleSelect`` is a stable closure over local setters; safe to
+    // reference without listing it as a dep.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingCodeNav?.ts, appId]);
 
   // Open a code candidate (from the UI Mapping panel) in the Code Browser
   // tab, scroll to its first line and persistently highlight every line

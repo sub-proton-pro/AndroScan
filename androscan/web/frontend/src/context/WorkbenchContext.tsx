@@ -54,6 +54,14 @@ type WorkbenchState = {
   status: string;
   setStatus: (s: string) => void;
 
+  // Cross-tab "open this file in the Code Browser" intent. The Hook Lab
+  // graph pane writes here when the operator picks "Open in Inspect" on a
+  // node tooltip; the Inspect tab consumes it on mount/change and clears
+  // it. ``ts`` forces re-fire when the same target is requested twice in
+  // a row.
+  pendingCodeNav: PendingCodeNav | null;
+  setPendingCodeNav: (n: PendingCodeNavInput | null) => void;
+
   // per-tab chat history (persisted client-side)
   chats: Record<TabId, ChatMessage[]>;
   appendChat: (tab: TabId, msg: ChatMessage) => void;
@@ -64,6 +72,15 @@ type WorkbenchState = {
   ) => void;
   clearChat: (tab: TabId) => void;
 };
+
+export type PendingCodeNavInput = {
+  appId: string;
+  relPath: string;
+  className: string;
+  method?: string;
+};
+
+export type PendingCodeNav = PendingCodeNavInput & { ts: number };
 
 const WorkbenchContext = createContext<WorkbenchState | null>(null);
 
@@ -78,6 +95,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   const [dossier, setDossier] = useState<Dossier | null>(null);
   const [triage, setTriage] = useState<TriageMap>({});
   const [status, setStatus] = useState("");
+  const [pendingCodeNav, setPendingCodeNavState] =
+    useState<PendingCodeNav | null>(null);
   const [chats, setChats] = useState<Record<TabId, ChatMessage[]>>({
     reports: [],
     inspect: [],
@@ -207,6 +226,13 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     setChats((prev) => ({ ...prev, [t]: [] }));
   }, []);
 
+  const setPendingCodeNav = useCallback(
+    (n: PendingCodeNavInput | null) => {
+      setPendingCodeNavState(n ? { ...n, ts: Date.now() } : null);
+    },
+    [],
+  );
+
   const value = useMemo<WorkbenchState>(
     () => ({
       tab,
@@ -225,6 +251,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       updateTriage,
       status,
       setStatus,
+      pendingCodeNav,
+      setPendingCodeNav,
       chats,
       appendChat,
       updateChat,
@@ -244,6 +272,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       triage,
       updateTriage,
       status,
+      pendingCodeNav,
+      setPendingCodeNav,
       chats,
       appendChat,
       updateChat,

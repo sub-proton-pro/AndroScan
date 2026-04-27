@@ -230,3 +230,143 @@ def test_per_app_status_includes_call_graph_card(tmp_path: Path) -> None:
     # Our fixture pre-builds the graph so status should be ready.
     assert card["status"] == "ready"
     assert card["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Frontend contract — these field names are baked into
+# ``androscan/web/frontend/src/api/graph.ts``. If you rename or drop one of
+# them, update both ends in the same commit. The tests below are deliberately
+# narrow (one field check per assertion) so a regression points at the right
+# property name.
+# ---------------------------------------------------------------------------
+
+
+_REQUIRED_NODE_FIELDS = (
+    "id",
+    "smali_id",
+    "class_id",
+    "method_name",
+    "descriptor",
+    "return_type",
+    "param_types",
+    "access_flags",
+    "is_static",
+    "is_abstract",
+    "is_native",
+    "is_synthetic",
+    "is_constructor",
+    "is_external",
+    "smali_start_line",
+    "smali_end_line",
+    "may_have_unresolved_reflection",
+)
+
+_REQUIRED_CLASS_FIELDS = (
+    "id",
+    "smali_class",
+    "class_name",
+    "package",
+    "simple_name",
+    "super_class",
+    "is_external",
+    "is_abstract",
+    "is_interface",
+    "smali_file",
+    "jadx_file",
+)
+
+_REQUIRED_EDGE_FIELDS = ("src_id", "dst_id", "kind", "invoke_op", "src_line")
+_REQUIRED_STATUS_FIELDS = (
+    "status",
+    "sha",
+    "fidelity_level",
+    "parser_version",
+    "built_at",
+    "finished_at",
+    "class_count",
+    "external_class_count",
+    "node_count",
+    "edge_count",
+    "error",
+    "db_path",
+)
+
+
+def test_list_response_field_shape_matches_frontend_contract(tmp_path: Path) -> None:
+    """The fields the React graph client (``api/graph.ts``) reads off the
+    list response must keep their names. We don't assert types here (FastAPI
+    already serialises them via the ``_*_to_dict`` helpers); we just lock
+    the property names so a future schema rename can't silently break the
+    UI without a test failure."""
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(f"/api/graph/{app_id}", params={"include_external": "true", "limit": 100})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # ``include_external=true`` ensures we see at least one external class
+    # in the fixture (Log/Object/etc), so every code path of the response
+    # serializer is exercised.
+    assert body["nodes"], "fixture should produce at least one node"
+    assert body["classes"], "fixture should produce at least one class"
+    assert body["edges"], "fixture should produce at least one edge"
+
+    for n in body["nodes"]:
+        for f in _REQUIRED_NODE_FIELDS:
+            assert f in n, f"node missing field {f}; got {sorted(n)}"
+    for c in body["classes"]:
+        for f in _REQUIRED_CLASS_FIELDS:
+            assert f in c, f"class missing field {f}; got {sorted(c)}"
+    for e in body["edges"]:
+        for f in _REQUIRED_EDGE_FIELDS:
+            assert f in e, f"edge missing field {f}; got {sorted(e)}"
+        # The frontend renders dashed edges based on these enum values —
+        # adding a new edge ``kind`` is a breaking change that needs a
+        # matching ``api/graph.ts`` update.
+        assert e["kind"] in {
+            "direct",
+            "static",
+            "super",
+            "virtual_dispatch",
+            "interface_dispatch",
+            "external",
+        }
+
+
+def test_status_response_field_shape_matches_frontend_contract(tmp_path: Path) -> None:
+    """``api/graph.ts``'s ``GraphIndexStatus`` mirrors the Python dataclass
+    one-for-one. Lock the names so renames travel through both sides."""
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(f"/api/graph/{app_id}/status")
+    assert r.status_code == 200, r.text
+    cg = r.json()["call_graph"]
+    for f in _REQUIRED_STATUS_FIELDS:
+        assert f in cg, f"status missing field {f}; got {sorted(cg)}"
+
+
+def test_neighbors_response_field_shape_matches_frontend_contract(
+    tmp_path: Path,
+) -> None:
+    """The focus-mode renderer in ``CallGraphView.tsx`` reads
+    ``node`` / ``callers`` / ``callees`` / ``classes`` and treats each
+    caller/callee as ``{node, edge}``. Lock that shape too."""
+    import urllib.parse
+
+    client, _root, app_id = _client(tmp_path)
+    sig = "Lcom/example/App;->main()V"
+    r = client.get(
+        f"/api/graph/{app_id}/neighbors/{urllib.parse.quote(sig, safe='')}"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    for top in ("node", "callers", "callees", "classes"):
+        assert top in body, f"neighbors response missing top-level {top}"
+    for f in _REQUIRED_NODE_FIELDS:
+        assert f in body["node"], f"neighbors.node missing {f}"
+    for entry in (*body["callers"], *body["callees"]):
+        assert {"node", "edge"} <= entry.keys()
+        for f in _REQUIRED_NODE_FIELDS:
+            assert f in entry["node"], f"neighbors entry.node missing {f}"
+        for f in _REQUIRED_EDGE_FIELDS:
+            assert f in entry["edge"], f"neighbors entry.edge missing {f}"
+    for c in body["classes"]:
+        for f in _REQUIRED_CLASS_FIELDS:
+            assert f in c, f"neighbors class missing {f}"
