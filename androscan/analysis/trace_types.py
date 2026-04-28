@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 
 # ---------------------------------------------------------------------------
@@ -265,16 +265,23 @@ class Branch:
 class DecisionPoint:
     """One conditional branch (or switch) in a method body.
 
-    Emitted by 10.1's ``decisions.parse_decisions``. Sliced by 10.2 for
-    predicate origin. Classified by 10.3 for per-branch outcome. Fed to
-    10.4's bypass planner. Persisted as part of a
-    :class:`BehaviorAnchor` payload by 10.5. Rendered by 10.7's
-    ``DecisionTimeline``.
+    Emitted by 10.1's ``decisions.parse_decisions``. Enriched by 10.2's
+    ``slicing.slice_predicate_origins`` (populates ``predicate_origin``).
+    Classified by 10.3 for per-branch outcome. Fed to 10.4's bypass
+    planner. Persisted as part of a :class:`BehaviorAnchor` payload by
+    10.5. Rendered by 10.7's ``DecisionTimeline``.
 
     The platform-neutral fields below are what the LLM, the cache, and
     the UI all consume. Parser-tier metadata (``src_file``, smali line
     number, raw opcode text) lives one layer above on
     :class:`androscan.analysis.decisions.MethodDecisions`.
+
+    ``predicate_origin`` defaults to ``None`` so 10.1 emits decisions
+    without it; 10.2 returns a ``MethodDecisions`` whose decisions all
+    have ``predicate_origin`` populated (or kept ``None`` on slice
+    failure). Pre-slice ``None`` and post-slice ``None`` look identical
+    by design — 10.5 only invokes the slicer once per anchor walk so
+    the distinction never matters at consumption time.
     """
     method: MethodRef
     instruction_index: int           # 0-based within the containing method body
@@ -282,6 +289,7 @@ class DecisionPoint:
     kind: DecisionKind
     predicate_registers: tuple[str, ...]  # platform-specific register strings (Smali: "v0", "p1", ...)
     branches: tuple[Branch, ...]
+    predicate_origin: Optional["PredicateOrigin"] = None
 
     @property
     def is_switch(self) -> bool:
@@ -292,6 +300,117 @@ class DecisionPoint:
         """``True`` for ``if-eq`` / ``if-ne`` / etc. (compares two
         registers); ``False`` for ``*z`` variants and switches."""
         return self.kind in _TWO_REG_KINDS
+
+
+# ---------------------------------------------------------------------------
+# Predicate origin (10.2 — backward slicing result)
+#
+# Each variant carries a ``kind`` discriminator field so JSON round-trip
+# (``dataclasses.asdict`` + ``json.dumps``) preserves the union variant
+# unambiguously — no custom encoder needed, and 10.5's trace.sqlite +
+# 10.6's wire format both deserialise via a simple ``kind``-keyed
+# dispatch.
+#
+# **Two-register predicate combination policy (DEC-024 v1):** when the
+# decision compares two registers (``if-eq`` / ``if-ne`` / ``if-lt`` /
+# ``if-le`` / ``if-gt`` / ``if-ge``), the slicer slices each register
+# independently and combines them via the priority rule
+# ``MethodCall > FieldRead > Param > Const > Composite > None``. The
+# more-actionable side wins because operators typically want to
+# manipulate the non-constant operand of a value comparison; for
+# two-non-Const cases the higher-priority kind still gives 10.4's
+# bypass planner a usable lever. v2 may widen this to a
+# ``tuple[PredicateOrigin, ...]`` when both sides are equally relevant.
+
+
+@dataclass(frozen=True)
+class MethodCallOrigin:
+    """Predicate value came from a method's return value (``invoke-*``
+    immediately preceding a ``move-result-*``).
+
+    ``invoke_kind`` carries the Smali dispatch kind (``virtual`` /
+    ``static`` / ``direct`` / ``super`` / ``interface`` /
+    ``polymorphic`` / ``custom``) so 10.4's bypass planner can select
+    the right hook template without re-parsing the call site.
+    """
+    method: MethodRef
+    invoke_kind: str
+    kind: str = "method_call"
+
+
+@dataclass(frozen=True)
+class FieldReadOrigin:
+    """Predicate value came from a field read (``iget-*`` for instance
+    fields or ``sget-*`` for static fields).
+
+    ``is_static`` distinguishes the two so 10.4 picks the right
+    ``Java.use(class).fieldName.value = ...`` shape (instance fields
+    need ``this`` capture; static fields don't).
+    """
+    field: FieldRef
+    is_static: bool
+    kind: str = "field_read"
+
+
+@dataclass(frozen=True)
+class ConstOrigin:
+    """Predicate value is a constant literal loaded by a ``const-*``
+    opcode. ``value`` is the raw Smali literal text (``"0x1"``,
+    ``"\\"premium\\""``, ``"#42"``) — preserved verbatim so the
+    operator's mental model of the source survives into the UI.
+    ``smali_op`` records which ``const-*`` variant produced it
+    (``const`` / ``const/4`` / ``const-string`` / etc.).
+    """
+    value: str
+    smali_op: str
+    kind: str = "const"
+
+
+@dataclass(frozen=True)
+class ParamOrigin:
+    """Predicate is an unmodified method parameter — backward walk
+    reached the start of the method body without finding a definition,
+    and the tracked register is a Smali parameter register (``pN``).
+
+    ``register`` is the raw Smali register (``"p0"``, ``"p1"``, ...).
+    Mapping back to a 0-based parameter index requires knowing whether
+    the enclosing method is static (apktool's convention is ``p0 =
+    this`` for instance methods); the slicer doesn't carry that
+    context, so consumers join against
+    :class:`androscan.analysis.smali_parser.MethodDecl.is_static` (or
+    the call-graph store) when they need the index.
+    """
+    register: str
+    kind: str = "param"
+
+
+@dataclass(frozen=True)
+class CompositeOrigin:
+    """Predicate is the result of a composite expression — arithmetic
+    (``add-int``, ``sub-int``, ...), comparison (``cmp-long``,
+    ``cmpl-float``, ...), instance-of (``instance-of``), array access
+    (``aget-*``, ``array-length``), cast (``int-to-byte``, ...),
+    object allocation (``new-instance``, ``new-array``), or exception
+    capture (``move-exception``).
+
+    ``reason`` carries the Smali opcode (e.g. ``"add-int"``,
+    ``"instance-of"``, ``"move-exception"``) so 10.3 / 10.5 / the
+    operator know what kind of computation produced the value. v1
+    deliberately doesn't break composites down further (intra-
+    procedural slicing limitation per DEC-024); 10.5's LLM call can
+    drill in via the source line if needed.
+    """
+    reason: str
+    kind: str = "composite"
+
+
+PredicateOrigin = Union[
+    MethodCallOrigin,
+    FieldReadOrigin,
+    ConstOrigin,
+    ParamOrigin,
+    CompositeOrigin,
+]
 
 
 # ---------------------------------------------------------------------------

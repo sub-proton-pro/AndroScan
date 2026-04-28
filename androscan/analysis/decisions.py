@@ -148,11 +148,21 @@ class MethodDecisions:
     pairs (rather than a dict) so the dataclass remains frozen-hashable
     — 10.3 / 10.5 build their own dicts when they need O(1) lookup.
     Order is the source order labels appeared in the method body.
+
+    ``instructions`` is the raw stripped text of every "real"
+    instruction line in the method body, indexed by ``instruction_index``
+    (so ``instructions[N]`` is the line whose offset is ``N``). This is
+    what enables 10.2's slicer (``androscan.analysis.slicing``) to be a
+    pure function over a :class:`MethodDecisions` without re-reading
+    the .smali file. Default is the empty tuple so callers that build
+    :class:`MethodDecisions` instances by hand (tests, future adapters)
+    don't need to populate it; the parser pass below always does.
     """
     method_signature: str                  # smali key, e.g. "Lcom/example/Foo;->bar(I)V"
     src_file: str                          # apktool-relative path
     decision_points: tuple[DecisionPoint, ...]
     label_index: tuple[tuple[str, int], ...]
+    instructions: tuple[str, ...] = ()
 
 
 @dataclass
@@ -314,6 +324,13 @@ class _MethodState:
         # Output accumulators.
         self._decisions: list[DecisionPoint] = []
         self._label_index: list[tuple[str, int]] = []
+        # Raw text of every "real" instruction line, indexed by
+        # ``_instruction_index`` (so ``self._instructions[N]`` is the
+        # line whose index is ``N``). Populated via :meth:`_emit_instruction`
+        # alongside the index bump so the two stay perfectly in sync —
+        # 10.2's slicer joins ``DecisionPoint.instruction_index``
+        # against this list to walk the method body backward.
+        self._instructions: list[str] = []
         # Walk state.
         self._instruction_index = 0
         self._last_source_line: Optional[int] = None
@@ -321,6 +338,17 @@ class _MethodState:
         # data-label name (``"pswitch_data_0"``). Value is the index in
         # ``self._decisions`` we'll back-fill once the block parses.
         self._pending_switches: dict[str, int] = {}
+
+    def _emit_instruction(self, raw: str) -> None:
+        """Record one "real" instruction line and bump the index.
+
+        The single source of truth for both the index counter and the
+        instructions list — keep this the only place either advances so
+        ``self._instructions[N]`` always equals the line that
+        incremented the index to N+1.
+        """
+        self._instructions.append(raw.strip())
+        self._instruction_index += 1
 
     def consume(self, lines: list[str], i: int) -> int:
         """Process the line at ``lines[i]`` and return how many lines
@@ -366,6 +394,7 @@ class _MethodState:
         m2 = _RE_IF_TWO_REG.match(raw)
         if m2:
             self._record_if(
+                raw=raw,
                 kind=_KIND_BY_TWO_REG_OP[m2.group("op")],
                 regs=(m2.group("reg_a"), m2.group("reg_b")),
                 target=m2.group("target"),
@@ -374,6 +403,7 @@ class _MethodState:
         m1 = _RE_IF_ZERO.match(raw)
         if m1:
             self._record_if(
+                raw=raw,
                 kind=_KIND_BY_ZERO_OP[m1.group("op")],
                 regs=(m1.group("reg"),),
                 target=m1.group("target"),
@@ -382,6 +412,7 @@ class _MethodState:
         sw = _RE_SWITCH_DISPATCH.match(raw)
         if sw:
             self._record_switch_dispatch(
+                raw=raw,
                 kind=DecisionKind.PACKED_SWITCH if sw.group("kind") == "packed" else DecisionKind.SPARSE_SWITCH,
                 reg=sw.group("reg"),
                 data_label=sw.group("data"),
@@ -394,7 +425,7 @@ class _MethodState:
         # are intentionally rejected here so ``.registers`` / ``.locals``
         # / ``.prologue`` / ``.catch`` don't bump the index.
         if not raw.lstrip().startswith(".") and _RE_REAL_INSTRUCTION.match(raw):
-            self._instruction_index += 1
+            self._emit_instruction(raw)
         return 1
 
     # ---- Recording helpers ------------------------------------------------
@@ -402,6 +433,7 @@ class _MethodState:
     def _record_if(
         self,
         *,
+        raw: str,
         kind: DecisionKind,
         regs: tuple[str, ...],
         target: str,
@@ -420,11 +452,12 @@ class _MethodState:
             ),
         )
         self._decisions.append(dp)
-        self._instruction_index += 1
+        self._emit_instruction(raw)
 
     def _record_switch_dispatch(
         self,
         *,
+        raw: str,
         kind: DecisionKind,
         reg: str,
         data_label: str,
@@ -444,7 +477,7 @@ class _MethodState:
         # parses. Frozen dataclasses → we'll rebuild the entry when we
         # know the branches.
         self._pending_switches[data_label] = len(self._decisions) - 1
-        self._instruction_index += 1
+        self._emit_instruction(raw)
 
     def _consume_packed_switch_block(
         self,
@@ -466,8 +499,12 @@ class _MethodState:
         # thread label-vs-data-block bookkeeping through the regular
         # walk.
         data_label = self._pop_recent_label_at(self._instruction_index)
-        # The data block itself counts as one instruction slot.
-        self._instruction_index += 1
+        # The data block itself counts as one instruction slot —
+        # represented in ``self._instructions`` by the ``.packed-switch
+        # <start>`` header line so the slicer's index lookup remains
+        # consistent (the block is opaque to the slicer; it just needs
+        # the slot to exist).
+        self._emit_instruction(lines[i])
 
         case_labels: list[str] = []
         consumed = 1  # for the .packed-switch header
@@ -523,7 +560,9 @@ class _MethodState:
         "what key triggers this branch" survives into the UI.
         """
         data_label = self._pop_recent_label_at(self._instruction_index)
-        self._instruction_index += 1
+        # Same opaque-slot treatment as packed-switch — the
+        # ``.sparse-switch`` header line stands in for the block.
+        self._emit_instruction(lines[i])
 
         entries: list[tuple[str, str]] = []  # (display_key, target_label)
         consumed = 1  # for the .sparse-switch header
@@ -602,6 +641,7 @@ class _MethodState:
             src_file=self.src_file,
             decision_points=decisions,
             label_index=tuple(self._label_index),
+            instructions=tuple(self._instructions),
         )
 
 
