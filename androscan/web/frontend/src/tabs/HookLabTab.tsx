@@ -217,6 +217,7 @@ export function HookLabTab() {
         <CallGraphView
           appId={appId}
           onSelectNode={setSelected}
+          appPackage={defaultPackage}
           hitsByMethod={hitsByMethod}
         />
       </Panel>

@@ -8,6 +8,7 @@ import {
   type CodeTree,
   type DecompileStatus,
 } from "../api/code";
+import { isAppPackage } from "../util/appPackage";
 
 type Selection = { rel_path: string; class_name: string; method?: string };
 
@@ -24,65 +25,6 @@ type Props = {
    *  the user's own code from third-party / framework libraries. */
   appPackage: string | null;
 };
-
-/** Common Android, AndroidX, Kotlin, Google, JetBrains and popular library
- *  prefixes that almost always belong to the SDK / dependencies, not the
- *  app under test. */
-const FRAMEWORK_PREFIXES = [
-  "android.",
-  "androidx.",
-  "com.android.",
-  "com.google.",
-  "com.facebook.",
-  "com.squareup.",
-  "com.bumptech.",
-  "kotlin",
-  "kotlinx.",
-  "org.jetbrains.",
-  "org.intellij.",
-  "org.json.",
-  "org.apache.",
-  "org.slf4j.",
-  "io.reactivex.",
-  "io.netty.",
-  "io.grpc.",
-  "io.opencensus.",
-  "io.opentelemetry.",
-  "rx.",
-  "dagger.",
-  "javax.",
-  "java.",
-  "junit.",
-  "org.junit.",
-  "org.hamcrest.",
-  "okhttp3.",
-  "okio.",
-  "retrofit2.",
-];
-
-function isAppPackage(pkgName: string, appPackage: string | null): boolean {
-  if (!pkgName) return false;
-  if (appPackage) {
-    if (pkgName === appPackage) return true;
-    if (pkgName.startsWith(appPackage + ".")) return true;
-    // Also recognise *ancestors* of the dossier package so the parent
-    // namespace (e.g. ``com.example.weakbank`` when the dossier reports
-    // ``com.example.weakbank.low``) lands in the App bucket too. We
-    // require at least 3 segments to avoid catching bare ``com`` or
-    // ``com.example`` roots that vendors and unrelated apps share.
-    if (
-      appPackage.startsWith(pkgName + ".") &&
-      pkgName.split(".").length >= 3
-    ) {
-      return true;
-    }
-  }
-  for (const p of FRAMEWORK_PREFIXES) {
-    if (pkgName === p || pkgName.startsWith(p)) return false;
-  }
-  if (appPackage) return false;
-  return true;
-}
 
 export function ClassMethodTree({
   appId,

@@ -67,6 +67,7 @@ import {
   type GraphStatusResponse,
 } from "../api/graph";
 import { useWorkbench } from "../context/WorkbenchContext";
+import { appPackagePrefix } from "../util/appPackage";
 import { classNameToJavaRelPath } from "../util/smaliClassToFile";
 
 // Register extensions exactly once. Idempotent with React strict-mode
@@ -90,6 +91,12 @@ type Props = {
   /** Selected node — drives the in-tab CodeView in HookLabTab. The graph
    *  pane never reads this back; it only fires the callback on click. */
   onSelectNode: (sel: SelectedNode | null) => void;
+  /** Dossier package (e.g. ``com.example.weakbank.low``) used by the
+   *  default-on "App only" toggle to drop the bundled-library noise
+   *  from the package overview. ``null`` (no dossier or no package
+   *  field) disables the toggle and falls back to the unfiltered view
+   *  — same behaviour as before this prop existed. */
+  appPackage?: string | null;
   /** Frida hit overlay (sub-step 4.8). ``null`` means no active Frida
    *  session is pinned — the graph renders in its plain 4.2 style.
    *  A ``Map`` (possibly empty) means overlay is active: keys are
@@ -132,7 +139,12 @@ type ContextMenu = {
 // Component
 // ---------------------------------------------------------------------------
 
-export function CallGraphView({ appId, onSelectNode, hitsByMethod }: Props) {
+export function CallGraphView({
+  appId,
+  onSelectNode,
+  appPackage = null,
+  hitsByMethod,
+}: Props) {
   const { setPendingCodeNav, setTab } = useWorkbench();
 
   // Status / data state -----------------------------------------------------
@@ -154,6 +166,19 @@ export function CallGraphView({ appId, onSelectNode, hitsByMethod }: Props) {
   const [focusHops, setFocusHops] = useState(DEFAULT_HOPS);
   const [filter, setFilter] = useState("");
   const [showExternal, setShowExternal] = useState(false);
+  // Default ON whenever we have a known dossier package — the typical
+  // case for any project that's been through ``--apk`` analysis. Falls
+  // back to OFF (same as pre-toggle behaviour) when the dossier
+  // doesn't carry a package field. Operators flip it off to see the
+  // bundled-library jungle (Material / AndroidX / Kotlin / OkHttp …).
+  const [appOnly, setAppOnly] = useState<boolean>(appPackage != null);
+  // Whether the operator has manually touched the toggle since the
+  // current ``appPackage`` resolved. Until then we keep auto-flipping
+  // the default whenever the dossier transitions null → "com.example.…"
+  // (dossier loads async, so the initial useState above sees ``null``
+  // for the first render or two). Once the operator clicks, we never
+  // override their choice.
+  const userTouchedAppOnly = useRef(false);
   const [ctxMenu, setCtxMenu] = useState<ContextMenu | null>(null);
 
   // Cytoscape ---------------------------------------------------------------
@@ -198,7 +223,36 @@ export function CallGraphView({ appId, onSelectNode, hitsByMethod }: Props) {
     return () => window.clearInterval(id);
   }, [appId, cgState]);
 
+  // -------- App-only toggle: auto-default on dossier resolve ---------------
+  // The dossier loads asynchronously after mount, so the initial
+  // ``useState(appPackage != null)`` reads ``null`` for the first
+  // render or two. Re-default the toggle whenever ``appPackage``
+  // transitions to a non-null value, but stop the moment the operator
+  // touches it themselves so we don't fight a manual choice. Also
+  // reset the "user touched" sentinel when the project (``appId``)
+  // changes so each project gets its own fresh default.
+  useEffect(() => {
+    userTouchedAppOnly.current = false;
+  }, [appId]);
+  useEffect(() => {
+    if (userTouchedAppOnly.current) return;
+    setAppOnly(appPackage != null);
+  }, [appPackage]);
+
   // -------- Graph data fetch (package mode) --------------------------------
+  // ``appOnly`` translates to a server-side ``package_prefix`` filter
+  // (``c.package LIKE 'com.example.weakbank%'`` in ``list_graph``).
+  // That keeps the response well under the 5000-node frontend cap even
+  // for apps that ship hundreds of bundled-library packages — the
+  // pre-toggle behaviour was that ``com.example.weakbank``'s methods
+  // (parsed last because their smali lives in ``smali_classes2/``)
+  // landed in the tail and got truncated, so the filter input had
+  // nothing to match. ``appPackagePrefix`` widens to the dossier
+  // package's parent (drops one segment) so sibling-flavour apps
+  // (``.low`` / ``.medium`` / ``.high`` builds of the same product)
+  // share one overview when the operator switches between them.
+  const packagePrefix =
+    appOnly && appPackage ? appPackagePrefix(appPackage) : null;
   useEffect(() => {
     if (!appId || cgState !== "ready") return;
     if (viewMode !== "package") return;
@@ -207,6 +261,7 @@ export function CallGraphView({ appId, onSelectNode, hitsByMethod }: Props) {
     setGraphError(null);
     void fetchGraph(appId, {
       includeExternal: showExternal,
+      packagePrefix: packagePrefix ?? undefined,
       limit: 5000,
     }).then((res: ApiResult<GraphListResponse>) => {
       if (cancelled) return;
@@ -221,7 +276,7 @@ export function CallGraphView({ appId, onSelectNode, hitsByMethod }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [appId, cgState, viewMode, showExternal]);
+  }, [appId, cgState, viewMode, showExternal, packagePrefix]);
 
   // -------- Graph data fetch (focus mode) ----------------------------------
   useEffect(() => {
@@ -510,6 +565,25 @@ export function CallGraphView({ appId, onSelectNode, hitsByMethod }: Props) {
             disabled={cgState !== "ready"}
           />{" "}
           External
+        </label>
+        <label
+          style={toggleLabelStyle}
+          title={
+            appPackage
+              ? `Hide bundled libraries (Material/AndroidX/Kotlin/etc.) — show only packages under ${appPackagePrefix(appPackage)}`
+              : "Dossier has no package — load a project before toggling"
+          }
+        >
+          <input
+            type="checkbox"
+            checked={appOnly}
+            onChange={(e) => {
+              userTouchedAppOnly.current = true;
+              setAppOnly(e.target.checked);
+            }}
+            disabled={cgState !== "ready" || !appPackage}
+          />{" "}
+          App only
         </label>
         {viewMode === "focus" && (
           <span style={hopsStepperStyle}>
