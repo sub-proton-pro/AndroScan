@@ -253,6 +253,23 @@ def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _format_build_error(e: BaseException) -> str:
+    """Render an exception into the ``meta.error`` string the Settings →
+    Status card displays.
+
+    On Python 3.11+ ``sqlite3.Error`` instances expose ``sqlite_errorname``
+    / ``sqlite_errorcode`` carrying SQLite's extended result code (e.g.
+    ``SQLITE_IOERR_FSYNC`` vs the plain ``disk I/O error`` text). Surfacing
+    that suffix turns an opaque generic IO failure into an actionable
+    diagnosis (fsync vs lock vs shm-open vs cantopen).
+    Falls back gracefully on older Pythons and on non-SQLite exceptions
+    where these attributes are absent.
+    """
+    code = getattr(e, "sqlite_errorname", None) or getattr(e, "sqlite_errorcode", None)
+    suffix = f" [{code}]" if code is not None else ""
+    return f"{type(e).__name__}: {e}{suffix}"[:2000]
+
+
 def _safe_int(s: Optional[str]) -> Optional[int]:
     if s is None or s == "":
         return None
@@ -773,7 +790,7 @@ def build_index(
                 _ensure_schema(conn)
                 _meta_set(conn, "status", "failed")
                 _meta_set(conn, "finished_at", str(time.time()))
-                _meta_set(conn, "error", f"{type(e).__name__}: {e}"[:2000])
+                _meta_set(conn, "error", _format_build_error(e))
         except sqlite3.Error:
             pass
         raise
@@ -819,7 +836,7 @@ def start_build_async(
                 with _connect(db, write=True) as conn:
                     _ensure_schema(conn)
                     _meta_set(conn, "status", "failed")
-                    _meta_set(conn, "error", f"{type(e).__name__}: {e}"[:2000])
+                    _meta_set(conn, "error", _format_build_error(e))
                     _meta_set(conn, "finished_at", str(time.time()))
             except sqlite3.Error:
                 pass

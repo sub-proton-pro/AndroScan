@@ -267,3 +267,46 @@ def test_dump_meta_returns_all_keys(tmp_path: Path) -> None:
     assert meta.get("sha") == SHA
     assert meta.get("fidelity_level") == call_graph.FIDELITY
     assert int(meta.get("edge_count", "0")) > 0
+
+
+# ---------------------------------------------------------------------------
+# _format_build_error: turns the opaque ``OperationalError: disk I/O error``
+# into something operators can act on (SQLITE_IOERR_FSYNC vs LOCK vs
+# SHMOPEN vs CANTOPEN). Without the suffix every flavour of SQLITE_IOERR_*
+# renders identically in the Settings → Status card.
+
+
+def test_format_build_error_includes_sqlite_errorname(tmp_path: Path) -> None:
+    """Real ``sqlite3.OperationalError`` instances carry
+    ``sqlite_errorname`` on Python 3.11+; the helper must surface it."""
+    import sqlite3
+    try:
+        sqlite3.connect(str(tmp_path / "no" / "such" / "dir.sqlite"))
+    except sqlite3.OperationalError as e:
+        msg = call_graph._format_build_error(e)
+        assert msg.startswith("OperationalError: ")
+        assert "unable to open database file" in msg
+        # Python 3.11+ exposes the extended result code; older runtimes
+        # gracefully omit the suffix (the helper's getattr fallback).
+        if getattr(e, "sqlite_errorname", None):
+            assert "[SQLITE_CANTOPEN]" in msg
+    else:  # pragma: no cover - defensive: connect should always raise
+        pytest.fail("expected sqlite3.OperationalError")
+
+
+def test_format_build_error_handles_non_sqlite_exception() -> None:
+    """Non-SQLite errors (apktool subprocess crash, parser bug, etc.) must
+    not break the helper — they just lack the bracketed suffix."""
+    err = ValueError("smali parser blew up")
+    msg = call_graph._format_build_error(err)
+    assert msg == "ValueError: smali parser blew up"
+    assert "[" not in msg
+
+
+def test_format_build_error_truncates_huge_messages() -> None:
+    """Cap matches the previous 2000-char ceiling so long stack-style
+    messages don't blow out the meta row."""
+    err = RuntimeError("x" * 5000)
+    msg = call_graph._format_build_error(err)
+    assert len(msg) == 2000
+    assert msg.startswith("RuntimeError: ")
