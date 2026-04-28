@@ -32,9 +32,12 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type RefObject,
 } from "react";
 import cytoscape, {
   type Core,
@@ -180,6 +183,20 @@ export function CallGraphView({
   // override their choice.
   const userTouchedAppOnly = useRef(false);
   const [ctxMenu, setCtxMenu] = useState<ContextMenu | null>(null);
+
+  // -------- Search dropdown state -----------------------------------------
+  // ``searchOpen`` is the "popover visible" flag. We open it on first
+  // keystroke (filter goes non-empty *and* input is focused), close on
+  // Escape / blur-outside / click-outside / Enter on a result.
+  // ``activeHitIdx`` is a flat index over the concatenated
+  // packages+classes+methods array (see ``flattenHits``); ↑/↓ walk
+  // it, Enter activates. Reset to 0 on every filter change so the
+  // first match is always pre-selected.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [activeHitIdx, setActiveHitIdx] = useState(0);
+  const searchAnchorRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchListRef = useRef<HTMLUListElement | null>(null);
 
   // Cytoscape ---------------------------------------------------------------
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -533,6 +550,113 @@ export function CallGraphView({
     [appId, setPendingCodeNav, setTab],
   );
 
+  // -------- Search dropdown wiring -----------------------------------------
+  // Recompute hits on every filter or graph change. ``searchGraph`` is
+  // pure and bounded (capped at ``SEARCH_HIT_LIMIT`` per section), so
+  // re-running it on each keystroke is cheap even on large graphs.
+  const searchHits = useMemo(
+    () => searchGraph(graph, filter),
+    [graph, filter],
+  );
+  const flatHits = useMemo(() => flattenHits(searchHits), [searchHits]);
+  const flatHitsLength = flatHits.length;
+
+  // Open the dropdown the moment the filter goes non-empty *and* the
+  // input is focused. Close (and reset the active row) when the filter
+  // clears. The blur-outside / click-outside / Escape paths close it
+  // independently below.
+  useEffect(() => {
+    if (!filter.trim()) {
+      setSearchOpen(false);
+      setActiveHitIdx(0);
+      return;
+    }
+    if (document.activeElement === searchInputRef.current) {
+      setSearchOpen(true);
+    }
+    setActiveHitIdx(0);
+  }, [filter]);
+
+  // Click-outside handler — only attached while the popover is open so
+  // we don't pay the document-level listener cost during the typical
+  // "operator isn't searching" idle state.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (!searchAnchorRef.current) return;
+      if (!searchAnchorRef.current.contains(e.target as Node)) {
+        setSearchOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [searchOpen]);
+
+  // Keep the active row scrolled into view when keyboard nav crosses
+  // a section break or pushes past the visible viewport.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const list = searchListRef.current;
+    if (!list) return;
+    const el = list.querySelector<HTMLLIElement>(
+      `li[data-hit-idx="${activeHitIdx}"]`,
+    );
+    if (el) el.scrollIntoView({ block: "nearest" });
+  }, [activeHitIdx, searchOpen]);
+
+  // Activate a single hit — same control flow as clicking the
+  // corresponding node in the graph: package / class drill into focus
+  // mode at their first-method node; method also fires
+  // ``onSelectNode`` so the right-pane decompile view opens. Filter is
+  // cleared so the focus subgraph isn't immediately filtered down to
+  // just the typed substring.
+  const activateHit = useCallback(
+    (hit: SearchHit) => {
+      setSearchOpen(false);
+      setFilter("");
+      setViewMode("focus");
+      setFocusNodeId(hit.firstNodeId);
+      setCtxMenu(null);
+      if (hit.kind === "method" && hit.node) {
+        onSelectNode(toSelected(hit.node, hit.klass));
+      }
+    },
+    [onSelectNode],
+  );
+
+  // Keyboard handler bound to the input. ↑/↓ walk active row,
+  // Enter activates, Escape closes. Tab is left to the browser so
+  // the operator can move focus out of the input without trapping.
+  const onSearchKeyDown = useCallback(
+    (e: ReactKeyboardEvent<HTMLInputElement>) => {
+      if (!searchOpen || flatHitsLength === 0) {
+        if (e.key === "ArrowDown" && filter.trim()) {
+          // Re-open if user pressed down after a programmatic close.
+          setSearchOpen(true);
+          e.preventDefault();
+        }
+        return;
+      }
+      if (e.key === "ArrowDown") {
+        setActiveHitIdx((i) => (i + 1) % flatHitsLength);
+        e.preventDefault();
+      } else if (e.key === "ArrowUp") {
+        setActiveHitIdx((i) => (i - 1 + flatHitsLength) % flatHitsLength);
+        e.preventDefault();
+      } else if (e.key === "Enter") {
+        const hit = flatHits[activeHitIdx];
+        if (hit) {
+          activateHit(hit);
+          e.preventDefault();
+        }
+      } else if (e.key === "Escape") {
+        setSearchOpen(false);
+        e.preventDefault();
+      }
+    },
+    [searchOpen, flatHits, flatHitsLength, activeHitIdx, filter, activateHit],
+  );
+
   // -------- Render ---------------------------------------------------------
   const overlay = pickOverlay({
     appId,
@@ -547,16 +671,73 @@ export function CallGraphView({
   return (
     <div className="callgraph-pane" style={paneStyle}>
       <div className="callgraph-toolbar" style={toolbarStyle}>
-        <input
-          className="callgraph-filter"
-          type="text"
-          placeholder="Filter package, class, or method…"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          spellCheck={false}
-          style={filterStyle}
-          disabled={cgState !== "ready"}
-        />
+        <div ref={searchAnchorRef} style={searchAnchorStyle}>
+          <input
+            ref={searchInputRef}
+            className="callgraph-filter"
+            type="text"
+            placeholder="Filter package, class, or method…"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            onFocus={() => {
+              if (filter.trim() && flatHitsLength > 0) setSearchOpen(true);
+            }}
+            onKeyDown={onSearchKeyDown}
+            spellCheck={false}
+            style={searchInputStyle}
+            disabled={cgState !== "ready"}
+            role="combobox"
+            aria-expanded={searchOpen}
+            aria-controls="callgraph-search-listbox"
+            aria-autocomplete="list"
+            aria-activedescendant={
+              searchOpen && flatHitsLength > 0
+                ? `callgraph-search-hit-${activeHitIdx}`
+                : undefined
+            }
+          />
+          <button
+            type="button"
+            className="callgraph-btn"
+            style={searchToggleBtnStyle}
+            onClick={() => {
+              if (searchOpen) {
+                setSearchOpen(false);
+              } else if (filter.trim()) {
+                setSearchOpen(true);
+                searchInputRef.current?.focus();
+              } else {
+                searchInputRef.current?.focus();
+              }
+            }}
+            disabled={cgState !== "ready"}
+            title={
+              searchOpen ? "Hide suggestions" : "Show suggestions"
+            }
+            aria-label={
+              searchOpen ? "Hide suggestions" : "Show suggestions"
+            }
+          >
+            {searchOpen ? "▲" : "▼"}
+          </button>
+          {searchOpen && flatHitsLength > 0 && (
+            <SearchDropdown
+              hits={searchHits}
+              activeIdx={activeHitIdx}
+              onHover={setActiveHitIdx}
+              onActivate={activateHit}
+              listRef={searchListRef}
+            />
+          )}
+          {searchOpen && flatHitsLength === 0 && filter.trim() && graph && (
+            <div style={searchEmptyStyle}>
+              No matches in loaded graph data
+              {graph.total_nodes > graph.nodes.length
+                ? ` (truncated to ${graph.nodes.length} of ${graph.total_nodes} — try toggling "App only")`
+                : ""}
+            </div>
+          )}
+        </div>
         <label style={toggleLabelStyle}>
           <input
             type="checkbox"
@@ -675,6 +856,204 @@ function toSelected(node: GraphNode, klass: GraphClass | undefined): SelectedNod
     package: klass?.package ?? "",
     javaRelPath: classNameToJavaRelPath(cls),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar search dropdown — typeahead over loaded graph data
+// ---------------------------------------------------------------------------
+
+/** One suggestion row in the dropdown. ``firstNodeId`` is the click
+ *  target — drilling into focus mode rooted there. ``node`` / ``klass``
+ *  are populated for ``method`` rows so ``onSelectNode`` can fire. */
+export type SearchHit = {
+  kind: "package" | "class" | "method";
+  /** Display label shown to the operator (the package name, class name,
+   *  or method name in context like ``MainActivity.onCreate``). */
+  label: string;
+  /** Secondary line shown muted under the label (e.g. ``5 classes ·
+   *  139 methods`` for a package, ``com.example.weakbank`` for a class
+   *  or method). */
+  secondary: string;
+  /** Score for ranking — lower is better. ``0`` exact, ``100``
+   *  prefix, ``200`` substring; ties broken by match position. */
+  score: number;
+  firstNodeId: number;
+  /** Method-row only — used by ``onSelectNode`` to populate the
+   *  right-pane decompile view; class / package rows leave it null
+   *  and rely on ``firstNodeId`` for the drill. */
+  node?: GraphNode;
+  klass?: GraphClass;
+};
+
+export type SearchHitGroups = {
+  packages: SearchHit[];
+  classes: SearchHit[];
+  methods: SearchHit[];
+};
+
+/** Cap per section. The dropdown shows three sections; each is sorted
+ *  by score then alphabetically and truncated to this many entries.
+ *  25 is a balance between "covers most relevant matches" and "fits
+ *  on one screen without internal scrolling at typical viewport
+ *  heights". */
+const SEARCH_HIT_LIMIT = 25;
+
+function scoreMatch(haystack: string, needle: string): number | null {
+  if (!haystack) return null;
+  const h = haystack.toLowerCase();
+  if (h === needle) return 0;
+  if (h.startsWith(needle)) return 100;
+  const idx = h.indexOf(needle);
+  if (idx < 0) return null;
+  // Substring rank: 200 base + match offset, so earlier matches beat
+  // later ones, and shorter haystacks tiebreak below in the comparator.
+  return 200 + idx;
+}
+
+function compareHits(a: SearchHit, b: SearchHit): number {
+  if (a.score !== b.score) return a.score - b.score;
+  if (a.label.length !== b.label.length) return a.label.length - b.label.length;
+  return a.label.localeCompare(b.label);
+}
+
+/** Pure-function ranker — pulls suggestion candidates out of the
+ *  already-loaded ``graph`` data (the same dataset the package
+ *  overview renders from). Empty / whitespace-only queries return
+ *  three empty arrays (the dropdown closes itself in that case).
+ *
+ *  Three sections in priority order:
+ *    1. Packages — matched on ``cls.package``
+ *    2. Classes  — matched on the simple name OR the dotted FQN
+ *    3. Methods  — matched on the bare ``method_name`` OR the
+ *       compound ``ClassName.method_name`` (so typing
+ *       ``MainActivity.onCreate`` finds the right one across
+ *       overloads in different classes)
+ *
+ *  External nodes are skipped (the operator's filter input was for
+ *  navigating in-app code; the existing **External** toggle covers
+ *  rendering them). The ``classes`` array is iterated once to build
+ *  the package + class hits and a class-id → first-node-id map so
+ *  the method loop can reuse it. */
+export function searchGraph(
+  graph: GraphListResponse | null,
+  query: string,
+  limit: number = SEARCH_HIT_LIMIT,
+): SearchHitGroups {
+  const empty: SearchHitGroups = { packages: [], classes: [], methods: [] };
+  if (!graph) return empty;
+  const q = query.trim().toLowerCase();
+  if (!q) return empty;
+
+  // First pass: aggregate per-package + per-class metadata so package
+  // and class rows render with operator-useful counts and so we can
+  // resolve "click drills into focus mode at the first method node".
+  const classMap = new Map<number, GraphClass>();
+  for (const c of graph.classes) classMap.set(c.id, c);
+  const firstNodeByClass = new Map<number, number>();
+  const firstNodeByPkg = new Map<string, number>();
+  const pkgClasses = new Map<string, Set<number>>();
+  const pkgMethods = new Map<string, number>();
+  for (const n of graph.nodes) {
+    if (n.is_external) continue;
+    const cls = classMap.get(n.class_id);
+    if (!cls || cls.is_external) continue;
+    if (!firstNodeByClass.has(cls.id)) firstNodeByClass.set(cls.id, n.id);
+    const pkg = cls.package || "(default)";
+    if (!firstNodeByPkg.has(pkg)) firstNodeByPkg.set(pkg, n.id);
+    let cs = pkgClasses.get(pkg);
+    if (!cs) {
+      cs = new Set();
+      pkgClasses.set(pkg, cs);
+    }
+    cs.add(cls.id);
+    pkgMethods.set(pkg, (pkgMethods.get(pkg) ?? 0) + 1);
+  }
+
+  // Package hits — one row per unique package whose name matches.
+  const packageHits: SearchHit[] = [];
+  for (const [pkg, firstNodeId] of firstNodeByPkg) {
+    const score = scoreMatch(pkg, q);
+    if (score == null) continue;
+    const ncls = pkgClasses.get(pkg)?.size ?? 0;
+    const nmet = pkgMethods.get(pkg) ?? 0;
+    packageHits.push({
+      kind: "package",
+      label: pkg,
+      secondary: `${ncls} class${ncls === 1 ? "" : "es"} · ${nmet} method${nmet === 1 ? "" : "s"}`,
+      score,
+      firstNodeId,
+    });
+  }
+  packageHits.sort(compareHits);
+
+  // Class hits — matched on simple name OR dotted FQN. We score against
+  // both and keep the better of the two so typing ``MainActivity``
+  // catches both ``com.example.weakbank.MainActivity`` (FQN substring
+  // 200+offset) and the bare simple-name (prefix=100), with the bare
+  // form winning the tiebreak.
+  const classHits: SearchHit[] = [];
+  for (const cls of graph.classes) {
+    if (cls.is_external) continue;
+    const firstNodeId = firstNodeByClass.get(cls.id);
+    if (firstNodeId == null) continue;
+    const sSimple = scoreMatch(cls.simple_name, q);
+    const sFqn = scoreMatch(cls.class_name, q);
+    const score =
+      sSimple == null ? sFqn : sFqn == null ? sSimple : Math.min(sSimple, sFqn);
+    if (score == null) continue;
+    classHits.push({
+      kind: "class",
+      label: cls.simple_name || cls.class_name,
+      secondary: cls.package || "(default)",
+      score,
+      firstNodeId,
+    });
+  }
+  classHits.sort(compareHits);
+
+  // Method hits — matched on bare ``method_name`` OR
+  // ``Class.method_name``. The compound form lets ``MainActivity.on``
+  // narrow to the activity's lifecycle methods even when ``on`` is a
+  // common substring across the whole graph.
+  const methodHits: SearchHit[] = [];
+  for (const n of graph.nodes) {
+    if (n.is_external) continue;
+    const cls = classMap.get(n.class_id);
+    if (!cls || cls.is_external) continue;
+    const compound = `${cls.simple_name}.${n.method_name}`;
+    const sBare = scoreMatch(n.method_name, q);
+    const sCompound = scoreMatch(compound, q);
+    const score =
+      sBare == null
+        ? sCompound
+        : sCompound == null
+          ? sBare
+          : Math.min(sBare, sCompound);
+    if (score == null) continue;
+    methodHits.push({
+      kind: "method",
+      label: compound,
+      secondary: cls.package || "(default)",
+      score,
+      firstNodeId: n.id,
+      node: n,
+      klass: cls,
+    });
+  }
+  methodHits.sort(compareHits);
+
+  return {
+    packages: packageHits.slice(0, limit),
+    classes: classHits.slice(0, limit),
+    methods: methodHits.slice(0, limit),
+  };
+}
+
+/** Flattened ordering of all hits across the three sections — drives
+ *  the keyboard-nav active-index walk. Packages first, then classes,
+ *  then methods (matches visual order in the popover). */
+export function flattenHits(g: SearchHitGroups): SearchHit[] {
+  return [...g.packages, ...g.classes, ...g.methods];
 }
 
 function lookupClass(classes: GraphClass[], id: number): GraphClass | undefined {
@@ -1238,6 +1617,163 @@ function Overlay(props: {
   );
 }
 
+// -------- Toolbar search dropdown popover --------------------------------
+
+/** Popover anchored under the filter input. Renders three sections
+ *  (Packages / Classes / Methods) with section headers + per-row
+ *  hover & active-row highlight. The active row tracking is owned by
+ *  the parent so keyboard nav (↑/↓ on the input) and mouse hover
+ *  share one source of truth.
+ *
+ *  ``data-hit-idx`` mirrors the flat index produced by ``flattenHits``
+ *  so the parent's "scroll active into view" effect can find the
+ *  right ``<li>`` cheaply. */
+function SearchDropdown(props: {
+  hits: SearchHitGroups;
+  activeIdx: number;
+  onHover: (idx: number) => void;
+  onActivate: (hit: SearchHit) => void;
+  listRef: RefObject<HTMLUListElement>;
+}) {
+  const { hits, activeIdx, onHover, onActivate, listRef } = props;
+  const sections: Array<{
+    label: string;
+    rows: SearchHit[];
+    base: number;
+  }> = [
+    { label: "Packages", rows: hits.packages, base: 0 },
+    {
+      label: "Classes",
+      rows: hits.classes,
+      base: hits.packages.length,
+    },
+    {
+      label: "Methods",
+      rows: hits.methods,
+      base: hits.packages.length + hits.classes.length,
+    },
+  ];
+  return (
+    <ul
+      ref={listRef}
+      id="callgraph-search-listbox"
+      role="listbox"
+      style={searchDropdownStyle}
+    >
+      {sections.map((sec) => {
+        if (sec.rows.length === 0) return null;
+        return (
+          <li key={sec.label} style={{ listStyle: "none" }}>
+            <div style={searchSectionHeaderStyle}>
+              {sec.label}{" "}
+              <span className="muted small">({sec.rows.length})</span>
+            </div>
+            <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+              {sec.rows.map((hit, i) => {
+                const idx = sec.base + i;
+                const active = idx === activeIdx;
+                return (
+                  <li
+                    key={`${hit.kind}-${hit.firstNodeId}-${i}`}
+                    id={`callgraph-search-hit-${idx}`}
+                    role="option"
+                    aria-selected={active}
+                    data-hit-idx={idx}
+                    style={
+                      active
+                        ? { ...searchRowStyle, ...searchRowActiveStyle }
+                        : searchRowStyle
+                    }
+                    onMouseEnter={() => onHover(idx)}
+                    onMouseDown={(e) => {
+                      // Use mousedown not click so the input doesn't blur
+                      // before we get a chance to handle the activation.
+                      e.preventDefault();
+                      onActivate(hit);
+                    }}
+                  >
+                    <div style={searchRowLabelStyle}>{hit.label}</div>
+                    {hit.secondary && (
+                      <div className="muted small" style={searchRowSecondaryStyle}>
+                        {hit.secondary}
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </li>
+        );
+      })}
+      <li style={searchHintRowStyle}>
+        <span className="muted small">↑↓ navigate · ↵ open · esc close</span>
+      </li>
+    </ul>
+  );
+}
+
+const searchDropdownStyle: CSSProperties = {
+  position: "absolute",
+  top: "calc(100% + 4px)",
+  left: 0,
+  right: 0,
+  maxHeight: "60vh",
+  overflowY: "auto",
+  background: "var(--panel-2)",
+  border: "1px solid var(--border)",
+  borderRadius: 4,
+  padding: "0.25rem 0",
+  margin: 0,
+  fontSize: "0.78rem",
+  zIndex: 30,
+  boxShadow: "0 4px 12px rgba(0, 0, 0, 0.3)",
+};
+
+const searchSectionHeaderStyle: CSSProperties = {
+  padding: "0.3rem 0.6rem 0.15rem 0.6rem",
+  fontSize: "0.7rem",
+  textTransform: "uppercase",
+  letterSpacing: "0.04em",
+  color: "var(--muted)",
+  borderTop: "1px solid var(--border)",
+};
+
+const searchRowStyle: CSSProperties = {
+  padding: "0.3rem 0.6rem",
+  cursor: "pointer",
+  borderLeft: "2px solid transparent",
+};
+
+const searchRowActiveStyle: CSSProperties = {
+  background: "var(--panel-3, rgba(56, 139, 253, 0.15))",
+  borderLeftColor: "var(--accent, #58a6ff)",
+};
+
+const searchRowLabelStyle: CSSProperties = {
+  color: "var(--text)",
+  fontFamily:
+    "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+};
+
+const searchRowSecondaryStyle: CSSProperties = {
+  fontFamily:
+    "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+  marginTop: "0.05rem",
+  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+};
+
+const searchHintRowStyle: CSSProperties = {
+  padding: "0.3rem 0.6rem 0.15rem 0.6rem",
+  borderTop: "1px solid var(--border)",
+  textAlign: "right",
+  listStyle: "none",
+};
+
 // -------- Right-click context menu ---------------------------------------
 
 function ContextMenuBox(props: {
@@ -1509,15 +2045,57 @@ const toolbarStyle: CSSProperties = {
   flexWrap: "wrap",
 };
 
-const filterStyle: CSSProperties = {
+// Wrapper around the search input + dropdown — needs ``position:
+// relative`` so the popover anchors to it. ``flex: 1 1 12em`` keeps
+// the same width behaviour the bare ``filterStyle`` had before the
+// dropdown was introduced.
+const searchAnchorStyle: CSSProperties = {
+  position: "relative",
+  display: "flex",
+  alignItems: "stretch",
   flex: "1 1 12em",
   minWidth: "8em",
+};
+
+const searchInputStyle: CSSProperties = {
+  flex: 1,
+  minWidth: 0,
   background: "var(--bg)",
   border: "1px solid var(--border)",
+  borderRight: "none",
   color: "var(--text)",
-  borderRadius: 4,
+  borderRadius: "4px 0 0 4px",
   padding: "0.25rem 0.5rem",
   fontSize: "0.8rem",
+};
+
+// Right-edge chevron button. Visually attached to the input via
+// ``border-radius: 0 4px 4px 0`` and a single shared border line.
+const searchToggleBtnStyle: CSSProperties = {
+  flex: "0 0 auto",
+  borderRadius: "0 4px 4px 0",
+  padding: "0 0.55rem",
+  fontSize: "0.7rem",
+  lineHeight: 1,
+};
+
+// Empty-state pill rendered below the input when the operator's
+// query genuinely matches nothing in the loaded graph data — flags
+// the truncation case explicitly so they know to flip "App only"
+// when they're hunting for app code that fell off the 5000-node page.
+const searchEmptyStyle: CSSProperties = {
+  position: "absolute",
+  top: "calc(100% + 4px)",
+  left: 0,
+  right: 0,
+  background: "var(--panel-2)",
+  border: "1px solid var(--border)",
+  borderRadius: 4,
+  padding: "0.4rem 0.6rem",
+  fontSize: "0.78rem",
+  color: "var(--muted)",
+  zIndex: 30,
+  boxShadow: "0 4px 12px rgba(0, 0, 0, 0.3)",
 };
 
 const toggleLabelStyle: CSSProperties = {
