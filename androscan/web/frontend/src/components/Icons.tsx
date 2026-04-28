@@ -111,3 +111,26 @@ export function IconOpenIn(props: IconProps) {
     </Base>
   );
 }
+
+export function IconCopy(props: IconProps) {
+  // Classic "copy to clipboard" glyph: two overlapping rounded
+  // rectangles (front sheet over back sheet). Matches the affordance
+  // GitHub / Cursor / VS Code use on inline code blocks so operators
+  // recognise it without a tooltip.
+  return (
+    <Base {...props}>
+      <rect x="5.5" y="2.5" width="8" height="8" rx="1.4" />
+      <rect x="2.5" y="5.5" width="8" height="8" rx="1.4" />
+    </Base>
+  );
+}
+
+export function IconCheck(props: IconProps) {
+  // Used as the post-copy confirmation state in place of a "copied"
+  // text label so the button stays icon-sized.
+  return (
+    <Base {...props}>
+      <polyline points="3,8.5 6.5,12 13,4.5" />
+    </Base>
+  );
+}

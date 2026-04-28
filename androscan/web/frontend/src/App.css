@@ -2803,19 +2803,29 @@ code { color: var(--accent); }
 
 .frida-install-copy-btn {
   flex-shrink: 0;
-  font-size: 0.65rem;
-  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   border-radius: 3px;
   border: 1px solid var(--border);
   background: var(--panel-bg, var(--bg));
   color: var(--muted);
   cursor: pointer;
   font-family: inherit;
+  transition: color 120ms ease, border-color 120ms ease;
 }
 
 .frida-install-copy-btn:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.frida-install-copy-btn.copied {
+  color: var(--ok);
+  border-color: var(--ok);
 }
 
 .diag-json {

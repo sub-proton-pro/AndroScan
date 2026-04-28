@@ -33,6 +33,7 @@ import {
 } from "../api/status";
 import { rebuildRagIndex } from "../api/rag";
 import { rebuildGraph } from "../api/graph";
+import { IconCheck, IconCopy } from "../components/Icons";
 import { useWorkbench } from "../context/WorkbenchContext";
 
 type Section = "global" | "perApp" | "status" | "diagnostics";
@@ -1153,11 +1154,12 @@ function FridaInstallCmd({ cmd }: { cmd: string }) {
       <code>{cmd}</code>
       <button
         type="button"
-        className="frida-install-copy-btn"
+        className={copied ? "frida-install-copy-btn copied" : "frida-install-copy-btn"}
         onClick={onCopy}
-        title="Copy command to clipboard"
+        title={copied ? "Copied" : "Copy command to clipboard"}
+        aria-label={copied ? "Copied" : "Copy command to clipboard"}
       >
-        {copied ? "copied" : "copy"}
+        {copied ? <IconCheck size={13} /> : <IconCopy size={13} />}
       </button>
     </div>
   );
