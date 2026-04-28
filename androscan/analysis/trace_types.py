@@ -267,9 +267,10 @@ class DecisionPoint:
 
     Emitted by 10.1's ``decisions.parse_decisions``. Enriched by 10.2's
     ``slicing.slice_predicate_origins`` (populates ``predicate_origin``).
-    Classified by 10.3 for per-branch outcome. Fed to 10.4's bypass
-    planner. Persisted as part of a :class:`BehaviorAnchor` payload by
-    10.5. Rendered by 10.7's ``DecisionTimeline``.
+    Classified by 10.3's ``branch_classifier.classify_branch_outcomes``
+    (populates ``branch_outcome``). Fed to 10.4's bypass planner.
+    Persisted as part of a :class:`BehaviorAnchor` payload by 10.5.
+    Rendered by 10.7's ``DecisionTimeline``.
 
     The platform-neutral fields below are what the LLM, the cache, and
     the UI all consume. Parser-tier metadata (``src_file``, smali line
@@ -290,6 +291,7 @@ class DecisionPoint:
     predicate_registers: tuple[str, ...]  # platform-specific register strings (Smali: "v0", "p1", ...)
     branches: tuple[Branch, ...]
     predicate_origin: Optional["PredicateOrigin"] = None
+    branch_outcome: Optional["BranchOutcome"] = None
 
     @property
     def is_switch(self) -> bool:
@@ -411,6 +413,69 @@ PredicateOrigin = Union[
     ParamOrigin,
     CompositeOrigin,
 ]
+
+
+# ---------------------------------------------------------------------------
+# Branch outcome (10.3 — heuristic deterministic classification)
+#
+# Per :class:`DecisionPoint`, the classifier walks each branch's basic
+# block and scores it against a fixed catalog of pentest-relevant
+# signals (DENY: ``throw`` / ``System.exit`` / ``Process.killProcess``
+# / ``Activity.finish`` / curated string-keyword regex; ALLOW:
+# ``setResult`` / ``startActivity*``; weak DENY: branch-length ratio).
+# Each branch ends up with a verdict in ``{deny, allow, neutral}``
+# plus a signed ``score`` and the human-readable list of ``reasons``
+# that fired.
+#
+# **Confidence tiers (10.3 contract)** — based on
+# ``max(|branch.score|)`` across all branches:
+#
+# * ``>= 1.0`` → ``1.00`` (strong signal — operator can trust the
+#   verdict without LLM review)
+# * ``>= 0.7`` → ``0.85`` (moderate / string-keyword signal — still
+#   above the 0.6 threshold, no LLM re-classification needed)
+# * ``>= 0.3`` → ``0.45`` (weak signal only — *below* threshold;
+#   10.5's ``trace_behavior`` skill will invoke the LLM to re-classify)
+# * else → ``0.00`` (no signals — LLM re-classifies)
+#
+# Pre-classification, ``DecisionPoint.branch_outcome`` is ``None``;
+# post-classification it's always populated (even when verdicts are
+# all neutral and confidence is 0.0) so 10.5 can distinguish "didn't
+# run the classifier" from "ran it and found nothing".
+
+
+@dataclass(frozen=True)
+class BranchVerdict:
+    """One branch's classified outcome.
+
+    ``branch_label`` matches the corresponding :class:`Branch.label` on
+    the parent :class:`DecisionPoint` (e.g. ``"true"`` / ``"false"`` /
+    ``"case 0"`` / ``"default"``); the ``verdicts`` tuple on
+    :class:`BranchOutcome` is ordered to match
+    ``DecisionPoint.branches`` so consumers can join by index *or* by
+    label as convenient.
+    """
+    branch_label: str
+    verdict: str                     # "deny" | "allow" | "neutral"
+    score: float                     # signed accumulated score (negative = deny, positive = allow)
+    reasons: tuple[str, ...] = ()    # human-readable reasons that fired for this branch
+
+
+@dataclass(frozen=True)
+class BranchOutcome:
+    """Per-:class:`DecisionPoint` classification result from the
+    heuristic classifier (:mod:`androscan.analysis.branch_classifier`).
+
+    ``confidence`` is a deterministic float in ``[0.0, 1.0]``; gates
+    with ``confidence < 0.6`` are flagged for LLM re-classification by
+    the 10.5 ``trace_behavior`` skill. ``reasons`` carries
+    method-level / cross-branch reasons (e.g. ``"branch length ratio
+    3:1 → weak deny on shorter side"``) — per-branch reasons live on
+    each :class:`BranchVerdict`.
+    """
+    verdicts: tuple[BranchVerdict, ...]
+    confidence: float
+    reasons: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
