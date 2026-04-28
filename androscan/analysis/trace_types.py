@@ -497,8 +497,45 @@ class BehaviorAnchor:
     ``(entry_method.smali_signature, hops)`` key). 10.7's
     ``BehaviorAnchorCard`` renders the header; ``DecisionTimeline``
     renders the per-decision verdicts; ``BypassPlanCard`` renders the
-    plans. Exact populated shape (decision/outcome/plan groupings)
-    finalised in 10.5; the *outer* shape is locked here.
+    plans. The *outer* shape is locked here (additive-only changes
+    going forward); per-field semantics stabilised in 10.5.
+
+    Field-by-field contract (10.5):
+
+    * ``entry_method`` — the gate-method anchor the operator picked
+      (or the cross-tab Mirror→Trace pipeline picked for them via
+      ``resolve_ui_element`` in 10.8).
+    * ``hops`` — clamped closure depth; ``trace.max_hops_default`` ≤
+      ``hops`` ≤ ``trace.max_hops_hard_cap``.
+    * ``truncated`` — True when the call-graph BFS hit either the
+      hop cap *or* the method cap (``MAX_TRACE_METHODS = 30``); UI
+      surfaces an "incomplete trace" badge on the header card.
+    * ``incomplete`` — True when at least one decision has an
+      unresolved ``predicate_origin`` (the slicer hit ``max_walk``
+      or the predicate came from a path the v1 slicer doesn't follow).
+      Distinct from ``truncated``: the closure walk may have completed
+      but still produced under-determined gates.
+    * ``decisions`` — the union of every method's
+      ``MethodDecisions.decision_points`` after the
+      ``parse → slice → classify`` pipeline; ordered first by closure
+      walk visit order, then by ``instruction_index`` within a method.
+    * ``plans`` — the deterministic + LLM-proposed bypass plans whose
+      ``risk`` is at or below ``trace.bypass_risk_max``; rendered as
+      the default list in 10.7's ``BypassPlanCard``.
+    * ``advanced_plans`` — the partition of bypass plans whose
+      ``risk`` *exceeds* the operator-configured threshold (per
+      :func:`androscan.analysis.bypass_planner.partition_by_risk`).
+      Rendered behind an "Advanced" expander in 10.7's UI.
+    * ``rationale`` — free-form LLM-authored "why this anchor matters"
+      prose (DEC-024 — once-per-anchor LLM call). Empty when the LLM
+      call was skipped (``trace.sqlite`` cache hit, LLM down, or
+      JSON parse failure → fail-soft to deterministic-only payload).
+    * ``low_confidence_decision_indices`` — the
+      ``decision.instruction_index`` values that were below
+      ``LLM_RECLASSIFY_THRESHOLD = 0.6`` *before* LLM re-classification.
+      Lets 10.7's UI surface "this verdict was LLM-refined" affordances
+      without re-walking the heuristic catalog. Empty when no LLM call
+      ran.
     """
     entry_method: MethodRef
     hops: int
@@ -506,6 +543,9 @@ class BehaviorAnchor:
     incomplete: bool = False              # True when any decision has unresolved predicate origin
     decisions: tuple[DecisionPoint, ...] = ()
     plans: tuple["BypassPlan", ...] = ()
+    advanced_plans: tuple["BypassPlan", ...] = ()
+    rationale: str = ""
+    low_confidence_decision_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

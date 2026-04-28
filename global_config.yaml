@@ -50,5 +50,12 @@ frida:
 # bypass-plan list. One of "low" | "medium" | "high"; plans whose risk exceeds
 # this threshold are surfaced behind an "Advanced" expander in the UI rather
 # than mixed with the defaults. Invalid values fail-soft to "medium".
+# max_hops_default: closure depth used by trace_behavior when the operator
+# (or a calling skill) doesn't supply an explicit hops arg. Higher values
+# expand the gate pool but cost LLM tokens + per-method static analysis.
+# max_hops_hard_cap: absolute ceiling on closure depth — even an explicit
+# hops arg is clamped to this value. Bounds the worst-case per-anchor cost.
 trace:
   bypass_risk_max: "medium"
+  max_hops_default: 3
+  max_hops_hard_cap: 6

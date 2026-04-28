@@ -78,6 +78,8 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     "rag_top_k_default":           ("rag",      "top_k_default",     "ANDROSCAN_RAG_TOP_K"),
     "frida_trace_ring_buffer_size":("frida",    "trace_ring_buffer_size", "ANDROSCAN_FRIDA_TRACE_RING"),
     "trace_bypass_risk_max":       ("trace",    "bypass_risk_max",        "ANDROSCAN_TRACE_BYPASS_RISK_MAX"),
+    "trace_max_hops_default":      ("trace",    "max_hops_default",       "ANDROSCAN_TRACE_MAX_HOPS_DEFAULT"),
+    "trace_max_hops_hard_cap":     ("trace",    "max_hops_hard_cap",      "ANDROSCAN_TRACE_MAX_HOPS_HARD_CAP"),
 }
 
 
@@ -111,6 +113,12 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # trace.bypass_risk_max is read per-call by 10.4's bypass_planner +
     # 10.5's trace_behavior skill; no in-flight state to bounce.
     "trace_bypass_risk_max",
+    # trace.max_hops_* are read per-call by 10.5's trace_behavior skill
+    # at the start of each closure walk; no in-flight state to bounce
+    # (an active closure walk that's already past the new cap completes
+    # under the old cap; the next call uses the new value).
+    "trace_max_hops_default",
+    "trace_max_hops_hard_cap",
 })
 
 
@@ -144,6 +152,8 @@ class Config:
     rag_top_k_default: int
     frida_trace_ring_buffer_size: int
     trace_bypass_risk_max: str   # "low" | "medium" | "high" — Phase 10 / DEC-024
+    trace_max_hops_default: int  # default closure depth for trace_behavior — Phase 10 / DEC-024
+    trace_max_hops_hard_cap: int # absolute closure depth ceiling — Phase 10 / DEC-024
 
     @classmethod
     def default(cls) -> "Config":
@@ -173,6 +183,8 @@ class Config:
             rag_top_k_default=8,
             frida_trace_ring_buffer_size=5000,
             trace_bypass_risk_max="medium",
+            trace_max_hops_default=3,
+            trace_max_hops_hard_cap=6,
         )
 
     @property
@@ -288,6 +300,8 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     # how llm_provider is handled (strings out of-set don't blow up
     # config loading; consumers handle the fallback).
     out["trace_bypass_risk_max"] = (trace.get("bypass_risk_max") or "medium").strip() or "medium"
+    out["trace_max_hops_default"] = _safe_int(trace.get("max_hops_default"), 3, "trace.max_hops_default")
+    out["trace_max_hops_hard_cap"] = _safe_int(trace.get("max_hops_hard_cap"), 6, "trace.max_hops_hard_cap")
     return out
 
 
@@ -367,6 +381,22 @@ def load_config(config_path: Optional[str] = None) -> Config:
             )
     if os.environ.get("ANDROSCAN_TRACE_BYPASS_RISK_MAX"):
         merged["trace_bypass_risk_max"] = os.environ["ANDROSCAN_TRACE_BYPASS_RISK_MAX"].strip().lower() or merged.get("trace_bypass_risk_max", "medium")
+    if os.environ.get("ANDROSCAN_TRACE_MAX_HOPS_DEFAULT"):
+        try:
+            merged["trace_max_hops_default"] = max(1, int(os.environ["ANDROSCAN_TRACE_MAX_HOPS_DEFAULT"].strip()))
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_TRACE_MAX_HOPS_DEFAULT={os.environ['ANDROSCAN_TRACE_MAX_HOPS_DEFAULT']!r} invalid; using default.",
+                file=sys.stderr,
+            )
+    if os.environ.get("ANDROSCAN_TRACE_MAX_HOPS_HARD_CAP"):
+        try:
+            merged["trace_max_hops_hard_cap"] = max(1, int(os.environ["ANDROSCAN_TRACE_MAX_HOPS_HARD_CAP"].strip()))
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_TRACE_MAX_HOPS_HARD_CAP={os.environ['ANDROSCAN_TRACE_MAX_HOPS_HARD_CAP']!r} invalid; using default.",
+                file=sys.stderr,
+            )
     if os.environ.get("ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"):
         try:
             merged["web_screencap_interval_ms"] = max(50, int(os.environ["ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"].strip()))
@@ -402,6 +432,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
         rag_top_k_default=max(1, int(merged.get("rag_top_k_default", 8))),
         frida_trace_ring_buffer_size=max(100, int(merged.get("frida_trace_ring_buffer_size", 5000))),
         trace_bypass_risk_max=str(merged.get("trace_bypass_risk_max") or "medium").strip().lower() or "medium",
+        trace_max_hops_default=max(1, int(merged.get("trace_max_hops_default", 3))),
+        trace_max_hops_hard_cap=max(1, int(merged.get("trace_max_hops_hard_cap", 6))),
     )
 
 
@@ -518,6 +550,8 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
         rag_top_k_default=max(1, int(flat["rag_top_k_default"])),
         frida_trace_ring_buffer_size=max(100, int(flat["frida_trace_ring_buffer_size"])),
         trace_bypass_risk_max=str(flat["trace_bypass_risk_max"] or "medium").strip().lower() or "medium",
+        trace_max_hops_default=max(1, int(flat["trace_max_hops_default"])),
+        trace_max_hops_hard_cap=max(1, int(flat["trace_max_hops_hard_cap"])),
     )
 
 
@@ -536,6 +570,8 @@ def coerce_yaml_value(field: str, raw: Any) -> Any:
         "web_port", "web_screencap_interval_ms",
         "rag_top_k_default",
         "frida_trace_ring_buffer_size",
+        "trace_max_hops_default",
+        "trace_max_hops_hard_cap",
     }
     float_fields = {"ollama_temperature", "cloud_temperature"}
     bool_fields = {"per_component_analysis"}
