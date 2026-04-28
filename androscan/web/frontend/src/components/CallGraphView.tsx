@@ -271,6 +271,69 @@ export function CallGraphView({ appId, onSelectNode, hitsByMethod }: Props) {
     };
   }, [cgState]);
 
+  // -------- Inverse-scale labels on zoom-in --------------------------------
+  // Cytoscape's wheel-zoom is "magnifier" by default — every visual
+  // element scales together, so a high zoom means a couple of huge
+  // overlapping rectangles that don't help navigate dense library
+  // packages (Material/AndroidX/Kotlin etc.). On zoom > 1 we inversely
+  // scale font / padding / border so on-screen label size stays roughly
+  // constant; the underlying layout positions don't change, but the
+  // node footprint in graph-coordinate space shrinks, so dense clusters
+  // visually spread out as you zoom in. Clamped at ``inv <= 1`` (only
+  // zoom-in is affected) so zoom-out keeps today's behaviour — at low
+  // zoom the whole graph is a smudge anyway and individual labels
+  // weren't useful at that scale.
+  //
+  // Per-element ``cy.nodes(...).style({...})`` (inline) is preferred
+  // over rebuilding ``cy.style()`` because the stylesheet API appends
+  // selector entries on each call, growing unboundedly across zoom
+  // events. ``cy.batch()`` coalesces the per-selector style writes into
+  // one render. ``requestAnimationFrame`` debounces the burst of zoom
+  // events that fire during a smooth wheel scroll. The handler is
+  // idempotent and self-applies on mount, so the very first
+  // ``cy.layout(...).run()`` (which calls ``fit:true`` and triggers a
+  // zoom event) immediately picks up the right scaling.
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    let frame = 0;
+    const apply = () => {
+      frame = 0;
+      const c = cyRef.current;
+      if (!c) return;
+      const inv = 1 / Math.max(1, c.zoom());
+      c.batch(() => {
+        c.nodes(".pkgnode").style({
+          "font-size": 11 * inv,
+          padding: `${10 * inv}px`,
+          "border-width": 1 * inv,
+        });
+        c.nodes(".pkgnode.reflective").style({ "border-width": 2 * inv });
+        c.nodes(".pkgnode.has-hits").style({ "border-width": 3 * inv });
+        c.nodes(".methodnode").style({
+          "font-size": 10 * inv,
+          padding: `${8 * inv}px`,
+          "border-width": 1 * inv,
+        });
+        c.nodes(".methodnode.focusroot").style({ "border-width": 2 * inv });
+        c.nodes(".methodnode.reflective").style({ "border-width": 2 * inv });
+        c.nodes(".methodnode.hit").style({ "border-width": 3 * inv });
+        c.edges(".edge").style({ width: 1.5 * inv, "font-size": 8 * inv });
+        c.edges(".pkgedge").style({ "font-size": 9 * inv });
+      });
+    };
+    const onZoom = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(apply);
+    };
+    cy.on("zoom", onZoom);
+    apply();
+    return () => {
+      cy.off("zoom", onZoom);
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, [cgState]);
+
   // -------- Render Cytoscape elements when data changes --------------------
   // ``hitsByMethod`` is intentionally in the dep array: a fresh hooks
   // poll (every 2.5 s in HookLabTab) updates the same Map reference
