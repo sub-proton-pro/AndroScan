@@ -5,6 +5,7 @@ import { streamChat } from "../api/chat";
 import { getLlmInfo, type LlmInfo } from "../api/llm";
 import { useWorkbench } from "../context/WorkbenchContext";
 import type { ChatAttachment, TabId } from "../types";
+import { IconChevronDown } from "./Icons";
 
 const MAX_PROMPT_CHARS = 8000;
 
@@ -12,6 +13,10 @@ type Props = {
   tab: TabId;
   attachments: ChatAttachment[];
   contextSummary?: string;
+  /** Optional: render a collapse button in the chat header. Mirrors the
+   *  Projects sidebar / Mirror panel pattern so the parent can shrink the
+   *  chat dock to a horizontal rail at the bottom of its column. */
+  onCollapse?: () => void;
 };
 
 const KIND_LABELS: Record<string, string> = {
@@ -89,7 +94,7 @@ function buildPreview(attachments: ChatAttachment[]): string {
  * applies guardrails (length cap, ANSI/secret redaction, prompt-injection
  * wrapping, allowlisted system prompts) and persists transcripts.
  */
-export function ChatDock({ tab, attachments, contextSummary }: Props) {
+export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props) {
   const { chats, appendChat, updateChat, clearChat, appId, runTs } = useWorkbench();
   const history = chats[tab];
   const [draft, setDraft] = useState("");
@@ -217,6 +222,18 @@ export function ChatDock({ tab, attachments, contextSummary }: Props) {
   return (
     <section className="chat-dock" aria-label={`Chat (${tab})`}>
       <header className="chat-head">
+        {onCollapse && (
+          <button
+            type="button"
+            className="logcat-toggle-btn chat-collapse-btn"
+            onClick={onCollapse}
+            aria-expanded="true"
+            aria-label="Collapse chat dock"
+            title="Collapse chat dock"
+          >
+            <IconChevronDown size={10} />
+          </button>
+        )}
         <h3>Chat</h3>
         <span
           className="chat-info-icon"

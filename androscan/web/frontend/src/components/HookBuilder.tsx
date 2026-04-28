@@ -43,6 +43,7 @@ import {
   type ParseInfo,
   type RenderResult,
 } from "../api/frida";
+import { IconChevronDown, IconChevronUp } from "./Icons";
 
 // Note on Monaco asset loading: ``@monaco-editor/react``'s default
 // ``loader`` lazy-fetches the Monaco editor + workers from a jsdelivr
@@ -73,6 +74,12 @@ type Props = {
   /** Called once a session has been successfully created so the
    *  parent can switch the right pane to the new trace. */
   onSessionCreated: (result: CreateSessionResult) => void;
+  /** Optional collapse state. When ``collapsed`` is true the body
+   *  (template form, Monaco view, summary, Inject row) is hidden and
+   *  only the header bar remains so the parent ``Panel`` can be shrunk
+   *  to a thin bar — mirrors the AdbShell / ScopedLogcat pattern. */
+  collapsed?: boolean;
+  onToggle?: () => void;
 };
 
 export function HookBuilder({
@@ -81,6 +88,8 @@ export function HookBuilder({
   prefillMethodName,
   defaultPackage,
   onSessionCreated,
+  collapsed = false,
+  onToggle,
 }: Props) {
   const [templates, setTemplates] = useState<HookTemplate[] | null>(null);
   const [templatesError, setTemplatesError] = useState<string | null>(null);
@@ -272,18 +281,39 @@ export function HookBuilder({
     (parse?.available === true && parse?.ok === false);
 
   return (
-    <div className="pane-scroll hooklab-builder">
+    <div
+      className={
+        collapsed
+          ? "pane-scroll hooklab-builder collapsed"
+          : "pane-scroll hooklab-builder"
+      }
+    >
       <header className="pane-head">
+        {onToggle && (
+          <button
+            type="button"
+            className="logcat-toggle-btn"
+            onClick={onToggle}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? "Expand hook builder" : "Collapse hook builder"}
+            title={collapsed ? "Expand hook builder" : "Collapse hook builder"}
+          >
+            {collapsed ? <IconChevronUp size={10} /> : <IconChevronDown size={10} />}
+          </button>
+        )}
         <h2>Hook Builder</h2>
-        <span className="muted small">{PANEL_DESCRIPTION}</span>
+        {!collapsed && (
+          <span className="muted small">{PANEL_DESCRIPTION}</span>
+        )}
       </header>
 
-      {templatesError && (
+      {!collapsed && templatesError && (
         <p className="hook-error" role="alert">
           Failed to load templates: {templatesError}
         </p>
       )}
 
+      {!collapsed && (
       <form onSubmit={onSubmit} className="hookbuilder-form">
         {/* Template picker */}
         <div className="hookbuilder-row">
@@ -461,6 +491,7 @@ export function HookBuilder({
           )}
         </div>
       </form>
+      )}
     </div>
   );
 }

@@ -16,6 +16,7 @@ import {
   listSessions,
   type FridaSessionInfo,
 } from "../api/frida";
+import { IconChevronRight } from "./Icons";
 
 const REFRESH_MS = 2500;
 
@@ -28,6 +29,9 @@ type Props = {
    *  instead of waiting for the next polling tick. */
   refreshTick: number;
   onDetached: (sessionId: string) => void;
+  /** Optional: render a collapse button in the header so the parent can
+   *  shrink the right column to a vertical rail. */
+  onCollapse?: () => void;
 };
 
 export function FridaSessionsList({
@@ -35,6 +39,7 @@ export function FridaSessionsList({
   onSelect,
   refreshTick,
   onDetached,
+  onCollapse,
 }: Props) {
   const [sessions, setSessions] = useState<FridaSessionInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -94,6 +99,17 @@ export function FridaSessionsList({
           >
             ↻
           </button>
+          {onCollapse && (
+            <button
+              type="button"
+              className="ghost-mini icon-btn"
+              onClick={onCollapse}
+              title="Collapse sessions panel"
+              aria-label="Collapse sessions panel"
+            >
+              <IconChevronRight />
+            </button>
+          )}
         </span>
       </header>
 

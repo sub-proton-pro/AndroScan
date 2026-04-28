@@ -91,6 +91,26 @@ export function IconChevronRight(props: IconProps) {
   );
 }
 
+// Vertical chevrons used by collapsible sections that fold along their
+// horizontal edge (chat dock, adb shell, hook builder). Convention:
+//   * IconChevronDown  → section is *expanded*; click pushes it shut.
+//   * IconChevronUp    → section is *collapsed*; click brings it back.
+export function IconChevronDown(props: IconProps) {
+  return (
+    <Base {...props}>
+      <polyline points="3,6 8,10.5 13,6" />
+    </Base>
+  );
+}
+
+export function IconChevronUp(props: IconProps) {
+  return (
+    <Base {...props}>
+      <polyline points="3,10 8,5.5 13,10" />
+    </Base>
+  );
+}
+
 export function IconClose(props: IconProps) {
   return (
     <Base {...props}>
@@ -134,3 +154,4 @@ export function IconCheck(props: IconProps) {
     </Base>
   );
 }
+

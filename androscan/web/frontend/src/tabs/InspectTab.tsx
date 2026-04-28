@@ -18,7 +18,11 @@ import { ChatDock } from "../components/ChatDock";
 import { ClassMethodTree } from "../components/ClassMethodTree";
 import { CodeView } from "../components/CodeView";
 import { ElementMappingPanel } from "../components/ElementMappingPanel";
-import { IconChevronLeft, IconChevronRight } from "../components/Icons";
+import {
+  IconChevronLeft,
+  IconChevronRight,
+  IconChevronUp,
+} from "../components/Icons";
 import { MirrorView } from "../components/MirrorView";
 import { ProjectsSidebar } from "../components/ProjectsSidebar";
 import { ScopedLogcat } from "../components/ScopedLogcat";
@@ -55,6 +59,8 @@ export function InspectTab() {
   const [treeColCollapsed, setTreeColCollapsed] = useState(false);
   const mirrorColRef = useRef<ImperativePanelHandle>(null);
   const [mirrorColCollapsed, setMirrorColCollapsed] = useState(false);
+  const chatRef = useRef<ImperativePanelHandle>(null);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
   type CenterTab = "mapping" | "code";
   const [centerTab, setCenterTab] = useState<CenterTab>("mapping");
   // Anchor line for the Code Browser viewer; bumped each time the user
@@ -490,8 +496,36 @@ export function InspectTab() {
             </div>
           </Panel>
           <PanelResizeHandle className="resize-v" />
-          <Panel defaultSize={38} minSize={12} collapsible className="panel chat-panel">
-            <ChatDock tab="inspect" attachments={attachments} />
+          <Panel
+            ref={chatRef}
+            defaultSize={38}
+            minSize={12}
+            collapsible
+            collapsedSize={3}
+            onCollapse={() => setChatCollapsed(true)}
+            onExpand={() => setChatCollapsed(false)}
+            className="panel chat-panel"
+          >
+            {chatCollapsed ? (
+              <button
+                type="button"
+                className="sidebar-rail rail-bottom"
+                onClick={() => chatRef.current?.expand()}
+                title="Expand chat dock"
+                aria-label="Expand chat dock"
+              >
+                <span className="sidebar-rail-chevron" aria-hidden="true">
+                  <IconChevronUp />
+                </span>
+                <span className="sidebar-rail-label">Chat</span>
+              </button>
+            ) : (
+              <ChatDock
+                tab="inspect"
+                attachments={attachments}
+                onCollapse={() => chatRef.current?.collapse()}
+              />
+            )}
           </Panel>
         </PanelGroup>
       </Panel>

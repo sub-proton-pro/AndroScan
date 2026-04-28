@@ -7,7 +7,7 @@ import {
 } from "react-resizable-panels";
 import { ChatDock } from "../components/ChatDock";
 import { FindingCard } from "../components/FindingCard";
-import { IconChevronRight } from "../components/Icons";
+import { IconChevronRight, IconChevronUp } from "../components/Icons";
 import { ProjectsSidebar } from "../components/ProjectsSidebar";
 import { useWorkbench } from "../context/WorkbenchContext";
 import type { ChatAttachment, Hypothesis } from "../types";
@@ -40,6 +40,8 @@ export function ReportsTab() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const sidebarRef = useRef<ImperativePanelHandle>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const chatRef = useRef<ImperativePanelHandle>(null);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
 
   // Reset / auto-pick selection when the run changes.
   useEffect(() => {
@@ -127,7 +129,7 @@ export function ReportsTab() {
         )}
       </Panel>
       <PanelResizeHandle className="resize-h" />
-      <Panel defaultSize={56} minSize={30} className="panel">
+      <Panel defaultSize={78} minSize={30} className="panel">
         <PanelGroup direction="vertical" autoSaveId="reports-center-v">
           <Panel defaultSize={70} minSize={20} className="panel">
             <div className="pane-scroll">
@@ -170,15 +172,38 @@ export function ReportsTab() {
             </div>
           </Panel>
           <PanelResizeHandle className="resize-v" />
-          <Panel defaultSize={30} minSize={12} collapsible className="panel chat-panel">
-            <ChatDock tab="reports" attachments={attachments} />
+          <Panel
+            ref={chatRef}
+            defaultSize={30}
+            minSize={12}
+            collapsible
+            collapsedSize={3}
+            onCollapse={() => setChatCollapsed(true)}
+            onExpand={() => setChatCollapsed(false)}
+            className="panel chat-panel"
+          >
+            {chatCollapsed ? (
+              <button
+                type="button"
+                className="sidebar-rail rail-bottom"
+                onClick={() => chatRef.current?.expand()}
+                title="Expand chat dock"
+                aria-label="Expand chat dock"
+              >
+                <span className="sidebar-rail-chevron" aria-hidden="true">
+                  <IconChevronUp />
+                </span>
+                <span className="sidebar-rail-label">Chat</span>
+              </button>
+            ) : (
+              <ChatDock
+                tab="reports"
+                attachments={attachments}
+                onCollapse={() => chatRef.current?.collapse()}
+              />
+            )}
           </Panel>
         </PanelGroup>
-      </Panel>
-      <PanelResizeHandle className="resize-h" />
-      {/* Right-most pane intentionally left empty for now (was raw report.json). */}
-      <Panel defaultSize={22} minSize={6} className="panel placeholder-panel">
-        <div className="pane-scroll" />
       </Panel>
     </PanelGroup>
   );

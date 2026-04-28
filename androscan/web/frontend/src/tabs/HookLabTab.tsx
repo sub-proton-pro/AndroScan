@@ -1,5 +1,11 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
-import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import {
+  ImperativePanelGroupHandle,
+  ImperativePanelHandle,
+  Panel,
+  PanelGroup,
+  PanelResizeHandle,
+} from "react-resizable-panels";
 import { ChatDock } from "../components/ChatDock";
 import {
   CallGraphView,
@@ -11,6 +17,7 @@ import { FridaSessionsList } from "../components/FridaSessionsList";
 import { FridaTracePanel } from "../components/FridaTracePanel";
 import { HookBuilder } from "../components/HookBuilder";
 import { HookStatsPanel } from "../components/HookStatsPanel";
+import { IconChevronLeft, IconChevronUp } from "../components/Icons";
 import { ScopeInspectorPanel } from "../components/ScopeInspectorPanel";
 import { fetchSource } from "../api/code";
 import {
@@ -105,6 +112,54 @@ export function HookLabTab() {
   // we just snapshot for chat. Both reset the moment the session changes.
   const [chatHooks, setChatHooks] = useState<HookStat[] | null>(null);
   const [chatTraceTail, setChatTraceTail] = useState<TraceEvent[] | null>(null);
+
+  // Imperative handles + collapsed flags for the chat dock (collapses to a
+  // bottom rail) and the right column (collapses to a right rail). Mirrors
+  // the InspectTab pattern so the same operator muscle memory carries over.
+  const chatRef = useRef<ImperativePanelHandle>(null);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
+  const rightColRef = useRef<ImperativePanelHandle>(null);
+  const [rightColCollapsed, setRightColCollapsed] = useState(false);
+
+  // Hook Builder lives in the middle of the centre vertical PanelGroup, so
+  // it can't fold to an edge rail; instead we mirror the AdbShell / logcat
+  // pattern — header stays visible, body hides, and the panel is shrunk to
+  // a thin strip.
+  //
+  // Layout intent: the collapsed Hook Builder strip should *drop down* and
+  // sit flush against the top edge of the Chat section. By default
+  // ``react-resizable-panels`` redistributes the freed space across all
+  // siblings, which leaves the strip floating somewhere in the middle of
+  // the column. To make the strip land just above Chat, we drive the
+  // resize through ``PanelGroup.setLayout`` so the freed pixels go
+  // exclusively to CodeView (the top neighbour) — Chat keeps its size,
+  // and the strip ends up pinned to Chat's top edge.
+  //
+  // Pre-collapse sizes are remembered so expanding restores the operator's
+  // own resize-bar customisations rather than the hard-coded defaults.
+  const centerGroupRef = useRef<ImperativePanelGroupHandle>(null);
+  const lastExpandedSizesRef = useRef<number[] | null>(null);
+  const [hookBuilderCollapsed, setHookBuilderCollapsed] = useState(false);
+  const HOOK_BUILDER_COLLAPSED_PCT = 4;
+  const HOOK_BUILDER_DEFAULT_LAYOUT = [36, 44, 20];
+  const toggleHookBuilder = () => {
+    const grp = centerGroupRef.current;
+    if (!grp) return;
+    if (hookBuilderCollapsed) {
+      // Expanding — restore the layout the operator had before collapsing.
+      grp.setLayout(lastExpandedSizesRef.current ?? HOOK_BUILDER_DEFAULT_LAYOUT);
+    } else {
+      // Collapsing — donate the freed pixels to CodeView so the strip sits
+      // just above Chat. Snapshot current sizes first so expand can rewind.
+      const sizes = grp.getLayout();
+      lastExpandedSizesRef.current = [...sizes];
+      const [code, hb, chat] = sizes.length === 3 ? sizes : HOOK_BUILDER_DEFAULT_LAYOUT;
+      const delta = hb - HOOK_BUILDER_COLLAPSED_PCT;
+      grp.setLayout([code + delta, HOOK_BUILDER_COLLAPSED_PCT, chat]);
+    }
+    // ``hookBuilderCollapsed`` is updated by the Panel's onCollapse /
+    // onExpand callbacks, which fire when the size crosses ``collapsedSize``.
+  };
 
   useEffect(() => {
     setSelected(null);
@@ -223,7 +278,11 @@ export function HookLabTab() {
       </Panel>
       <PanelResizeHandle className="resize-h" />
       <Panel defaultSize={46} minSize={30} className="panel">
-        <PanelGroup direction="vertical" autoSaveId="hook-center-v">
+        <PanelGroup
+          ref={centerGroupRef}
+          direction="vertical"
+          autoSaveId="hook-center-v"
+        >
           <Panel defaultSize={36} minSize={18} className="panel">
             <HookLabCodeView
               appId={appId}
@@ -232,95 +291,155 @@ export function HookLabTab() {
             />
           </Panel>
           <PanelResizeHandle className="resize-v" />
-          <Panel defaultSize={44} minSize={22} className="panel">
+          <Panel
+            defaultSize={44}
+            minSize={4}
+            collapsible
+            collapsedSize={4}
+            onCollapse={() => setHookBuilderCollapsed(true)}
+            onExpand={() => setHookBuilderCollapsed(false)}
+            className="panel"
+          >
             <HookBuilder
               appId={appId}
               prefillClassName={selected?.className ?? null}
               prefillMethodName={selected?.methodName ?? null}
               defaultPackage={defaultPackage}
               onSessionCreated={onSessionCreated}
+              collapsed={hookBuilderCollapsed}
+              onToggle={toggleHookBuilder}
             />
           </Panel>
           <PanelResizeHandle className="resize-v" />
-          <Panel defaultSize={20} minSize={10} collapsible className="panel chat-panel">
-            <ChatDock
-              tab="hook"
-              attachments={chatAttachments}
-              contextSummary={buildHookChatContextSummary({
-                selected,
-                hasSource: selectedSource != null,
-                activeSession,
-                hooks: chatHooks,
-                traceTail: chatTraceTail,
-              })}
-            />
+          <Panel
+            ref={chatRef}
+            defaultSize={20}
+            minSize={10}
+            collapsible
+            collapsedSize={3}
+            onCollapse={() => setChatCollapsed(true)}
+            onExpand={() => setChatCollapsed(false)}
+            className="panel chat-panel"
+          >
+            {chatCollapsed ? (
+              <button
+                type="button"
+                className="sidebar-rail rail-bottom"
+                onClick={() => chatRef.current?.expand()}
+                title="Expand chat dock"
+                aria-label="Expand chat dock"
+              >
+                <span className="sidebar-rail-chevron" aria-hidden="true">
+                  <IconChevronUp />
+                </span>
+                <span className="sidebar-rail-label">Chat</span>
+              </button>
+            ) : (
+              <ChatDock
+                tab="hook"
+                attachments={chatAttachments}
+                contextSummary={buildHookChatContextSummary({
+                  selected,
+                  hasSource: selectedSource != null,
+                  activeSession,
+                  hooks: chatHooks,
+                  traceTail: chatTraceTail,
+                })}
+                onCollapse={() => chatRef.current?.collapse()}
+              />
+            )}
           </Panel>
         </PanelGroup>
       </Panel>
       <PanelResizeHandle className="resize-h" />
-      <Panel defaultSize={22} minSize={14} className="panel">
-        <PanelGroup direction="vertical" autoSaveId="hook-right-v">
-          <Panel defaultSize={36} minSize={18} className="panel">
-            <FridaSessionsList
-              selectedSessionId={activeSession?.sessionId ?? null}
-              onSelect={onSelectSession}
-              refreshTick={sessionsRefreshTick}
-              onDetached={onDetached}
-            />
-          </Panel>
-          <PanelResizeHandle className="resize-v" />
-          <Panel defaultSize={64} minSize={20} className="panel">
-            <div className="right-pane-tabs">
-              <nav className="right-pane-tabs-nav" role="tablist" aria-label="Trace / Hooks / Scope">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={rightTab === "trace"}
-                  className={`right-pane-tab ${rightTab === "trace" ? "right-pane-tab-active" : ""}`}
-                  onClick={() => setRightTab("trace")}
-                >
-                  Trace
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={rightTab === "hooks"}
-                  className={`right-pane-tab ${rightTab === "hooks" ? "right-pane-tab-active" : ""}`}
-                  onClick={() => setRightTab("hooks")}
-                  disabled={!activeSession}
-                  title={activeSession ? undefined : "Inject a hook to see per-method stats"}
-                >
-                  Hooks
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={rightTab === "scope"}
-                  className={`right-pane-tab ${rightTab === "scope" ? "right-pane-tab-active" : ""}`}
-                  onClick={() => setRightTab("scope")}
-                  disabled={!activeSession}
-                  title={activeSession ? undefined : "Inject a scope_inspector hook to see field snapshots"}
-                >
-                  Scope
-                </button>
-              </nav>
-              <div className="right-pane-tab-body">
-                {rightTab === "trace" && (
-                  <FridaTracePanel
-                    sessionId={activeSession?.sessionId ?? null}
-                    persistEnabled={activeSession?.persistEnabled ?? false}
-                  />
-                )}
-                {rightTab === "hooks" && (
-                  <HookStatsPanel sessionId={activeSession?.sessionId ?? null} />
-                )}
-                {rightTab === "scope" && (
-                  <ScopeInspectorPanel sessionId={activeSession?.sessionId ?? null} />
-                )}
+      <Panel
+        ref={rightColRef}
+        defaultSize={22}
+        minSize={14}
+        collapsible
+        collapsedSize={3}
+        onCollapse={() => setRightColCollapsed(true)}
+        onExpand={() => setRightColCollapsed(false)}
+        className="panel"
+      >
+        {rightColCollapsed ? (
+          <button
+            type="button"
+            className="sidebar-rail rail-right"
+            onClick={() => rightColRef.current?.expand()}
+            title="Expand sessions panel"
+            aria-label="Expand sessions panel"
+          >
+            <span className="sidebar-rail-chevron" aria-hidden="true">
+              <IconChevronLeft />
+            </span>
+            <span className="sidebar-rail-label">Sessions</span>
+          </button>
+        ) : (
+          <PanelGroup direction="vertical" autoSaveId="hook-right-v">
+            <Panel defaultSize={36} minSize={18} className="panel">
+              <FridaSessionsList
+                selectedSessionId={activeSession?.sessionId ?? null}
+                onSelect={onSelectSession}
+                refreshTick={sessionsRefreshTick}
+                onDetached={onDetached}
+                onCollapse={() => rightColRef.current?.collapse()}
+              />
+            </Panel>
+            <PanelResizeHandle className="resize-v" />
+            <Panel defaultSize={64} minSize={20} className="panel">
+              <div className="right-pane-tabs">
+                <nav className="right-pane-tabs-nav" role="tablist" aria-label="Trace / Hooks / Scope">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={rightTab === "trace"}
+                    className={`right-pane-tab ${rightTab === "trace" ? "right-pane-tab-active" : ""}`}
+                    onClick={() => setRightTab("trace")}
+                  >
+                    Trace
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={rightTab === "hooks"}
+                    className={`right-pane-tab ${rightTab === "hooks" ? "right-pane-tab-active" : ""}`}
+                    onClick={() => setRightTab("hooks")}
+                    disabled={!activeSession}
+                    title={activeSession ? undefined : "Inject a hook to see per-method stats"}
+                  >
+                    Hooks
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={rightTab === "scope"}
+                    className={`right-pane-tab ${rightTab === "scope" ? "right-pane-tab-active" : ""}`}
+                    onClick={() => setRightTab("scope")}
+                    disabled={!activeSession}
+                    title={activeSession ? undefined : "Inject a scope_inspector hook to see field snapshots"}
+                  >
+                    Scope
+                  </button>
+                </nav>
+                <div className="right-pane-tab-body">
+                  {rightTab === "trace" && (
+                    <FridaTracePanel
+                      sessionId={activeSession?.sessionId ?? null}
+                      persistEnabled={activeSession?.persistEnabled ?? false}
+                    />
+                  )}
+                  {rightTab === "hooks" && (
+                    <HookStatsPanel sessionId={activeSession?.sessionId ?? null} />
+                  )}
+                  {rightTab === "scope" && (
+                    <ScopeInspectorPanel sessionId={activeSession?.sessionId ?? null} />
+                  )}
+                </div>
               </div>
-            </div>
-          </Panel>
-        </PanelGroup>
+            </Panel>
+          </PanelGroup>
+        )}
       </Panel>
     </PanelGroup>
   );

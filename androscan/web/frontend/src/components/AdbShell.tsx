@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getDeviceStatus, type DeviceStatus } from "../api/device";
+import { IconChevronDown, IconChevronUp } from "./Icons";
 
 type Entry = {
   cmd: string;
@@ -131,7 +132,7 @@ export function AdbShell({ collapsed = false, onToggle }: Props) {
             aria-label={collapsed ? "Expand adb shell" : "Collapse adb shell"}
             title={collapsed ? "Expand adb shell" : "Collapse adb shell"}
           >
-            {collapsed ? "+" : "−"}
+            {collapsed ? <IconChevronUp size={10} /> : <IconChevronDown size={10} />}
           </button>
         )}
         <h3>adb shell</h3>
