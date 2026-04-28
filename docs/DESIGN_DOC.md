@@ -375,6 +375,26 @@ Skills use a three-tier model: **pipeline** (orchestration only: extract_manifes
 
 **Full sub-task checklists:** `docs/TASKS.md` § Interactive RE Workbench → § Hook Lab v1 — sub-step backlog (now flagged "v1 complete").
 
+### Phase 10 — Behavior Trace (Lab tab gate-identification mode) *(planning checkpoint 10.0 done 2026-04-28)*
+
+**Goal:** From a UI element or method anchor, enumerate the closure of conditional gates that govern its behaviour, classify each gate's outcome (deny / allow / neutral with confidence), and propose template-bound bypass plans the operator can stage → inject via the existing Hook Lab v1 Stage→Inject path. Trace becomes the headline mode of the **Lab** tab (renamed from Hook Lab per **DEC-024**, concurrent with this phase); the existing Cytoscape pane is demoted to "Graph mode" alongside `Manual Hooks` and `Trace`. Trace adds **zero new device-touching surface area** — every state mutation flows through the same paths Hook Lab v1 already established.
+
+**Workflow:** *Anchor → Locate → Trace → Classify → Manipulate → Verify* — operator picks an anchor (Mirror tap → click-to-code resolution from Phase 7, or a method node from the Lab Graph mode), the static layer enumerates branches in the forward closure (≤ `MAX_TRACE_HOPS = 3` by default, hard-capped at 6, `MAX_TRACE_METHODS = 30`), the LLM is invoked **once per anchor** to interpret + propose plans, the operator stages a plan via the existing `HookBuilder.tsx` flow (now Lab's `Manual Hooks` mode) and injects via the existing `POST /api/frida/sessions` allowlist-gated path, verification is operator-driven (re-tap the anchor, watch the Frida overlay light up the same gate methods in cyan).
+
+**Deliverables (target):**
+
+- New `androscan/analysis/` modules: `trace_types.py` (platform-neutral data model — `BehaviorAnchor` / `DecisionPoint` / `BypassPlan` / `MethodRef` / `FieldRef` as frozen dataclasses), `decisions.py` (decision-point extraction over the Smali instruction stream — one extra pass over `smali_parser.py`'s lexical pipeline), `slicing.py` (intra-procedural backward slicing for predicate origin — no aliasing / no field-flow / no escape analysis; honestly surfaced via `predicate_origin: None` when the slice fails), `branch_classifier.py` (deterministic `classify(decision_point) -> BranchOutcome` with deny / allow / neutral + confidence float; gates with `confidence < 0.6` flagged for LLM re-classification), `bypass_planner.py` (template-bound `BypassPlan` synthesis — references existing `frida_hooks/` templates plus new `force_return_value` / `force_string_compare_equal` / `force_method_skip` templates; risk taxonomy `low / medium / high` with operator-configurable threshold).
+- New LLM-tier skill `trace_behavior` (`requires_confirmation=False` per DEC-022 / DEC-024); per-anchor LLM call only — per-decision LLM calls explicitly rejected as unaffordable in DEC-022's per-turn skill-output budget. Persists populated `BehaviorAnchor` to per-app SQLite at `apps/<app_id>/.decompiled/<sha>/trace.sqlite` (schema_version 1, mirrors the DEC-016 / DEC-018 / DEC-023 `<sha>`-keyed cache pattern). Fail-open on missing app context, unbuilt call graph, or unresolved entry method.
+- New REST routes `GET / POST / DELETE /api/trace/{app_id}/anchor` in new `androscan/web/trace_routes.py` (factory-built via `build_trace_router(...)` and wired through `androscan/web/app.py`'s same DI seams as `status_routes` / `settings_routes` / `frida_routes`).
+- New frontend Trace mode under `androscan/web/frontend/src/components/trace/` (anchor card, decision timeline with verdict badges, bypass plan cards with "Stage in Manual Hooks" buttons that pre-fill `HookBuilder` via `pendingHookPrefill` plumbing, "trace truncated" / "trace may be incomplete" banners). Lab tab gains a 3-mode left-rail switcher: `Trace | Manual Hooks | Graph` defaulting to `Trace`. Cross-tab `Inspect → Trace` plumbing via `pendingTraceEntry` so the existing click-to-code `resolution.best` (Phase 7 / DEC-019) can seed an anchor in one click. New `trace` `ChatAttachment` kind for the Lab chat dock.
+- Hook Lab → Lab code rename (`HookLabTab.tsx` → `LabTab.tsx`, `HookLabCodeView` → `LabCodeView`, URL hash `#/hook` → `#/lab` with a back-compat redirect, per-tab chat-prompt key in `androscan/web/chat.py`, `frontend/README.md` reference) — all in sub-step 10.6 alongside the tab routing changes, keeping Phase 10's docs-vs-code commits cleanly separated. Until then code-level identifiers in DEC-024 / TASKS.md Phase 10 entries reference existing `HookLabTab.tsx` filename for accuracy.
+
+**Tests (target):** ~80 new tests across `tests/test_decisions_extract.py`, `tests/test_decisions_slicing.py`, `tests/test_branch_classifier.py`, `tests/test_bypass_planner.py`, `tests/test_trace_behavior_skill.py`, `tests/test_trace_routes.py`. Deterministic fixture-driven static layer (small Smali under `tests/fixtures/trace_smali/`); LLM mocked at the test boundary; no device touching in default suite (the `device` pytest marker from DEC-023 sub-step 4.3 covers any opt-in cases).
+
+**Why this phase, not "more call-graph affordances":** the Cytoscape topological view is infrastructure, not deliverable. Operators want to know *what stops a particular UI behaviour from working* and *how to bypass it* — not which method calls which. DEC-024 §rationale captures the full reasoning, including why client-side trust manipulation is the right framing (vs. source/sink reachability, which is well-served by other tools and is the workflow most operators already have a path to) and why static enumeration + per-anchor LLM interpretation is the right architectural split (vs. LLM-only or per-decision LLM calls).
+
+**Status:** Sub-step 10.0 (planning checkpoint + DEC-024 + Hook Lab → Lab rename pin + this phase stub) **done 2026-04-28**, docs-only commit. Sub-steps 10.1 → 10.8 strictly linear, one per Agent-mode session, with a brief Ask-mode planning checkpoint at the top of 10.6 to confirm the `BehaviorAnchor` JSON wire shape before the frontend in 10.7 starts depending on it. **Full sub-task checklist:** `docs/TASKS.md` § Phase 10 — Behavior Trace v1 — sub-step backlog. Rationale + alternatives + tradeoffs + risk taxonomy + rename policy: **DEC-024**.
+
 ---
 
 ## 9. Risks and mitigations
@@ -409,7 +429,8 @@ Skills use a three-tier model: **pipeline** (orchestration only: extract_manifes
 
 ## 11. Relationship to other docs
 
-- **Phases 6–9** (Interactive RE Workbench): detailed sub-tasks in `docs/TASKS.md`; architecture deltas in `docs/ARCHITECTURE.md`; rationale in `docs/DECISIONS.md` (DEC-015–017).
+- **Phases 6–9** (Interactive RE Workbench): detailed sub-tasks in `docs/TASKS.md`; architecture deltas in `docs/ARCHITECTURE.md`; rationale in `docs/DECISIONS.md` (DEC-015–023).
+- **Phase 10** (Behavior Trace — Lab tab gate-identification mode): detailed sub-tasks in `docs/TASKS.md` § Phase 10 sub-step backlog; rationale + data model + rename policy in `docs/DECISIONS.md` **DEC-024**.
 - **Target shape and MVP contracts:** this document.
 - **Concise purpose:** `docs/PROJECT_BRIEF.md`.
 - **Current implementation:** `docs/STATE.md`.

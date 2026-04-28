@@ -6,6 +6,8 @@ Its purpose is to prevent agents and contributors from assuming that the intende
 
 This file should be updated whenever a task materially changes what exists, what works, or what remains incomplete.
 
+> **Naming note (post-DEC-024, 2026-04-28):** the tab labelled **Hook Lab** in the Phase 6→9 / Hook Lab v1 entries below was renamed **Lab** going forward as part of Phase 10's planning checkpoint. Historical entries in this file (Phase 6 polish — tab shell, Hook Lab 4.1 → 4.8 sub-bullets, etc.) retain the original "Hook Lab" naming as accurate proper nouns for the v1 milestone. New entries added by Phase 10 sub-steps (10.1+) use **Lab**. Code rename (`HookLabTab.tsx` → `LabTab.tsx`, `#/hook` URL hash → `#/lab`, etc.) ships in sub-step **10.6** alongside the tab routing changes — until then code-level identifiers reference existing filenames for accuracy. See **DEC-024** for the full policy.
+
 ---
 
 ## Summary
