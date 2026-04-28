@@ -44,3 +44,11 @@ rag:
 # (sub-step 4.5). Min clamp = 100 events.
 frida:
   trace_ring_buffer_size: 5000
+
+# Behavior Trace v1 — Lab tab gate-identification + bypass-planning mode (Phase 10 / DEC-024).
+# bypass_risk_max: maximum risk level the planner will emit into the default
+# bypass-plan list. One of "low" | "medium" | "high"; plans whose risk exceeds
+# this threshold are surfaced behind an "Advanced" expander in the UI rather
+# than mixed with the defaults. Invalid values fail-soft to "medium".
+trace:
+  bypass_risk_max: "medium"

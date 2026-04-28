@@ -514,16 +514,41 @@ class BypassPlan:
 
     Template-bound per DEC-024 — every plan references one of the
     existing ``frida_hooks/`` templates (or new override templates added
-    in 10.4). Free-form LLM JS is explicitly v2.
+    in 10.4: ``force_return_value`` / ``force_method_skip`` /
+    ``force_string_compare_equal``). Free-form LLM JS is explicitly v2.
 
     ``risk`` and ``risks`` are the operator-facing risk affordances; the
-    planner refuses to emit any plan whose ``risk`` exceeds the
-    operator-configured ``trace.bypass_risk_max`` threshold (default
-    ``"medium"``). High-risk plans are surfaced behind an "Advanced"
-    expander in 10.7's UI rather than emitted into the default list.
+    planner emits plans into a default list when ``risk <=
+    trace.bypass_risk_max`` (default ``"medium"``) and into a separate
+    ``advanced_plans`` tuple otherwise. 10.7's UI surfaces the latter
+    behind an "Advanced" expander rather than mixing them with the
+    default list.
+
+    Back-reference fields (10.4):
+
+    * ``target_method`` — the method this plan's hook will actually
+      attach to. May differ from the gate method itself: a Plan A
+      (predicate-flip) plan targets the *predicate's source method*
+      (e.g. ``isPremiumUser``), not the enclosing gate method (e.g.
+      ``onPaymentClicked``).
+    * ``source_decision_method`` — the gate method the plan was
+      generated for (the ``DecisionPoint.method`` whose verdict the
+      plan is intended to flip). Lets 10.5's persistence layer index
+      plans by the gate they bypass and 10.7's ``BypassPlanCard``
+      render alongside the right ``DecisionPoint``.
+    * ``source_decision_instruction_index`` — which ``DecisionPoint``
+      within ``source_decision_method`` (matches
+      ``DecisionPoint.instruction_index``). Methods with multiple
+      decisions need the disambiguator.
+
+    All three default to ``None`` so 10.1's minimal-shell construction
+    pattern still works (the planner always populates them).
     """
     template_id: str
     params: dict[str, str]
     rationale: str
     risk: str                             # "low" | "medium" | "high" — locked enum 10.4
     risks: tuple[str, ...] = ()
+    target_method: Optional[MethodRef] = None
+    source_decision_method: Optional[MethodRef] = None
+    source_decision_instruction_index: Optional[int] = None

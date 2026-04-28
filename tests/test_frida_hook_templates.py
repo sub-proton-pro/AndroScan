@@ -238,8 +238,13 @@ class TestRegistryFailClosed:
 
     def test_module_list_is_non_empty(self):
         # Sanity: if someone accidentally empties the list, the loop
-        # below would silently pass — guard against that.
-        assert len(frida_hooks._TEMPLATE_MODULES) >= 5
+        # below would silently pass — guard against that. Lower bound
+        # bumped from 5 → 9 in Phase 10 sub-step 10.4 (DEC-024) when
+        # the bypass-planner override templates landed
+        # (force_return_value / force_method_skip /
+        # force_string_compare_equal alongside the original 6 v1
+        # observation templates).
+        assert len(frida_hooks._TEMPLATE_MODULES) >= 9
 
     def test_registered_count_matches_module_list(self):
         # Every module in the list contributed exactly one template.
@@ -423,6 +428,106 @@ class TestTemplates:
         # extras-not-captured caveat.
         assert "deep-link" in s or "navigation" in s
         assert "extras" in s
+
+    def test_force_return_value_renders(self):
+        """Phase 10 sub-step 10.4 — bypass-planner override template."""
+        result = render_by_id(
+            "force_return_value",
+            {
+                "class_name": "com.example.LicenseChecker",
+                "method_name": "isPremiumUser",
+                "return_value_expr": "true",
+                "event_label": "force-rv-1",
+            },
+        )
+        # Every parameter substituted into the JS body.
+        assert "com.example.LicenseChecker" in result.js
+        assert "isPremiumUser" in result.js
+        assert "force-rv-1" in result.js
+        assert "(true)" in result.js  # the forced literal as raw JS
+        # Phase markers used by the Lab session pane.
+        assert '"phase": "forced"' in result.js
+        assert '"phase": "ready"' in result.js
+        assert '"phase": "error"' in result.js
+        # Summary surfaces the contract the operator needs to see
+        # before injecting: the original method body is NOT executed.
+        s = result.summary.lower()
+        assert "force" in s
+        assert "not executed" in s or "side effects" in s
+        assert "true" in result.summary  # forced literal mentioned
+        # Sensitive-APIs metadata flags the implementation hijack.
+        from androscan.adapters.frida_hooks import get_template
+
+        tmpl = get_template("force_return_value")
+        assert "overload.implementation" in tmpl.sensitive_apis
+
+    def test_force_method_skip_renders(self):
+        """Phase 10 sub-step 10.4 — bypass-planner void-gate template."""
+        result = render_by_id(
+            "force_method_skip",
+            {
+                "class_name": "com.example.LicenseGate",
+                "method_name": "enforceLicense",
+                "return_descriptor": "V",
+                "event_label": "force-skip-1",
+            },
+        )
+        assert "com.example.LicenseGate" in result.js
+        assert "enforceLicense" in result.js
+        assert "force-skip-1" in result.js
+        assert '"V"' in result.js  # descriptor used in the JS
+        # Phase markers — ``skipped`` instead of ``forced`` to
+        # distinguish from force_return_value events on the
+        # operator-facing trace stream.
+        assert '"phase": "skipped"' in result.js
+        assert '"phase": "ready"' in result.js
+        s = result.summary.lower()
+        assert "skip" in s or "no-op" in s or "stub" in s
+        assert "side effects" in s or "not executed" in s
+        # The descriptor → zero-value mapping for void / Z / I / L is
+        # the contract operators rely on. Spot-check non-void rendering
+        # too — the descriptor flows into the JS, not the descriptor
+        # text in the summary.
+        result_z = render_by_id(
+            "force_method_skip",
+            {
+                "class_name": "com.example.Foo",
+                "method_name": "isOk",
+                "return_descriptor": "Z",
+                "event_label": "skip-z",
+            },
+        )
+        assert '"Z"' in result_z.js
+
+    def test_force_string_compare_equal_renders(self):
+        """Phase 10 sub-step 10.4 — license-check / secret-string bypass."""
+        result = render_by_id(
+            "force_string_compare_equal",
+            {
+                "target_literal": "LICENSE_VALID_42",
+                "event_label": "string-eq-1",
+            },
+        )
+        assert "LICENSE_VALID_42" in result.js
+        assert "string-eq-1" in result.js
+        # Both String.equals overloads must be hooked — that's the
+        # template's whole-point (covers both equals + equalsIgnoreCase
+        # patterns operators see in the wild).
+        assert "String.equals" in result.js or "Str.equals" in result.js
+        assert "equalsIgnoreCase" in result.js
+        # Phase marker.
+        assert '"phase": "forced"' in result.js
+        # Summary calls out the literal-gated nature so operators
+        # understand the blast-radius before injecting.
+        s = result.summary.lower()
+        assert "literal" in s
+        assert "app-wide" in s or "blast-radius" in s
+        # Sensitive-APIs metadata flags the String hooks specifically.
+        from androscan.adapters.frida_hooks import get_template
+
+        tmpl = get_template("force_string_compare_equal")
+        assert "String.equals" in tmpl.sensitive_apis
+        assert "String.equalsIgnoreCase" in tmpl.sensitive_apis
 
     def test_scope_inspector_renders(self):
         result = render_by_id(

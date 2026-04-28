@@ -164,6 +164,15 @@ _TEMPLATE_MODULES: tuple[str, ...] = (
     "androscan.adapters.frida_hooks.crypto",
     "androscan.adapters.frida_hooks.shared_preferences",
     "androscan.adapters.frida_hooks.intent",
+    # Phase 10 / DEC-024 sub-step 10.4 — override templates emitted by
+    # the bypass planner (``androscan.analysis.bypass_planner``). Risk
+    # taxonomy:
+    #   force_return_value         — LOW    (one named method, one literal)
+    #   force_method_skip          — MEDIUM (one named method, side effects skipped)
+    #   force_string_compare_equal — MEDIUM (app-wide String.equals, literal-gated)
+    "androscan.adapters.frida_hooks.force_return_value",
+    "androscan.adapters.frida_hooks.force_method_skip",
+    "androscan.adapters.frida_hooks.force_string_compare_equal",
 )
 
 

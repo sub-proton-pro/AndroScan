@@ -77,6 +77,7 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     "rag_embed_model":             ("rag",      "embed_model",       "ANDROSCAN_RAG_MODEL"),
     "rag_top_k_default":           ("rag",      "top_k_default",     "ANDROSCAN_RAG_TOP_K"),
     "frida_trace_ring_buffer_size":("frida",    "trace_ring_buffer_size", "ANDROSCAN_FRIDA_TRACE_RING"),
+    "trace_bypass_risk_max":       ("trace",    "bypass_risk_max",        "ANDROSCAN_TRACE_BYPASS_RISK_MAX"),
 }
 
 
@@ -107,6 +108,9 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # frida.trace_ring_buffer_size only takes effect on new FridaSession
     # instances; nothing in flight needs to be torn down to pick up a change.
     "frida_trace_ring_buffer_size",
+    # trace.bypass_risk_max is read per-call by 10.4's bypass_planner +
+    # 10.5's trace_behavior skill; no in-flight state to bounce.
+    "trace_bypass_risk_max",
 })
 
 
@@ -139,6 +143,7 @@ class Config:
     rag_embed_model: str
     rag_top_k_default: int
     frida_trace_ring_buffer_size: int
+    trace_bypass_risk_max: str   # "low" | "medium" | "high" — Phase 10 / DEC-024
 
     @classmethod
     def default(cls) -> "Config":
@@ -167,6 +172,7 @@ class Config:
             rag_embed_model="",
             rag_top_k_default=8,
             frida_trace_ring_buffer_size=5000,
+            trace_bypass_risk_max="medium",
         )
 
     @property
@@ -275,6 +281,13 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["frida_trace_ring_buffer_size"] = _safe_int(
         frida.get("trace_ring_buffer_size"), 5000, "frida.trace_ring_buffer_size"
     )
+    trace = config_dict.get("trace") or {}
+    # Loader stays permissive (any string accepted) — the planner +
+    # 10.5 skill validate against {"low", "medium", "high"} downstream
+    # with a fail-soft fallback to "medium" on invalid input. Mirrors
+    # how llm_provider is handled (strings out of-set don't blow up
+    # config loading; consumers handle the fallback).
+    out["trace_bypass_risk_max"] = (trace.get("bypass_risk_max") or "medium").strip() or "medium"
     return out
 
 
@@ -352,6 +365,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 f"Warning: ANDROSCAN_FRIDA_TRACE_RING={os.environ['ANDROSCAN_FRIDA_TRACE_RING']!r} invalid; using default.",
                 file=sys.stderr,
             )
+    if os.environ.get("ANDROSCAN_TRACE_BYPASS_RISK_MAX"):
+        merged["trace_bypass_risk_max"] = os.environ["ANDROSCAN_TRACE_BYPASS_RISK_MAX"].strip().lower() or merged.get("trace_bypass_risk_max", "medium")
     if os.environ.get("ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"):
         try:
             merged["web_screencap_interval_ms"] = max(50, int(os.environ["ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"].strip()))
@@ -386,6 +401,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         rag_embed_model=str(merged.get("rag_embed_model") or "").strip(),
         rag_top_k_default=max(1, int(merged.get("rag_top_k_default", 8))),
         frida_trace_ring_buffer_size=max(100, int(merged.get("frida_trace_ring_buffer_size", 5000))),
+        trace_bypass_risk_max=str(merged.get("trace_bypass_risk_max") or "medium").strip().lower() or "medium",
     )
 
 
@@ -501,6 +517,7 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
         rag_embed_model=str(flat["rag_embed_model"] or "").strip(),
         rag_top_k_default=max(1, int(flat["rag_top_k_default"])),
         frida_trace_ring_buffer_size=max(100, int(flat["frida_trace_ring_buffer_size"])),
+        trace_bypass_risk_max=str(flat["trace_bypass_risk_max"] or "medium").strip().lower() or "medium",
     )
 
 
@@ -529,6 +546,7 @@ def coerce_yaml_value(field: str, raw: Any) -> Any:
         "section_rule_char",
         "web_host",
         "rag_embed_provider", "rag_embed_model",
+        "trace_bypass_risk_max",
     }
     if field in int_fields:
         return _safe_int(raw, 0, field)
