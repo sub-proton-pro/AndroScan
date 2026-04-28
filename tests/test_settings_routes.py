@@ -63,6 +63,16 @@ def client(cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Test
         # paths override via monkeypatch).
         return {"ok": True, "abi": "arm64-v8a", "frida_arch": "android-arm64",
                 "error": None}
+    async def _root_user_build(*a, **kw):
+        # Default fixture: production / Google Play AVD posture (the
+        # most common setup operators land on by accident). Mirrors the
+        # real device used during development — locks the UI's "warn
+        # before adb root" path into the contract test below. Tests
+        # that need a userdebug AVD or a Magisk-rooted device override
+        # via monkeypatch.
+        return {"ok": True, "rooted": False, "can_adb_root": False,
+                "current_uid": 2000, "build_type": "user",
+                "debuggable": False, "error": None}
     # Patch via the *consumer* module — status_routes binds the names at
     # import time, so patching the producer module wouldn't take effect.
     from androscan.web import status_routes as sr
@@ -73,6 +83,7 @@ def client(cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Test
     monkeypatch.setattr(sr, "probe_frida_version", _missing)
     monkeypatch.setattr(sr, "probe_frida_server", _frida_server_off)
     monkeypatch.setattr(sr, "probe_device_cpu_abi", _abi_arm64)
+    monkeypatch.setattr(sr, "probe_device_root_status", _root_user_build)
     monkeypatch.setattr(sr, "probe_adb_device", _device_ok)
     monkeypatch.setattr(sr, "probe_uiautomator_dump", _empty_dump)
     monkeypatch.setattr(sr, "probe_foreground_activity", _fg)
@@ -363,9 +374,10 @@ def test_global_status_exposes_frida_server_card_contract(client: TestClient) ->
     The frontend (`src/api/status.ts` ``GlobalStatus.tools.frida_server``)
     relies on this exact field set: ``ok``, ``label``, ``running``, ``pid``,
     ``host_version``, ``device_version``, ``version_skew``, ``error``,
-    ``device_abi``, ``frida_arch``. Locking the keys here means any
-    backend rename that drifts the contract breaks pytest before it
-    ever ships to the UI.
+    ``device_abi``, ``frida_arch``, ``device_rooted``, ``can_adb_root``,
+    ``device_build_type``. Locking the keys here means any backend
+    rename that drifts the contract breaks pytest before it ever ships
+    to the UI.
     """
     body = client.get("/api/status/global").json()
     card = body["tools"]["frida_server"]
@@ -373,6 +385,7 @@ def test_global_status_exposes_frida_server_card_contract(client: TestClient) ->
         "ok", "label", "running", "pid",
         "host_version", "device_version", "version_skew", "error",
         "device_abi", "frida_arch",
+        "device_rooted", "can_adb_root", "device_build_type",
     }
     assert expected_keys.issubset(card.keys()), (
         f"missing keys: {expected_keys - card.keys()}"
@@ -388,6 +401,54 @@ def test_global_status_exposes_frida_server_card_contract(client: TestClient) ->
     # install playbook fields must be populated and self-consistent.
     assert card["device_abi"] == "arm64-v8a"
     assert card["frida_arch"] == "android-arm64"
+    # Default fixture is the production / Google Play AVD posture
+    # (build=user, uid=2000) — the UI relies on can_adb_root=False to
+    # render the "this AVD can't be rooted" warning before step 4.
+    assert card["device_build_type"] == "user"
+    assert card["device_rooted"] is False
+    assert card["can_adb_root"] is False
+
+
+def test_global_status_frida_server_card_userdebug_avd(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AOSP / Google APIs AVD: can_adb_root=True, no warning surfaced."""
+    from androscan.web import status_routes as sr
+    from androscan.web.status_routes import invalidate_status_cache
+
+    async def _userdebug(*a, **kw):
+        return {"ok": True, "rooted": False, "can_adb_root": True,
+                "current_uid": 2000, "build_type": "userdebug",
+                "debuggable": True, "error": None}
+
+    monkeypatch.setattr(sr, "probe_device_root_status", _userdebug)
+    invalidate_status_cache()
+
+    card = client.get("/api/status/global").json()["tools"]["frida_server"]
+    assert card["can_adb_root"] is True
+    assert card["device_build_type"] == "userdebug"
+    assert card["device_rooted"] is False
+
+
+def test_global_status_frida_server_card_no_device_root(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No device attached → all three root fields are null (not raising)."""
+    from androscan.web import status_routes as sr
+    from androscan.web.status_routes import invalidate_status_cache
+
+    async def _no_device_root(*a, **kw):
+        return {"ok": False, "rooted": None, "can_adb_root": None,
+                "current_uid": None, "build_type": None, "debuggable": None,
+                "error": "adb: no devices/emulators found"}
+
+    monkeypatch.setattr(sr, "probe_device_root_status", _no_device_root)
+    invalidate_status_cache()
+
+    card = client.get("/api/status/global").json()["tools"]["frida_server"]
+    assert card["device_rooted"] is None
+    assert card["can_adb_root"] is None
+    assert card["device_build_type"] is None
 
 
 def test_global_status_frida_server_card_unknown_abi(

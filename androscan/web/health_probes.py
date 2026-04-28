@@ -21,6 +21,11 @@ Categories
   ``ro.product.cpu.abi`` value plus its mapping to the Frida release
   filename arch suffix so the Settings tab can render an ABI-aware
   ``frida-server`` install playbook.
+* Device root status (``probe_device_root_status``) — predicts
+  whether ``adb root`` will succeed (``ro.build.type`` +
+  ``ro.debuggable`` + current shell uid) so the install playbook can
+  warn the operator before they paste a step that can't possibly
+  work on a production / Google Play AVD image.
 * Network services (``probe_ollama_tags`` / ``probe_ollama_embed_model``).
 * Embed provider (``probe_fastembed_available`` / ``probe_embed_provider``).
 * Filesystem (``probe_disk`` / ``probe_path_writable``).
@@ -33,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import re
 import shutil
 import sys
 import time
@@ -305,6 +311,120 @@ async def probe_device_cpu_abi(
         "frida_arch": frida_arch,
         "error": None if frida_arch is not None
                  else f"unknown ABI {abi!r} (no Frida arch mapping)",
+    }
+
+
+# Build types that allow ``adb root`` to succeed. ``user`` (production
+# / Google Play AVD images) refuses with "adbd cannot run as root in
+# production builds"; ``userdebug`` (the AOSP / Google APIs AVD
+# variants) and ``eng`` (engineering builds) flip adbd to uid 0 on
+# request.
+_ROOTABLE_BUILD_TYPES: frozenset[str] = frozenset({"userdebug", "eng"})
+
+
+async def probe_device_root_status(
+    adb_cmd: str = "adb",
+    timeout: float = SHORT_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    """Predict whether the connected device can be rooted via ``adb root``.
+
+    Frida requires the on-device server to run as root, which in turn
+    means either (a) the default adb shell user is *already* root
+    (uid 0 — rare on stock images, common on Magisk-rooted phones or
+    custom ``eng`` ROMs) or (b) ``adb root`` will succeed, which only
+    works on ``userdebug`` / ``eng`` build types with
+    ``ro.debuggable=1``. Production (``user``) builds — including the
+    standard Google Play AVD images — refuse ``adb root`` with
+    *"adbd cannot run as root in production builds"*, so the
+    Settings-tab install playbook needs to warn the operator before
+    they paste step 4.
+
+    We deliberately do **not** invoke ``adb root`` itself here — it
+    has the side effect of restarting adbd, which would tear down
+    in-flight WebSocket streams (``/ws/mirror`` / ``/ws/logcat`` /
+    Frida trace WS). Instead we read ``ro.build.type`` +
+    ``ro.debuggable`` + the current adb-shell uid via ``id``; together
+    these are sufficient to predict whether ``adb root`` *would*
+    succeed without paying the side effect.
+
+    Returns ``{ok, rooted, can_adb_root, current_uid, build_type,
+    debuggable, error}``:
+
+    * ``rooted`` — True when the default adb shell already runs as
+      uid 0 (the strongest "no further setup needed" signal).
+    * ``can_adb_root`` — True when ``adb root`` is expected to
+      succeed (build is ``userdebug`` or ``eng`` AND
+      ``ro.debuggable=1``) **or** the shell is already root.
+    * ``current_uid`` — int uid the default adb shell runs as
+      (typically 2000 = ``shell`` on locked-down images).
+    * ``build_type`` — ``"user"`` (production), ``"userdebug"``,
+      or ``"eng"`` (engineering).
+
+    All four data fields are ``None`` when the probe couldn't reach
+    the device at all (no emulator attached / adb wedged).
+    """
+    # Single shell roundtrip — 3 sub-commands joined with ``;`` so we
+    # don't pay 3 separate ``adb shell`` startups (~100 ms each on a
+    # busy emulator). ``echo ---`` between blocks is the parser
+    # boundary; it's safe because none of the values we read can
+    # contain that string.
+    rc, out, err = await _run(
+        adb_cmd, "shell",
+        "getprop ro.build.type; echo ---; getprop ro.debuggable; echo ---; id",
+        timeout=timeout,
+    )
+    if rc != 0:
+        return {
+            "ok": False,
+            "rooted": None,
+            "can_adb_root": None,
+            "current_uid": None,
+            "build_type": None,
+            "debuggable": None,
+            "error": (err or out or "could not query device root status").strip()[:300] or "no device",
+        }
+
+    parts = (out or "").split("---")
+    if len(parts) < 3:
+        return {
+            "ok": False,
+            "rooted": None,
+            "can_adb_root": None,
+            "current_uid": None,
+            "build_type": None,
+            "debuggable": None,
+            "error": f"unexpected getprop output: {out!r:.300}",
+        }
+
+    build_type = parts[0].strip() or None
+    debuggable_raw = parts[1].strip()
+    debuggable: Optional[bool] = (
+        debuggable_raw == "1" if debuggable_raw in ("0", "1") else None
+    )
+    id_line = parts[2].strip()
+
+    current_uid: Optional[int] = None
+    # ``id`` outputs e.g. ``uid=2000(shell) gid=2000(shell) groups=...``.
+    m = re.search(r"uid=(\d+)", id_line)
+    if m:
+        try:
+            current_uid = int(m.group(1))
+        except ValueError:
+            current_uid = None
+
+    rooted = current_uid == 0
+    can_adb_root = bool(rooted) or (
+        build_type in _ROOTABLE_BUILD_TYPES and debuggable is True
+    )
+
+    return {
+        "ok": True,
+        "rooted": rooted,
+        "can_adb_root": can_adb_root,
+        "current_uid": current_uid,
+        "build_type": build_type,
+        "debuggable": debuggable,
+        "error": None,
     }
 
 

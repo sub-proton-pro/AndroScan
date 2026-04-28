@@ -371,6 +371,131 @@ def test_probe_device_cpu_abi_no_device(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 # ---------------------------------------------------------------------------
+# probe_device_root_status (drives the install-playbook root warning)
+
+
+def _root_probe_stdout(build_type: str, debuggable: str, id_line: str) -> bytes:
+    """Build the exact ``getprop ; echo --- ; getprop ; echo --- ; id`` shape
+    the probe joins server-side. Keeps the parser-boundary contract in one
+    place so a refactor of the probe's command string fails fast here.
+    """
+    return f"{build_type}\n---\n{debuggable}\n---\n{id_line}\n".encode()
+
+
+def test_probe_device_root_status_user_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production (Google Play) AVD: build=user, uid=2000 → can_adb_root=False."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, _root_probe_stdout(
+            "user", "0", "uid=2000(shell) gid=2000(shell) groups=2000(shell)",
+        ), b"")}),
+    )
+    out = asyncio.run(hp.probe_device_root_status("adb"))
+    assert out["ok"] is True
+    assert out["rooted"] is False
+    assert out["can_adb_root"] is False
+    assert out["current_uid"] == 2000
+    assert out["build_type"] == "user"
+    assert out["debuggable"] is False
+    assert out["error"] is None
+
+
+def test_probe_device_root_status_userdebug_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AOSP / Google APIs AVD: build=userdebug, debuggable=1 → can_adb_root=True."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, _root_probe_stdout(
+            "userdebug", "1", "uid=2000(shell) gid=2000(shell) groups=2000(shell)",
+        ), b"")}),
+    )
+    out = asyncio.run(hp.probe_device_root_status("adb"))
+    assert out["ok"] is True
+    assert out["rooted"] is False  # not yet root, but adb root will succeed
+    assert out["can_adb_root"] is True
+    assert out["current_uid"] == 2000
+    assert out["build_type"] == "userdebug"
+    assert out["debuggable"] is True
+
+
+def test_probe_device_root_status_already_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Magisk / eng device where adbd already runs as root: rooted=True wins."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, _root_probe_stdout(
+            "user", "0", "uid=0(root) gid=0(root) groups=0(root)",
+        ), b"")}),
+    )
+    out = asyncio.run(hp.probe_device_root_status("adb"))
+    assert out["ok"] is True
+    assert out["rooted"] is True
+    # Even though build_type is ``user``, an already-root shell makes the
+    # adb-root step a no-op rather than a failure — the UI gate is
+    # ``can_adb_root``, so it must roll the rooted-shell case in.
+    assert out["can_adb_root"] is True
+    assert out["current_uid"] == 0
+
+
+def test_probe_device_root_status_eng_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Engineering build: same allowance as userdebug."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, _root_probe_stdout(
+            "eng", "1", "uid=2000(shell) gid=2000(shell) groups=2000(shell)",
+        ), b"")}),
+    )
+    out = asyncio.run(hp.probe_device_root_status("adb"))
+    assert out["can_adb_root"] is True
+    assert out["build_type"] == "eng"
+
+
+def test_probe_device_root_status_userdebug_but_not_debuggable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``userdebug`` build with ``ro.debuggable=0`` (rare hardened image):
+    we refuse to claim ``can_adb_root=True`` since adbd will refuse the
+    upgrade. Closes a footgun where a sideways-rooted device looks
+    rootable on build_type alone but isn't.
+    """
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, _root_probe_stdout(
+            "userdebug", "0", "uid=2000(shell) gid=2000(shell) groups=2000(shell)",
+        ), b"")}),
+    )
+    out = asyncio.run(hp.probe_device_root_status("adb"))
+    assert out["can_adb_root"] is False
+    assert out["debuggable"] is False
+
+
+def test_probe_device_root_status_no_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """adb errors (no device) → ok=False, all four data fields None."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(1, b"", b"adb: no devices/emulators found\n")}),
+    )
+    out = asyncio.run(hp.probe_device_root_status("adb"))
+    assert out["ok"] is False
+    assert out["rooted"] is None
+    assert out["can_adb_root"] is None
+    assert out["current_uid"] is None
+    assert out["build_type"] is None
+    assert out["debuggable"] is None
+    assert out["error"]
+
+
+def test_probe_device_root_status_unparsable_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Garbled getprop response (missing ``---`` boundaries) → ok=False, no claims."""
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec",
+        _make_subprocess_factory({"adb": _FakeProc(0, b"???\n", b"")}),
+    )
+    out = asyncio.run(hp.probe_device_root_status("adb"))
+    assert out["ok"] is False
+    assert out["can_adb_root"] is None
+    assert out["error"]
+
+
+# ---------------------------------------------------------------------------
 # Ollama probes
 
 

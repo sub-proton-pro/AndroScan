@@ -415,11 +415,21 @@ explicitly rather than re-litigating the safety surface.
   `_ABI_TO_FRIDA_ARCH` table to the Frida release-filename arch suffix
   (`arm64-v8a → android-arm64`, etc.); the hint then synthesises the exact
   download URL (host `frida` CLI version + arch) and prints copy-pasteable
-  commands for download → decompress → push → start → verify. This is
-  **operator guidance only** — the workbench still does not run any of
-  those commands itself. The README pointer remains the documented
-  escape hatch when the synthesised hint isn't applicable (unmapped ABI,
-  missing host CLI, custom ROMs, Magisk modules, etc.).
+  commands for download → decompress → push → start → verify. A second
+  probe — `probe_device_root_status` — reads `ro.build.type` +
+  `ro.debuggable` + the default adb-shell uid (single shell roundtrip,
+  zero side effects on adbd) and rolls them into a `can_adb_root`
+  boolean; when False the playbook hoists a yellow warning banner above
+  the steps explaining that `adb root` will fail on this AVD (production
+  / Google Play image) and listing the three remediations (recreate as
+  AOSP / Google APIs userdebug, boot with `-writable-system` + Magisk,
+  use a rooted physical device). When `device_rooted === true` (Magisk
+  / eng), step 4 elides the `adb root` line entirely and surfaces a
+  green confirmation banner instead. This is **operator guidance only**
+  — the workbench still does not run any of those commands itself. The
+  README pointer remains the documented escape hatch when the
+  synthesised hint isn't applicable (unmapped ABI, missing host CLI,
+  custom ROMs, Magisk modules, etc.).
 
 **No device-touching code in the default `pytest` suite:**
 - Real `frida` Python imports happen only inside the `_frida_python()` seam.
@@ -572,15 +582,20 @@ place without cross-referencing five DEC-023 sub-bullets.
   visibility surface — the README points operators at upstream
   `frida-server` install docs, and the Settings → Status card surfaces
   device state in `tools.frida_server` (yellow on missing, red on major
-  version skew). The post-v1 polish pass added a third probe
-  (`probe_device_cpu_abi`) and an ABI-aware install playbook on the
-  same card; the playbook is **operator guidance only** — the
-  synthesised commands are rendered as copy-pasteable `<code>` blocks
-  with a click-to-copy button, never executed by the workbench. v2 may
-  revisit auto-provisioning if operator demand justifies the per-OEM /
-  Magisk / userspace-gadget complexity; v1 closes with the explicit
-  position that this is *not* a missing feature but a deliberate
-  trust-boundary choice.
+  version skew). The post-v1 polish pass added two more probes — the
+  ABI probe (`probe_device_cpu_abi`) and the root-status probe
+  (`probe_device_root_status`) — and an ABI-aware install playbook
+  on the same card with a per-AVD root-status warning banner. The
+  playbook is **operator guidance only** — the synthesised commands
+  are rendered as copy-pasteable `<code>` blocks with a click-to-copy
+  icon button, never executed by the workbench. The root-status probe
+  itself is a pure read (`getprop ro.build.type` / `ro.debuggable` /
+  `id`); it deliberately does NOT call `adb root` because that has the
+  side effect of restarting adbd and would tear down in-flight
+  WebSocket streams. v2 may revisit auto-provisioning if operator
+  demand justifies the per-OEM / Magisk / userspace-gadget complexity;
+  v1 closes with the explicit position that this is *not* a missing
+  feature but a deliberate trust-boundary choice.
 - **LLM-tier `generate_frida_hook` is structurally prep-only (4.7 — first
   consumer of DEC-022's `requires_confirmation=True`):** the skill calls
   `frida_hooks.render_by_id` and returns rendered JS + deterministic

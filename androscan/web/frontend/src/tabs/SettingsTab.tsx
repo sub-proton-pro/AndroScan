@@ -1026,6 +1026,7 @@ function FridaServerStatusCard({
     card.device_version ? `device ${card.device_version}` : "",
     card.host_version ? `host ${card.host_version}` : "",
     card.device_abi ? `abi ${card.device_abi}` : "",
+    card.device_build_type ? `build ${card.device_build_type}` : "",
     card.version_skew === "major"
       ? "version skew: major (incompatible)"
       : card.version_skew === "minor"
@@ -1079,6 +1080,24 @@ function FridaServerInstallHint({
   // known, but the placeholder is still copy-pasteable as a template.
   const decompressed = filename ? filename.replace(/\.xz$/, "") : "frida-server-<version>-android-<arch>";
 
+  // Root-status branching: the install playbook needs to behave
+  // differently depending on whether the device can be rooted.
+  //   * can_adb_root === false → operator pasted ``adb root`` will
+  //     fail; we hoist a warning banner above the steps explaining
+  //     why and what to do instead (recreate the AVD as
+  //     AOSP / Google APIs userdebug, or use Magisk).
+  //   * device_rooted === true → adbd already runs as uid 0; we
+  //     skip the ``adb root`` line in step 4 (it's a no-op-with-noise
+  //     on Magisk / eng builds and confuses operators who think they
+  //     need to run it).
+  //   * Both null → no device attached; we render the playbook as a
+  //     template so the operator can see what to expect, but the
+  //     "no device" line in the detect blurb already explains the
+  //     situation.
+  const canAdbRoot = card.can_adb_root;
+  const alreadyRooted = card.device_rooted === true;
+  const buildType = card.device_build_type;
+
   return (
     <details className="frida-install-hint">
       <summary>How to install <code>frida-server</code> on the device</summary>
@@ -1091,6 +1110,30 @@ function FridaServerInstallHint({
           <p className="frida-install-detect frida-install-warn">
             We don't have a Frida arch mapping for <code>{abi}</code> — pick the closest match by hand from the <a href={releaseTagUrl} target="_blank" rel="noopener noreferrer">releases page</a>.
           </p>
+        )}
+        {canAdbRoot === false && (
+          <div className="frida-install-banner frida-install-banner-warn">
+            <strong>This device can't be rooted via <code>adb root</code>.</strong>
+            <p>
+              {buildType === "user"
+                ? <>The attached AVD is a production build (<code>ro.build.type=user</code>) — almost certainly a <em>Google Play</em> system image. Step 4 below will fail with <code>adbd cannot run as root in production builds</code>, and Frida needs root to inject.</>
+                : <>The attached device's build profile (<code>ro.build.type={buildType ?? "?"}</code> / <code>ro.debuggable=0</code>) refuses the <code>adb root</code> upgrade. Step 4 below will fail and Frida needs root to inject.</>
+              }
+            </p>
+            <p>
+              To enable Hook Lab on this device, do <em>one</em> of the following first:
+            </p>
+            <ul>
+              <li>Recreate the AVD in Android Studio's Device Manager picking the <strong>AOSP</strong> or <strong>Google APIs</strong> system image variant (not <em>Google Play</em>) — these ship as <code>userdebug</code> and accept <code>adb root</code>.</li>
+              <li>Boot the existing AVD with <code>emulator -avd &lt;name&gt; -writable-system</code>, then push <a href="https://github.com/topjohnwu/Magisk/releases/latest" target="_blank" rel="noopener noreferrer">Magisk</a> or another <code>su</code> provider.</li>
+              <li>Use a physical device that's already rooted (Magisk / eng ROM).</li>
+            </ul>
+          </div>
+        )}
+        {alreadyRooted && (
+          <div className="frida-install-banner frida-install-banner-ok">
+            <strong>Device already runs as root</strong> (<code>uid=0</code>) — step 4 below skips the <code>adb root</code> upgrade.
+          </div>
         )}
         <ol className="frida-install-steps">
           <li>
@@ -1112,8 +1155,12 @@ function FridaServerInstallHint({
             <FridaInstallCmd cmd={`adb push ${decompressed} /data/local/tmp/frida-server`} />
           </li>
           <li>
-            <span className="frida-install-step-label">Make it executable & start it (root needed; emulators run as root)</span>
-            <FridaInstallCmd cmd={`adb root`} />
+            <span className="frida-install-step-label">
+              {alreadyRooted
+                ? "Make it executable & start it (device already runs as root)"
+                : "Make it executable & start it (root needed; emulators run as root)"}
+            </span>
+            {!alreadyRooted && <FridaInstallCmd cmd={`adb root`} />}
             <FridaInstallCmd cmd={`adb shell "chmod 755 /data/local/tmp/frida-server"`} />
             <FridaInstallCmd cmd={`adb shell "/data/local/tmp/frida-server &" >/dev/null 2>&1 &`} />
           </li>

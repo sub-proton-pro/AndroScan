@@ -47,6 +47,7 @@ from androscan.web.health_probes import (
     probe_embed_provider,
     probe_foreground_activity,
     probe_device_cpu_abi,
+    probe_device_root_status,
     probe_frida_server,
     probe_frida_version,
     probe_frida_version_skew,
@@ -114,6 +115,11 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
     # the other adb probes), so we don't bother gating it on
     # ``probe_adb_device``.
     abi_p = probe_device_cpu_abi("adb")
+    # Root-status probe — same deal: tells the install playbook
+    # whether ``adb root`` is going to work on this AVD, so it can
+    # warn before the operator pastes step 4. Pure read (``getprop``
+    # + ``id``); no side effects on adbd.
+    root_p = probe_device_root_status("adb")
     device_p = probe_adb_device()
     ollama_p = probe_ollama_tags(getattr(config, "ollama_base_url", "http://localhost:11434"))
     embed_p = probe_embed_provider(
@@ -122,8 +128,8 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
         getattr(config, "ollama_base_url", "http://localhost:11434"),
     )
 
-    (adb_v, jadx_v, apktool_v, frida_v, frida_server_v, device_v, ollama_t, embed_s, abi_v) = await asyncio.gather(
-        adb_p, jadx_p, apktool_p, frida_p, frida_server_p, device_p, ollama_p, embed_p, abi_p,
+    (adb_v, jadx_v, apktool_v, frida_v, frida_server_v, device_v, ollama_t, embed_s, abi_v, root_v) = await asyncio.gather(
+        adb_p, jadx_p, apktool_p, frida_p, frida_server_p, device_p, ollama_p, embed_p, abi_p, root_p,
         return_exceptions=False,
     )
 
@@ -204,6 +210,17 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
                 # is attached or the ABI isn't in our mapping table.
                 "device_abi": abi_v.get("abi"),
                 "frida_arch": abi_v.get("frida_arch"),
+                # Device root-status: does the install playbook need to
+                # warn the operator that ``adb root`` will fail? All
+                # four fields are ``null`` when no device is attached.
+                # ``can_adb_root`` rolls up build-type + debuggable +
+                # current uid into the single boolean the UI cares
+                # about; the raw ``device_build_type`` and
+                # ``device_rooted`` are surfaced too so the warning
+                # message can be specific.
+                "device_rooted": root_v.get("rooted"),
+                "can_adb_root": root_v.get("can_adb_root"),
+                "device_build_type": root_v.get("build_type"),
             },
         },
         "device": {

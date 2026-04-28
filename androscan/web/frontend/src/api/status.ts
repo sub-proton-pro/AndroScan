@@ -58,6 +58,28 @@ export type GlobalStatus = {
        */
       device_abi: string | null;
       frida_arch: string | null;
+      /**
+       * Device root-status fields used by the install playbook to
+       * warn the operator before they paste ``adb root`` into a
+       * production AVD that will refuse with *"adbd cannot run as
+       * root in production builds"*. All three are ``null`` when no
+       * device is attached.
+       *
+       * ``can_adb_root`` is the single boolean the UI gates on — it
+       * rolls up build-type + debuggable + current-uid into the one
+       * signal that matters: "will step 4 work?".
+       *
+       * ``device_rooted`` (default adb shell already runs as uid 0)
+       * lets the playbook skip the ``adb root`` step entirely on
+       * Magisk-rooted devices / eng builds.
+       *
+       * ``device_build_type`` (``"user"`` / ``"userdebug"`` / ``"eng"``)
+       * is surfaced verbatim so the warning can name the actual
+       * cause instead of a generic message.
+       */
+      device_rooted: boolean | null;
+      can_adb_root: boolean | null;
+      device_build_type: string | null;
     };
   };
   device: StatusCard & {
