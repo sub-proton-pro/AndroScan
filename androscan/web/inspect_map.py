@@ -121,6 +121,13 @@ class Candidate:
     line: int
     snippet: str
     kind: str  # "findViewById" | "compose_id" | "onClick_near" | "reference"
+    # Best-effort enclosing method (Java) / function (Kotlin) name. ``None``
+    # when the heuristic can't pin one (e.g. line lives at file scope, top-of-
+    # file ``init`` block, anonymous-inner-class body that couldn't be
+    # disambiguated, or jadx emitted unusual indentation). Consumers must
+    # treat ``None`` as "unknown" rather than "matched to the empty string".
+    # See :func:`_find_enclosing_method` for the heuristic + worked examples.
+    method_name: Optional[str] = None
 
 
 _FINDVIEW_RE_TMPL = r"findViewById\s*\(\s*R\.id\.{name}\s*\)"
@@ -129,6 +136,158 @@ _COMPOSE_RE_TMPL = r'"{name}"'
 _ONCLICK_NEAR_RE = re.compile(
     r"\b(?:setOnClickListener|onClick|onLongClick|setOnLongClickListener)\b"
 )
+
+
+# ----- Enclosing-method heuristic ------------------------------------------
+#
+# Walks backwards from a matched line to the nearest method/function header.
+# Pure regex over jadx-decompiled source — no full parser, no symbol table —
+# so it has known limits documented at :func:`_find_enclosing_method`. It's
+# enough for the Inspect → Trace seed to produce ``Lcom/.../Foo;->onClick(``
+# instead of just ``Lcom/.../Foo;->`` for the common cases the operator
+# actually clicks on (``findViewById`` inside ``onCreate``, ``onClick``
+# bodies, Kotlin ``fun`` bodies).
+#
+# Java method header (one line):
+#   ``public final void onClick(View v) {``
+#   ``  protected static <T> T foo() throws Bar {``
+#   ``  void foo() {``
+# We anchor on a non-keyword identifier followed by ``(`` followed by a
+# closing ``)`` then optional ``throws ...`` then ``{`` (or end-of-line for
+# headers that wrap to a brace on the next line — handled by allowing
+# the trailing brace to be absent and re-checking on the *next* line).
+#
+# Kotlin function header (one line):
+#   ``fun onClick(v: View) {``
+#   ``private suspend fun foo(): String =`` (expression-bodied, no brace)
+#   ``override fun onCreate(savedInstanceState: Bundle?) {``
+# Anchored on the literal ``fun `` keyword (post Kotlin tokenization,
+# this is unambiguous).
+_JAVA_RESERVED_BEFORE_PAREN = frozenset({
+    "if", "for", "while", "switch", "synchronized", "catch", "return",
+    "throw", "new", "do", "try", "else", "case", "finally",
+})
+
+# Java header: optional modifiers + return type + name + ``(`` + params + ``)``
+# + optional ``throws`` + optional opening brace at end (or on next line).
+# We require the ``(`` and a matching ``)`` on the same line because anything
+# more elaborate would need a tokenizer.
+_JAVA_METHOD_RE = re.compile(
+    r"""^\s*
+        (?:                              # optional access modifiers / annotations
+            (?:public|protected|private|static|final|abstract|synchronized|
+             native|default|strictfp|@\w+(?:\([^)]*\))?)\s+
+        )*
+        (?:<[^>]+>\s+)?                  # optional generic <T> or <T extends Foo>
+        (?:[\w.<>\[\]?,\s$]+?\s+)?       # return type (loose; may include generics)
+        (?P<name>[A-Za-z_$][\w$]*)       # method / constructor name
+        \s*\(                            # opening paren
+        [^)]*\)                          # params (no nested parens — good enough)
+        (?:\s*throws\s+[\w.,\s]+)?       # optional throws clause
+        \s*(?:\{|$)                      # opening brace, or wrap to next line
+    """,
+    re.VERBOSE,
+)
+
+# Kotlin function header — anchored on the ``fun`` keyword (with optional
+# receiver-type prefix like ``fun Foo.bar()``).
+_KOTLIN_FUN_RE = re.compile(
+    r"""^\s*
+        (?:                              # optional modifiers + annotations
+            (?:public|private|protected|internal|open|final|abstract|sealed|
+             override|operator|infix|inline|noinline|crossinline|tailrec|
+             external|suspend|@\w+(?:\([^)]*\))?)\s+
+        )*
+        fun\s+
+        (?:<[^>]+>\s+)?                  # optional generic params
+        (?:[\w.$<>\[\]?,\s]+?\.)?        # optional receiver type (``Foo.``)
+        (?P<name>[A-Za-z_$][\w$]*)       # function name
+        \s*\(
+    """,
+    re.VERBOSE,
+)
+
+
+def _find_enclosing_method(
+    lines: list[str], match_idx: int, *, language: str
+) -> Optional[str]:
+    """Walk back from ``lines[match_idx]`` to the nearest method/function header.
+
+    ``language`` is ``"java"`` or ``"kotlin"`` (anything else returns
+    ``None`` — the caller already knows the file extension).
+
+    Returns the method name or ``None`` if the heuristic couldn't pin one.
+    Bounded at 800 lines back (jadx-decompiled methods are rarely longer
+    than that; bounding keeps cost predictable on adversarially-large
+    files).
+
+    Known false-negative classes (returns ``None``):
+    * matched line is at file scope (top-of-class field initialiser,
+      static block, top-of-file Kotlin property);
+    * matched line is inside a Kotlin ``init { ... }`` block;
+    * matched line is inside an anonymous inner class whose enclosing
+      method header is past the 800-line walk-back budget;
+    * jadx emitted unusual indentation that breaks the regex anchor.
+
+    Known false-positive class: a string or comment containing ``foo() {``
+    on its own line could be matched as a method header. We mitigate by
+    skipping lines whose stripped form starts with ``//``, ``/*``, ``*``,
+    or ``"`` — but a multi-line string with embedded code remains an
+    edge case. Net effect: a 1-of-N method-name guess; consumer
+    (operator) verifies via the picker that closes the loop.
+    """
+    if match_idx < 0 or match_idx >= len(lines):
+        return None
+    if language not in ("java", "kotlin"):
+        return None
+    rx = _JAVA_METHOD_RE if language == "java" else _KOTLIN_FUN_RE
+    is_java = language == "java"
+
+    # Walk back from the line *above* the match, since the match line
+    # itself is inside a body (so its own header is somewhere above).
+    lo = max(0, match_idx - 800)
+    for i in range(match_idx - 1, lo - 1, -1):
+        s = lines[i]
+        stripped = s.lstrip()
+        # Skip pure-comment / continuation-string lines so we don't false-
+        # match ``// void foo() {`` as a header.
+        if not stripped:
+            continue
+        first = stripped[0]
+        if first in ("/", "*", '"'):
+            # Java-style ``//`` and ``/* */`` and Javadoc continuation ``*``;
+            # also any line that begins with a string literal (Kotlin
+            # multi-line strings don't usually start with ``"`` at the
+            # *beginning* of a line, so this is safe enough).
+            if stripped.startswith(("//", "/*", "*")) or stripped.startswith('"'):
+                continue
+        m = rx.match(s)
+        if not m:
+            continue
+        name = m.group("name")
+        if is_java:
+            # Skip Java control-flow + ``new Foo(``-style false matches.
+            if name in _JAVA_RESERVED_BEFORE_PAREN:
+                continue
+            # Skip lines that are clearly invocations rather than headers:
+            # a header must end with ``{`` *or* trail off (so the body
+            # opens on the next line). An invocation typically ends with
+            # ``;`` or a comma. The regex already requires ``\{|$`` after
+            # the optional ``throws``, but the loose return-type group
+            # can swallow up to a trailing ``;`` on lines like
+            # ``int x = foo();`` — guard explicitly.
+            if s.rstrip().endswith(";"):
+                continue
+        return name
+    return None
+
+
+def _language_for_file(rel: str) -> str:
+    if rel.endswith(".java"):
+        return "java"
+    if rel.endswith(".kt"):
+        return "kotlin"
+    return ""
 
 
 def _snippet(lines: list[str], idx: int, before: int = 1, after: int = 2) -> str:
@@ -181,6 +340,7 @@ def find_handlers(
             break
         rel = str(p.relative_to(sources_dir))
         lines = text.splitlines()
+        language = _language_for_file(rel)
 
         per_file = 0
         for i, line in enumerate(lines):
@@ -197,11 +357,17 @@ def find_handlers(
                 kind = "compose_id"
             if kind is None:
                 continue
+            method_name = (
+                _find_enclosing_method(lines, i, language=language)
+                if language
+                else None
+            )
             candidates.append(Candidate(
                 file=rel,
                 line=i + 1,
                 snippet=_snippet(lines, i),
                 kind=kind,
+                method_name=method_name,
             ))
             per_file += 1
 

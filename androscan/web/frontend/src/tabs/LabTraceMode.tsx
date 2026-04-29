@@ -1,20 +1,33 @@
 /**
  * Trace mode for the Lab tab — the headline UI for Phase 10
- * (sub-steps 10.7 + 10.8). The 10.6 placeholder shipped a status-only
- * view; this rewrite is the real surface:
+ * (sub-steps 10.7 + 10.8 + the post-v1 method-picker follow-up). The
+ * 10.6 placeholder shipped a status-only view; this rewrite is the
+ * real surface:
  *
  *   1. Top-of-pane form: smali entry signature input + hops stepper
- *      (1..6 clamped) + Build / Force-rebuild buttons. When the form
- *      is seeded from an external source (10.8's Inspect → Trace
- *      cross-tab handoff), a small pill above the input names the
- *      source so the operator knows the field wasn't typed by hand.
- *   2. Result region: ``BehaviorAnchorCard`` header + ``DecisionTimeline``
+ *      (1..6 clamped) + Build / Force-rebuild buttons. The Trace
+ *      button is disabled until the input is a syntactically-complete
+ *      Smali signature (closing paren + return descriptor); a tooltip
+ *      explains what's missing so the operator isn't left guessing.
+ *      When the form is seeded from an external source (10.8's
+ *      Inspect → Trace cross-tab handoff), a small pill above the
+ *      input names the source so the operator knows the field wasn't
+ *      typed by hand.
+ *   2. Method picker (new): activates whenever the entry is a
+ *      class-prefix-only string (``Lcom/.../Foo;->[partial]``) and
+ *      reads from ``GET /api/graph/{app_id}/methods``. Closes the
+ *      operator-visible workflow gap when the Inspect → Trace seed
+ *      couldn't pin a method (most ``findViewById`` candidates) —
+ *      clicking a row fills the entry with the full Smali signature
+ *      and auto-fires the trace. Debounced 150 ms so a fast typist
+ *      doesn't fire one request per keystroke.
+ *   3. Result region: ``BehaviorAnchorCard`` header + ``DecisionTimeline``
  *      + the per-plan ``BypassPlanCard`` list (default plans visible,
  *      advanced plans behind an ``<details>`` expander per DEC-024).
- *   3. Cached anchors picker: a small list of previously-built
+ *   4. Cached anchors picker: a small list of previously-built
  *      anchors so the operator can flip between them without
  *      re-typing the smali signature.
- *   4. Status row: cache + decompile + call-graph readiness, surfaced
+ *   5. Status row: cache + decompile + call-graph readiness, surfaced
  *      via the same ``GET /status`` shape the 10.6 placeholder hit.
  *
  * Lifecycle owned by the ``useTraceAnchor`` hook in ``api/trace.ts``:
@@ -30,10 +43,11 @@
  * builder can fold it into the new ``trace`` ``ChatAttachment``.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { DecisionTimeline } from "../components/trace/DecisionTimeline";
+import { listMethodsOnClass, type GraphNode } from "../api/graph";
 import {
   deleteTraceAnchor,
   fetchTraceStatus,
@@ -71,9 +85,45 @@ function looksLikeCompleteSmaliSignature(s: string): boolean {
   return /^\[*([VZBSCIJFD]|L[\w/$]+;)$/.test(ret);
 }
 
+/** Split a Smali entry-method prefix or signature into ``{smaliClass,
+ *  methodPrefix}``. Used by the method picker to decide whether to fire
+ *  the autocomplete query and what to filter by:
+ *
+ *    ``Lcom/example/Foo;->``         → ``{ smaliClass: "Lcom/example/Foo;",
+ *                                          methodPrefix: "" }``
+ *    ``Lcom/example/Foo;->onCli``    → ``{ smaliClass: "Lcom/example/Foo;",
+ *                                          methodPrefix: "onCli" }``
+ *    ``Lcom/example/Foo;->onClick(`` → null (already past the ``(``;
+ *                                       descriptor list is being typed,
+ *                                       picker would be misleading)
+ *    ``Lcom/example/Foo;``           → null (no ``->`` separator yet)
+ *    ``junk``                        → null
+ */
+function classPrefixContext(
+  s: string,
+): { smaliClass: string; methodPrefix: string } | null {
+  const t = s.trim();
+  const sep = t.indexOf(";->");
+  if (sep <= 0) return null;
+  const klass = t.slice(0, sep + 1); // include the ``;``
+  if (!/^L[\w/$]+;$/.test(klass)) return null;
+  const tail = t.slice(sep + 3);
+  // Once the operator has typed any non-name char (``(``, space, etc.)
+  // we step out of picker mode — they're past method-name selection.
+  if (!/^[\w$]*$/.test(tail)) return null;
+  return { smaliClass: klass, methodPrefix: tail };
+}
+
 const DEFAULT_HOPS = 3;
 const MIN_HOPS = 1;
 const MAX_HOPS = 6;
+/** Picker query is debounced this long after the last keystroke so we
+ *  don't fire one request per character on a fast typist. */
+const PICKER_DEBOUNCE_MS = 150;
+/** Hard cap on the number of methods we display in the picker — the
+ *  backend route caps at 500, but anything past ~50 isn't a useful
+ *  pick list (operator should narrow with more name prefix). */
+const PICKER_DISPLAY_LIMIT = 50;
 
 export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
   const { pendingTraceEntry, setPendingTraceEntry } = useWorkbench();
@@ -202,10 +252,69 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
     return new Set(state.anchor.low_confidence_decision_indices);
   }, [state]);
 
+  // Method picker — fires when the entry is a class-prefix-only string
+  // (``Lcom/.../Foo;->[partial]``). Lets the operator discover available
+  // methods/overloads without typing descriptors blind. Closes the
+  // operator-visible workflow gap from the Inspect → Trace seed when
+  // the resolver couldn't pin a method (most ``findViewById`` candidates).
+  const pickerCtx = useMemo(() => classPrefixContext(entryDraft), [entryDraft]);
+  const [pickerMethods, setPickerMethods] = useState<GraphNode[] | null>(null);
+  const [pickerLoading, setPickerLoading] = useState(false);
+  const [pickerTotal, setPickerTotal] = useState(0);
+  const [pickerError, setPickerError] = useState<string | null>(null);
+  // Stale-response guard: keyed on (smaliClass, methodPrefix, appId) so
+  // a slow request for an old class doesn't clobber the picker state
+  // for the current input.
+  const pickerInflightKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!appId || !pickerCtx) {
+      setPickerMethods(null);
+      setPickerLoading(false);
+      setPickerError(null);
+      pickerInflightKeyRef.current = null;
+      return;
+    }
+    const key = `${appId}|${pickerCtx.smaliClass}|${pickerCtx.methodPrefix}`;
+    pickerInflightKeyRef.current = key;
+    setPickerLoading(true);
+    setPickerError(null);
+    const handle = setTimeout(async () => {
+      const r = await listMethodsOnClass(appId, pickerCtx.smaliClass, {
+        namePrefix: pickerCtx.methodPrefix || null,
+        limit: PICKER_DISPLAY_LIMIT,
+      });
+      // Only commit if this response is for the latest query.
+      if (pickerInflightKeyRef.current !== key) return;
+      setPickerLoading(false);
+      if (r.ok) {
+        setPickerMethods(r.data.methods);
+        setPickerTotal(r.data.total);
+      } else {
+        setPickerMethods([]);
+        setPickerTotal(0);
+        setPickerError(`${r.status ? `${r.status} — ` : ""}${r.error}`);
+      }
+    }, PICKER_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(handle);
+    };
+  }, [appId, pickerCtx?.smaliClass, pickerCtx?.methodPrefix, pickerCtx]);
+
+  const onPickMethod = (sig: string) => {
+    setEntryDraft(sig);
+    setSeedLabel(null);
+    const hops = Math.max(MIN_HOPS, Math.min(MAX_HOPS, hopsDraft || DEFAULT_HOPS));
+    setActiveEntry(sig);
+    setActiveHops(hops);
+  };
+
+  const entryComplete = looksLikeCompleteSmaliSignature(entryDraft);
+
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const entry = entryDraft.trim();
-    if (!entry) return;
+    if (!entry || !entryComplete) return;
     const hops = Math.max(MIN_HOPS, Math.min(MAX_HOPS, hopsDraft || DEFAULT_HOPS));
     setActiveEntry(entry);
     setActiveHops(hops);
@@ -301,7 +410,17 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
               />
             </label>
             <div className="trace-form-buttons">
-              <button type="submit" disabled={!entryDraft.trim()}>Trace</button>
+              <button
+                type="submit"
+                disabled={!entryComplete}
+                title={
+                  entryComplete
+                    ? "Run the trace_behavior skill on this entry method"
+                    : "Add the method name + parameter descriptors + return type, e.g. onClick(Landroid/view/View;)V — or pick from the list below"
+                }
+              >
+                Trace
+              </button>
               <button
                 type="button"
                 onClick={onForceRebuild}
@@ -312,6 +431,18 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
               </button>
             </div>
           </form>
+
+          {pickerCtx && (
+            <MethodPicker
+              smaliClass={pickerCtx.smaliClass}
+              methodPrefix={pickerCtx.methodPrefix}
+              methods={pickerMethods}
+              total={pickerTotal}
+              loading={pickerLoading}
+              error={pickerError}
+              onPick={onPickMethod}
+            />
+          )}
 
           <TraceResultRegion
             state={state}
@@ -443,6 +574,106 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
         )}
       </section>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MethodPicker — surfaces method/overload candidates on the class the
+// operator is currently typing. Activates whenever the entry input is a
+// class-prefix-only string (``Lcom/.../Foo;->[partial]``) and reads from
+// ``GET /api/graph/{app_id}/methods``. Closes the operator-visible
+// workflow gap when the Inspect → Trace seed couldn't pin a method
+// (most ``findViewById`` candidates) — clicking a row fills the entry
+// with the full Smali signature and auto-fires the trace.
+// ---------------------------------------------------------------------------
+
+type PickerProps = {
+  smaliClass: string;
+  methodPrefix: string;
+  methods: GraphNode[] | null;
+  total: number;
+  loading: boolean;
+  error: string | null;
+  onPick: (smaliId: string) => void;
+};
+
+function MethodPicker({
+  smaliClass,
+  methodPrefix,
+  methods,
+  total,
+  loading,
+  error,
+  onPick,
+}: PickerProps) {
+  const className = smaliClass.slice(1, -1).replace(/\//g, ".");
+  const filterLabel = methodPrefix ? ` matching "${methodPrefix}*"` : "";
+
+  return (
+    <section className="trace-method-picker" aria-label="Method picker">
+      <header className="trace-method-picker-head">
+        <h3>
+          Methods on <code>{className}</code>
+          {filterLabel}
+        </h3>
+        {loading && <span className="muted small">loading…</span>}
+        {!loading && methods && (
+          <span className="muted small">
+            {total === 0
+              ? "no methods found"
+              : total > methods.length
+                ? `${methods.length} of ${total} (narrow with name prefix)`
+                : `${methods.length} method${methods.length === 1 ? "" : "s"}`}
+          </span>
+        )}
+      </header>
+      {error && (
+        <p className="muted small" style={{ color: "var(--err)" }}>
+          {error}
+        </p>
+      )}
+      {!loading && methods && methods.length === 0 && !error && (
+        <p className="muted small">
+          {total === 0
+            ? `No methods on this class in the call graph. Either the class name is mistyped, or the call graph hasn't indexed this class yet (try Force re-trace's sibling Rebuild on the Graph mode).`
+            : "No methods match the prefix; try a shorter prefix or clear it."}
+        </p>
+      )}
+      {methods && methods.length > 0 && (
+        <ul className="trace-method-picker-list">
+          {methods.map((m) => {
+            const params = m.param_types.join(", ");
+            return (
+              <li key={m.smali_id}>
+                <button
+                  type="button"
+                  className="trace-method-picker-row"
+                  onClick={() => onPick(m.smali_id)}
+                  title={`Use ${m.smali_id} as the entry method`}
+                >
+                  <code className="trace-method-picker-name">
+                    {m.method_name}
+                    <span className="muted">({params})</span>
+                    <span className="muted">: {m.return_type}</span>
+                  </code>
+                  {m.is_static && <span className="trace-method-picker-tag">static</span>}
+                  {m.is_abstract && <span className="trace-method-picker-tag">abstract</span>}
+                  {m.is_constructor && <span className="trace-method-picker-tag">ctor</span>}
+                  {m.may_have_unresolved_reflection && (
+                    <span
+                      className="trace-method-picker-tag trace-method-picker-tag-warn"
+                      title="This method has unresolved reflection — trace may be incomplete"
+                    >
+                      reflective
+                    </span>
+                  )}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
   );
 }
 

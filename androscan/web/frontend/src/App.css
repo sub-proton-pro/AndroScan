@@ -4941,6 +4941,107 @@ code { color: var(--accent); }
   color: var(--err);
 }
 
+/* ----- MethodPicker — Trace-mode autocomplete on a class-prefix entry ----- */
+/* Activates when the entry input is a class-prefix-only string                */
+/* (``Lcom/.../Foo;->[partial]``); reads from                                  */
+/* ``GET /api/graph/{app_id}/methods``. Closes the operator-visible workflow   */
+/* gap when the Inspect → Trace seed couldn't pin a method (most               */
+/* findViewById candidates) — clicking a row fills the entry with the full     */
+/* Smali signature and auto-fires the trace.                                   */
+
+.trace-method-picker {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.6rem;
+  background: var(--panel-2);
+  margin-top: 0.5rem;
+}
+
+.trace-method-picker-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.trace-method-picker-head h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text);
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.trace-method-picker-head h3 code {
+  font-size: 0.85rem;
+  color: var(--accent);
+  background: transparent;
+  padding: 0;
+}
+
+.trace-method-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.trace-method-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+}
+
+.trace-method-picker-row:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.trace-method-picker-name {
+  flex: 1;
+  font-family: var(--mono, monospace);
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.trace-method-picker-name .muted {
+  color: var(--muted);
+}
+
+.trace-method-picker-tag {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  border-radius: 8px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  flex-shrink: 0;
+}
+
+.trace-method-picker-tag-warn {
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 35%, transparent);
+}
+
 /* ----- HookBuilder "Staged from Trace" pill ----- */
 
 .hookbuilder-staged-pill {

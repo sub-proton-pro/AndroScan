@@ -1015,6 +1015,119 @@ def list_graph(
     }
 
 
+def list_methods_on_class(
+    decompile_cache_dir: Path,
+    smali_class: str,
+    *,
+    name_prefix: Optional[str] = None,
+    include_external: bool = False,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """List the method nodes whose owning class is ``smali_class``.
+
+    The ``smali_class`` argument is the type-descriptor form
+    (``Lcom/example/Foo;``); we accept both the descriptor form and the
+    bare ``com/example/Foo`` (with or without the trailing ``;`` and
+    leading ``L``) so the operator can paste either shape.
+
+    Used by the ``GET /api/graph/{app_id}/methods`` route which backs the
+    Trace mode method picker — operators land in Trace mode with a
+    class-prefix-only entry (``Lcom/.../Foo;->``) and need to discover
+    which method/overload to trace without typing descriptors blind.
+
+    Returns ``{"smali_class": <normalised>, "methods": [<node>...],
+    "total": <int>, "truncated": <bool>}``. Methods are ordered by
+    method name then by parameter-types JSON so overloads of the same
+    method group together. ``include_external=False`` (default) drops
+    ``is_external=1`` rows because the call-graph store materialises
+    every external callee as an in-graph node — usually noise from the
+    operator's perspective.
+
+    ``limit`` is clamped to ``[1, 500]`` server-side to keep the JSON
+    payload bounded — a class with 500+ methods is pathological in
+    practice but possible for generated Kotlin / dex-merger output.
+    """
+    db = call_graph_db_path(decompile_cache_dir)
+    normalised = _normalise_smali_class(smali_class)
+    if not normalised:
+        return {"smali_class": smali_class, "methods": [], "total": 0, "truncated": False}
+    if not db.is_file():
+        return {"smali_class": normalised, "methods": [], "total": 0, "truncated": False}
+
+    limit = max(1, min(int(limit), 500))
+    name_prefix_clean = (name_prefix or "").strip()
+
+    where = ["c.smali_class = ?"]
+    args: list[Any] = [normalised]
+    if not include_external:
+        where.append("n.is_external = 0")
+    if name_prefix_clean:
+        where.append("n.method_name LIKE ?")
+        args.append(f"{name_prefix_clean}%")
+
+    try:
+        with _connect(db) as conn:
+            total_sql = (
+                "SELECT COUNT(*) FROM nodes n JOIN classes c ON c.id = n.class_id"
+                " WHERE " + " AND ".join(where)
+            )
+            total = int(conn.execute(total_sql, args).fetchone()[0])
+            rows = conn.execute(
+                "SELECT n.* FROM nodes n JOIN classes c ON c.id = n.class_id"
+                " WHERE " + " AND ".join(where)
+                + " ORDER BY n.method_name, n.param_types_json LIMIT ?",
+                [*args, limit + 1],  # +1 so we know if we truncated
+            ).fetchall()
+    except sqlite3.Error as e:
+        logger.warning("list_methods_on_class sqlite error: %s", e)
+        return {
+            "smali_class": normalised,
+            "methods": [],
+            "total": 0,
+            "truncated": False,
+            "error": str(e),
+        }
+
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "smali_class": normalised,
+        "methods": [_node_to_dict(r) for r in rows],
+        "total": total,
+        "truncated": truncated,
+    }
+
+
+def _normalise_smali_class(s: str) -> str:
+    """Accept any of ``Lcom/example/Foo;`` / ``com/example/Foo`` /
+    ``com.example.Foo`` and return the canonical Smali class descriptor.
+
+    Returns ``""`` if the input is empty or obviously malformed
+    (whitespace-only, has invalid chars).
+    """
+    if not s:
+        return ""
+    t = s.strip()
+    if not t:
+        return ""
+    # Dotted form → slashed form (so ``com.example.Foo`` → ``Lcom/example/Foo;``).
+    if "/" not in t and "." in t and not t.startswith("L"):
+        t = t.replace(".", "/")
+    # Strip any leading ``L`` and trailing ``;`` so we work with the bare
+    # internal name, then wrap consistently.
+    if t.startswith("L"):
+        t = t[1:]
+    if t.endswith(";"):
+        t = t[:-1]
+    if not t:
+        return ""
+    # Char-class guard: a Smali internal name is ``[\w$/]+``.
+    for ch in t:
+        if not (ch.isalnum() or ch in ("_", "$", "/")):
+            return ""
+    return f"L{t};"
+
+
 def neighbors(
     decompile_cache_dir: Path,
     node_ref: str,

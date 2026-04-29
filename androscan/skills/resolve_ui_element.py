@@ -175,13 +175,24 @@ def _score_deterministic(
         score += elb
         reasons.append(f"early line {line} (+{elb:.3f})")
 
+    # ``inspect_map.find_handlers`` (since the Phase 10 follow-up) carries a
+    # best-effort ``method_name`` derived from a back-walk to the nearest
+    # method header. ``None`` is the honest "couldn't pin one" answer; we
+    # forward it as-is so the Inspect → Trace seed can fall back to a
+    # class-prefix-only signature when needed (the picker UI in
+    # ``LabTraceMode.tsx`` then takes over).
+    raw_method = cand.get("method_name")
+    method_name = raw_method.strip() if isinstance(raw_method, str) and raw_method.strip() else None
+    if method_name:
+        reasons.append(f"enclosing method: {method_name}")
+
     return _ScoredCandidate(
         file=file_rel,
         line=line,
         snippet=(cand.get("snippet") or "").strip(),
         kind=kind,
         class_name=file_simple or None,
-        method_name=None,  # deterministic grep doesn't know which method
+        method_name=method_name,
         source="deterministic",
         score=score,
         reasons=reasons,

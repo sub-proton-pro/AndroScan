@@ -179,6 +179,25 @@ export type GraphRebuildResponse = {
   kicked: boolean;
 };
 
+/** Response payload for ``GET /api/graph/{app_id}/methods``. Backs the
+ *  Trace mode method picker — operators land in Trace mode with a
+ *  class-prefix-only entry (``Lcom/.../Foo;->``) and need to discover
+ *  which method/overload to trace without typing descriptors blind. */
+export type GraphMethodsResponse = {
+  app_id: string;
+  sha: string;
+  /** Server-normalised Smali class descriptor, e.g. ``Lcom/example/Foo;``.
+   *  Always carried back so the client can verify what it asked for
+   *  (the route accepts dotted/bare/descriptor forms transparently). */
+  smali_class: string;
+  methods: GraphNode[];
+  total: number;
+  /** True when the result was clamped at ``limit`` — caller can re-fetch
+   *  with a tighter ``namePrefix`` to narrow the picker. */
+  truncated: boolean;
+  error?: string;
+};
+
 // ---------------------------------------------------------------------------
 // Endpoint wrappers
 // ---------------------------------------------------------------------------
@@ -259,6 +278,33 @@ export function rebuildGraph(
 ): Promise<ApiResult<GraphRebuildResponse>> {
   const q = opts.dropApktool ? "?drop_apktool=true" : "";
   return postJson(`/api/graph/${encodeURIComponent(appId)}/rebuild${q}`);
+}
+
+/** List method nodes whose owning class is ``smaliClass``. The backend
+ *  accepts the descriptor form (``Lcom/example/Foo;``), the bare
+ *  internal name (``com/example/Foo``), or the dotted form
+ *  (``com.example.Foo``); the response always carries the normalised
+ *  descriptor form back. ``namePrefix`` filters method names by prefix
+ *  for an autocomplete-as-you-type UX. ``limit`` is clamped server-side
+ *  at ``[1, 500]``. */
+export type ListMethodsOpts = {
+  namePrefix?: string | null;
+  includeExternal?: boolean;
+  limit?: number;
+};
+
+export function listMethodsOnClass(
+  appId: string,
+  smaliClass: string,
+  opts: ListMethodsOpts = {},
+): Promise<ApiResult<GraphMethodsResponse>> {
+  const params = new URLSearchParams({ class: smaliClass });
+  if (opts.namePrefix) params.set("name_prefix", opts.namePrefix);
+  if (opts.includeExternal) params.set("include_external", "true");
+  if (typeof opts.limit === "number") params.set("limit", String(opts.limit));
+  return getJson(
+    `/api/graph/${encodeURIComponent(appId)}/methods?${params.toString()}`,
+  );
 }
 
 // ---------------------------------------------------------------------------

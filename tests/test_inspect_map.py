@@ -100,6 +100,183 @@ def test_find_handlers_no_sources_dir(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Enclosing-method heuristic — added in the Phase 10 follow-up so the
+# Inspect → Trace seed produces ``Lcom/.../Foo;->onClick(`` instead of
+# the bare class prefix. We test the heuristic both directly and through
+# ``find_handlers`` so an accidental rewiring (e.g. forgetting to pass
+# ``language=`` through) regresses loudly.
+
+
+def test_find_enclosing_method_picks_java_method_above_match() -> None:
+    src = """package com.example;
+public class Foo {
+  public void onCreate(Bundle b) {
+    Button x = findViewById(R.id.btn_login);
+  }
+}
+""".splitlines()
+    # The match line is index 3 (0-indexed): the findViewById line.
+    assert im._find_enclosing_method(src, 3, language="java") == "onCreate"
+
+
+def test_find_enclosing_method_skips_control_flow_and_constructors() -> None:
+    src = """public class Foo {
+  void real() {
+    if (cond()) {
+      while (more()) {
+        for (int i = 0; i < N; i++) {
+          int x = R.id.btn_login;
+        }
+      }
+    }
+  }
+}
+""".splitlines()
+    # Match is on the ``int x = R.id.btn_login;`` line (index 5). We must
+    # walk past the ``for/while/if`` control-flow lines (which look like
+    # method headers because they have ``( ... )`` followed by ``{``)
+    # to land on ``real``.
+    assert im._find_enclosing_method(src, 5, language="java") == "real"
+
+
+def test_find_enclosing_method_skips_invocation_with_trailing_semicolon() -> None:
+    """``int x = foo();`` shouldn't be matched as a header — guard
+    against the loose return-type group swallowing the semicolon."""
+    src = """class Foo {
+  void real() {
+    int x = computeSomething(arg1);
+    int y = R.id.btn_login;
+  }
+}
+""".splitlines()
+    assert im._find_enclosing_method(src, 3, language="java") == "real"
+
+
+def test_find_enclosing_method_picks_kotlin_fun_above_match() -> None:
+    src = """package com.example
+class Foo {
+  override fun onCreate(state: Bundle?) {
+    val x = R.id.btn_login
+  }
+}
+""".splitlines()
+    assert im._find_enclosing_method(src, 3, language="kotlin") == "onCreate"
+
+
+def test_find_enclosing_method_handles_kotlin_modifiers_and_generics() -> None:
+    src = """class Foo {
+  private suspend inline fun <T> doStuff(x: T): String {
+    val r = R.id.btn_login
+    return r.toString()
+  }
+}
+""".splitlines()
+    assert im._find_enclosing_method(src, 2, language="kotlin") == "doStuff"
+
+
+def test_find_enclosing_method_returns_none_at_file_scope() -> None:
+    """Match at top-of-class field initialiser has no enclosing method."""
+    src = """class Foo {
+  static int X = R.id.btn_login;
+}
+""".splitlines()
+    assert im._find_enclosing_method(src, 1, language="java") is None
+
+
+def test_find_enclosing_method_skips_comment_false_match() -> None:
+    """``// void shouldNotMatch() {`` in a comment shouldn't be picked up."""
+    src = """class Foo {
+  void real() {
+    // void shouldNotMatch() {
+    int x = R.id.btn_login;
+  }
+}
+""".splitlines()
+    assert im._find_enclosing_method(src, 3, language="java") == "real"
+
+
+def test_find_enclosing_method_unknown_language_returns_none() -> None:
+    src = ["void foo() {", "  R.id.btn_login", "}"]
+    assert im._find_enclosing_method(src, 1, language="cpp") is None
+    assert im._find_enclosing_method(src, 1, language="") is None
+
+
+def test_find_enclosing_method_out_of_range_index_safe() -> None:
+    src = ["void foo() {", "}"]
+    assert im._find_enclosing_method(src, -1, language="java") is None
+    assert im._find_enclosing_method(src, 99, language="java") is None
+
+
+def test_find_enclosing_method_walks_back_inside_anonymous_inner_class() -> None:
+    """A typical Android handler: the match line is inside an anonymous
+    ``OnClickListener`` body, so the heuristic should pick the inner
+    ``onClick`` (not the outer ``onCreate``). Operator value is
+    higher with the inner method since that's where the bypass-relevant
+    logic lives."""
+    src = """class Foo {
+  public void onCreate(Bundle b) {
+    Button x = findViewById(R.id.x);
+    x.setOnClickListener(new View.OnClickListener() {
+      public void onClick(View v) {
+        int y = R.id.btn_login;
+      }
+    });
+  }
+}
+""".splitlines()
+    # Match at index 5 — the bare R.id.btn_login reference inside the
+    # anonymous ``onClick`` body. Heuristic walks back and lands on the
+    # nearest header, which is ``onClick``.
+    assert im._find_enclosing_method(src, 5, language="java") == "onClick"
+
+
+def test_find_handlers_populates_method_name_for_java(tmp_path: Path) -> None:
+    """End-to-end: ``Candidate.method_name`` is set for Java sources."""
+    src = _write_handler(tmp_path)
+    cands = im.find_handlers(src, "btn_login")
+    assert cands, "expected at least one candidate"
+    methods = [c.method_name for c in cands]
+    # MainActivity in the fixture has a method ``onCreate`` (the
+    # findViewById sits inside it), and ``other`` (bare reference).
+    # At minimum the findViewById candidate should have ``onCreate``.
+    fv = next((c for c in cands if c.kind == "findViewById"), None)
+    assert fv is not None
+    assert fv.method_name == "onCreate", f"got {methods!r}"
+
+
+def test_find_handlers_populates_method_name_for_kotlin(tmp_path: Path) -> None:
+    """End-to-end: ``Candidate.method_name`` is set for Kotlin sources."""
+    src = tmp_path / "sources"
+    pkg = src / "com" / "example" / "app"
+    pkg.mkdir(parents=True)
+    (pkg / "MainActivity.kt").write_text(
+        """package com.example.app
+class MainActivity : Activity() {
+  override fun onCreate(b: Bundle?) {
+    val btn = findViewById(R.id.btn_login)
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    cands = im.find_handlers(src, "btn_login")
+    assert cands, "expected at least one candidate"
+    fv = next((c for c in cands if c.kind == "findViewById"), None)
+    assert fv is not None
+    assert fv.method_name == "onCreate"
+
+
+def test_find_handlers_method_name_serialises_in_asdict(tmp_path: Path) -> None:
+    """``map_tap_to_code`` returns ``asdict(c)`` per candidate; ensure the
+    new field shows up in the wire payload."""
+    src = _write_handler(tmp_path)
+    cands = im.find_handlers(src, "btn_login")
+    from dataclasses import asdict
+    payload = [asdict(c) for c in cands]
+    assert all("method_name" in c for c in payload)
+
+
+# ---------------------------------------------------------------------------
 # adb glue (runner injected)
 
 

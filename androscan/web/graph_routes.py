@@ -210,6 +210,41 @@ def build_graph_router(config: Config, app_dir_resolver) -> APIRouter:
             **payload,
         }
 
+    @router.get("/{app_id}/methods")
+    def graph_methods(
+        app_id: str,
+        smali_class: str = Query(..., alias="class", max_length=500),
+        name_prefix: Optional[str] = Query(default=None, max_length=120),
+        include_external: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        """List method nodes whose owning class is ``smali_class``.
+
+        Used by the Trace mode method picker — operators land in Trace
+        mode with a class-prefix-only entry (``Lcom/.../Foo;->``) and
+        need to discover which method/overload to trace without typing
+        descriptors blind. The ``class`` query parameter accepts the
+        descriptor form (``Lcom/example/Foo;``), the bare internal
+        name (``com/example/Foo``), or the dotted form
+        (``com.example.Foo``); the response always carries the
+        normalised descriptor form back so the client can verify what
+        it asked for.
+
+        ``name_prefix=on`` filters method names by prefix (so an
+        autocomplete-as-you-type UI on the input field can issue one
+        request per keystroke without overfetching). ``limit`` is
+        clamped server-side at ``[1, 500]``.
+        """
+        cache_dir, sha = _cache_dir_for(app_id)
+        payload = call_graph.list_methods_on_class(
+            cache_dir,
+            smali_class,
+            name_prefix=name_prefix,
+            include_external=include_external,
+            limit=limit,
+        )
+        return {"app_id": app_id, "sha": sha, **payload}
+
     @router.get("/{app_id}/neighbors/{node_ref:path}")
     def graph_neighbors(
         app_id: str,

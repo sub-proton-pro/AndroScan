@@ -164,6 +164,131 @@ def test_neighbors_unknown_node_is_404(tmp_path: Path) -> None:
     assert r.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# /methods — backs the Trace mode method picker. Operators land in Trace
+# mode with a class-prefix-only entry (``Lcom/.../Foo;->``) and need to
+# discover which method/overload to trace without typing descriptors blind.
+
+
+def test_methods_returns_methods_on_class(tmp_path: Path) -> None:
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(
+        f"/api/graph/{app_id}/methods",
+        params={"class": "Lcom/example/Dog;"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["smali_class"] == "Lcom/example/Dog;"
+    sigs = {m["smali_id"] for m in body["methods"]}
+    assert "Lcom/example/Dog;-><init>()V" in sigs
+    assert "Lcom/example/Dog;->speak()V" in sigs
+    assert body["total"] == len(body["methods"])
+    assert body["truncated"] is False
+
+
+def test_methods_accepts_dotted_class_form(tmp_path: Path) -> None:
+    """Operator convenience: pasting ``com.example.Dog`` should work."""
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(
+        f"/api/graph/{app_id}/methods",
+        params={"class": "com.example.Dog"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["smali_class"] == "Lcom/example/Dog;"
+    assert any(m["method_name"] == "speak" for m in body["methods"])
+
+
+def test_methods_accepts_bare_internal_form(tmp_path: Path) -> None:
+    """Operator convenience: pasting the bare ``com/example/Dog`` should work."""
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(
+        f"/api/graph/{app_id}/methods",
+        params={"class": "com/example/Dog"},
+    )
+    assert r.status_code == 200
+    assert r.json()["smali_class"] == "Lcom/example/Dog;"
+
+
+def test_methods_name_prefix_filters(tmp_path: Path) -> None:
+    """Autocomplete-as-you-type uses ``name_prefix=`` to narrow the picker."""
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(
+        f"/api/graph/{app_id}/methods",
+        params={"class": "Lcom/example/Dog;", "name_prefix": "spe"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert all(m["method_name"].startswith("spe") for m in body["methods"])
+    assert any(m["method_name"] == "speak" for m in body["methods"])
+
+
+def test_methods_unknown_class_returns_empty_list(tmp_path: Path) -> None:
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(
+        f"/api/graph/{app_id}/methods",
+        params={"class": "Lcom/example/Nonexistent;"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["methods"] == []
+    assert body["total"] == 0
+
+
+def test_methods_excludes_external_by_default(tmp_path: Path) -> None:
+    """Externally-referenced classes (``Lcom/example/Animal;`` is in-app
+    but ``Ljava/lang/Object;`` is external) shouldn't appear unless the
+    caller flips ``include_external``."""
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(
+        f"/api/graph/{app_id}/methods",
+        params={"class": "Ljava/lang/Object;"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["methods"] == []
+    r2 = client.get(
+        f"/api/graph/{app_id}/methods",
+        params={"class": "Ljava/lang/Object;", "include_external": "true"},
+    )
+    assert r2.status_code == 200
+    # The fixture invokes Object.<init> through Animal.<init>, so the
+    # ``include_external=true`` view should surface at least that node.
+    body2 = r2.json()
+    sigs = {m["smali_id"] for m in body2["methods"]}
+    assert any(s.startswith("Ljava/lang/Object;") for s in sigs)
+
+
+def test_methods_rejects_oversize_limit(tmp_path: Path) -> None:
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(
+        f"/api/graph/{app_id}/methods",
+        params={"class": "Lcom/example/Dog;", "limit": 9999},
+    )
+    assert r.status_code == 422
+
+
+def test_methods_rejects_missing_class_query(tmp_path: Path) -> None:
+    """``class`` is a required query param; FastAPI should 422."""
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(f"/api/graph/{app_id}/methods")
+    assert r.status_code == 422
+
+
+def test_methods_normalises_malformed_input_to_empty(tmp_path: Path) -> None:
+    """Malformed class strings (whitespace, illegal chars) return empty
+    results rather than 5xx — matches the fail-soft contract of every
+    other call-graph route."""
+    client, _root, app_id = _client(tmp_path)
+    r = client.get(f"/api/graph/{app_id}/methods", params={"class": "  "})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["methods"] == []
+    r2 = client.get(f"/api/graph/{app_id}/methods", params={"class": "L bad name;"})
+    assert r2.status_code == 200
+    assert r2.json()["methods"] == []
+
+
 def test_paths_endpoint_returns_route(tmp_path: Path) -> None:
     import urllib.parse
     client, _root, app_id = _client(tmp_path)

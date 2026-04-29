@@ -270,6 +270,97 @@ def test_dump_meta_returns_all_keys(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# _normalise_smali_class — accept any of the three input shapes operators
+# might paste (descriptor / bare internal / dotted) and round-trip them
+# all to the canonical descriptor form.
+
+
+def test_normalise_smali_class_accepts_descriptor_form() -> None:
+    assert call_graph._normalise_smali_class("Lcom/example/Foo;") == "Lcom/example/Foo;"
+
+
+def test_normalise_smali_class_accepts_bare_internal_form() -> None:
+    assert call_graph._normalise_smali_class("com/example/Foo") == "Lcom/example/Foo;"
+
+
+def test_normalise_smali_class_accepts_dotted_form() -> None:
+    assert call_graph._normalise_smali_class("com.example.Foo") == "Lcom/example/Foo;"
+
+
+def test_normalise_smali_class_handles_inner_dollar() -> None:
+    """Inner-class names are part of the internal name; ``$`` must survive."""
+    assert call_graph._normalise_smali_class("Lcom/example/Foo$Inner;") == "Lcom/example/Foo$Inner;"
+
+
+def test_normalise_smali_class_strips_surrounding_whitespace() -> None:
+    assert call_graph._normalise_smali_class("  Lcom/example/Foo;  ") == "Lcom/example/Foo;"
+
+
+def test_normalise_smali_class_returns_empty_for_garbage() -> None:
+    """Operator typos / random pastes shouldn't 5xx — return empty."""
+    assert call_graph._normalise_smali_class("") == ""
+    assert call_graph._normalise_smali_class("   ") == ""
+    assert call_graph._normalise_smali_class("L bad name;") == ""
+    assert call_graph._normalise_smali_class("L;") == ""
+
+
+# ---------------------------------------------------------------------------
+# list_methods_on_class — direct unit coverage of the helper that backs
+# the Trace mode method picker route.
+
+
+def test_list_methods_on_class_returns_methods(tmp_path: Path) -> None:
+    cache = _seed_cache(tmp_path)
+    call_graph.build_index(cache, Path("/n/a.apk"), SHA)
+    res = call_graph.list_methods_on_class(cache, "Lcom/example/Dog;")
+    sigs = {m["smali_id"] for m in res["methods"]}
+    assert "Lcom/example/Dog;-><init>()V" in sigs
+    assert "Lcom/example/Dog;->speak()V" in sigs
+    assert res["smali_class"] == "Lcom/example/Dog;"
+    assert res["truncated"] is False
+    assert res["total"] == len(res["methods"])
+
+
+def test_list_methods_on_class_filters_by_name_prefix(tmp_path: Path) -> None:
+    cache = _seed_cache(tmp_path)
+    call_graph.build_index(cache, Path("/n/a.apk"), SHA)
+    res = call_graph.list_methods_on_class(
+        cache, "Lcom/example/Dog;", name_prefix="spe"
+    )
+    assert all(m["method_name"].startswith("spe") for m in res["methods"])
+    assert any(m["method_name"] == "speak" for m in res["methods"])
+
+
+def test_list_methods_on_class_unknown_class(tmp_path: Path) -> None:
+    cache = _seed_cache(tmp_path)
+    call_graph.build_index(cache, Path("/n/a.apk"), SHA)
+    res = call_graph.list_methods_on_class(cache, "Lcom/example/Unknown;")
+    assert res["methods"] == []
+    assert res["total"] == 0
+
+
+def test_list_methods_on_class_db_missing(tmp_path: Path) -> None:
+    """No build run yet → return empty rather than raise."""
+    cache = tmp_path / "never-built"
+    cache.mkdir()
+    res = call_graph.list_methods_on_class(cache, "Lcom/example/Dog;")
+    assert res["methods"] == []
+    assert res["total"] == 0
+
+
+def test_list_methods_on_class_clamps_oversize_limit(tmp_path: Path) -> None:
+    """Server-side clamp at 500 — defensive even though the route enforces too."""
+    cache = _seed_cache(tmp_path)
+    call_graph.build_index(cache, Path("/n/a.apk"), SHA)
+    # Pass a huge limit; should clamp to 500 (no error, no crash).
+    res = call_graph.list_methods_on_class(cache, "Lcom/example/Dog;", limit=10_000)
+    assert "methods" in res
+    # Dog only has 2 methods, so truncation isn't exercised here, but the
+    # clamp must not have raised.
+    assert len(res["methods"]) <= 500
+
+
+# ---------------------------------------------------------------------------
 # _format_build_error: turns the opaque ``OperationalError: disk I/O error``
 # into something operators can act on (SQLITE_IOERR_FSYNC vs LOCK vs
 # SHMOPEN vs CANTOPEN). Without the suffix every flavour of SQLITE_IOERR_*
