@@ -3433,6 +3433,46 @@ code { color: var(--accent); }
   border-color: var(--warn);
 }
 
+/* Multi-line code-body input — currently only the Custom template's
+ * ``js_body`` param. Operators paste real Frida scripts in here, so:
+ *   - monospace font (variable names + braces stay aligned with the
+ *     Monaco mirror below);
+ *   - vertical resize only (horizontal would break the .hookbuilder-row
+ *     grid which constrains the input column);
+ *   - no soft-wrap (``wrap="off"`` on the element) so visual line
+ *     numbers match the Monaco preview's gutter exactly — operators
+ *     hitting a "parse: error (line 7)" indicator can count to line 7
+ *     in the textarea without fighting wrap-induced line shifts;
+ *   - tighter line-height than the rest of the form (the textarea is
+ *     dense enough that the form's default 1.4 leaves visible gaps
+ *     between code lines). */
+.hookbuilder-textarea {
+  font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  resize: vertical;
+  min-height: 9rem;
+  white-space: pre;
+  /* ``overflow-wrap: normal`` cooperates with white-space: pre to
+   * prevent any browser-level wrap heuristic from kicking in on
+   * long lines; horizontal scrolling is the intended UX. */
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+/* Top-align the label cell when the row holds a textarea — the
+ * default ``align-items: center`` on .hookbuilder-row would float a
+ * single-line "Js body" label down the middle of a 12-row textarea,
+ * which reads as if the label belongs to nothing. ``padding-top``
+ * matches the textarea's own first-line baseline. */
+.hookbuilder-row-textarea {
+  align-items: start;
+}
+
+.hookbuilder-row-textarea .hookbuilder-label {
+  padding-top: 0.42rem;
+}
+
 /* ---- Type-aware suggestion strip under return_value_expr ----
  *
  * Renders one ``.hookbuilder-suggestion-bundle`` per resolved return

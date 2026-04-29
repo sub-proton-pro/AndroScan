@@ -243,8 +243,12 @@ class TestRegistryFailClosed:
         # the bypass-planner override templates landed
         # (force_return_value / force_method_skip /
         # force_string_compare_equal alongside the original 6 v1
-        # observation templates).
-        assert len(frida_hooks._TEMPLATE_MODULES) >= 9
+        # observation templates), and from 9 → 10 in Phase 11
+        # candidate work when the operator-authored ``custom`` JS
+        # passthrough template landed alongside the structured
+        # templates (lets manual-paste + eventual chat-suggested-JS
+        # share the existing render / parse / Inject pipeline).
+        assert len(frida_hooks._TEMPLATE_MODULES) >= 10
 
     def test_registered_count_matches_module_list(self):
         # Every module in the list contributed exactly one template.
@@ -528,6 +532,72 @@ class TestTemplates:
         tmpl = get_template("force_string_compare_equal")
         assert "String.equals" in tmpl.sensitive_apis
         assert "String.equalsIgnoreCase" in tmpl.sensitive_apis
+
+    def test_custom_renders_passthrough(self):
+        """Phase 11 candidate — operator-authored JS body passes through verbatim.
+
+        The Custom template is a strict ``str.format`` passthrough:
+        ``js_template = "{js_body}\\n"`` and nothing else. The whole
+        contract is that whatever the operator typed appears in the
+        rendered JS unchanged — no auto-injected ``Java.perform``
+        wrapper, no ``event_label`` threading, no ``ready`` /
+        ``error`` scaffolding.
+
+        The brace-survival check (curly braces in the body don't get
+        re-interpreted by ``str.format``) is the subtlest invariant
+        here: ``str.format`` only parses the *template string*, not
+        the substituted values, so ``Java.perform(function () { ... })``
+        in the body keeps its braces. If a future refactor of the
+        template ever adds a second ``{placeholder}`` to
+        ``js_template``, this test would catch any escaping
+        regression that breaks real-world JS bodies.
+        """
+        body = (
+            "Java.perform(function () {\n"
+            "  var Foo = Java.use('com.example.Foo');\n"
+            "  Foo.bar.implementation = function () { return true; };\n"
+            "  send({class: 'Foo', phase: 'forced'});\n"
+            "});"
+        )
+        result = render_by_id("custom", {"js_body": body})
+        # Body comes out verbatim — every line, every brace, every
+        # quote. Trailing newline added by the template (so the
+        # rendered JS is well-formed even if the operator forgot the
+        # final newline).
+        assert result.js == body + "\n"
+        # Specifically check the brace survival: this is the bit
+        # that would break if anyone "improved" the template by
+        # adding another placeholder without thinking through the
+        # str.format escaping rules.
+        assert "function () {" in result.js
+        assert "function () { return true; };" in result.js
+        # Summary deliberately doesn't echo the body (it could be
+        # huge); it surfaces the safety-contract reminders instead.
+        s = result.summary.lower()
+        assert "operator-authored" in s
+        assert "verbatim" in s
+        assert "pyjsparser" in s
+        # The contract reminders the structured-template summaries
+        # would normally surface but Custom can't compute:
+        assert "no event_label" in s or "event_label is enforced" in s
+        assert "sensitive-api" in s or "touches" in s
+        assert "risk" in s
+        # Sensitive-APIs intentionally empty — the renderer doesn't
+        # analyse the JS body, so any value would be a guess.
+        from androscan.adapters.frida_hooks import get_template
+
+        tmpl = get_template("custom")
+        assert tmpl.sensitive_apis == ()
+        # One required parameter, ``js_body``, and nothing else.
+        assert [p.name for p in tmpl.params] == ["js_body"]
+        assert tmpl.params[0].required is True
+
+    def test_custom_missing_body_raises(self):
+        # Empty body fails the renderer's ``required + non-empty``
+        # check the same way every other template's required params
+        # do — operators can't accidentally Inject a no-op script.
+        with pytest.raises(HookParamError, match="js_body"):
+            render_by_id("custom", {"js_body": ""})
 
     def test_scope_inspector_renders(self):
         result = render_by_id(

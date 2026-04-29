@@ -847,8 +847,24 @@ export function HookBuilder({
                 onSwitchToMethodSkip={switchToMethodSkip}
               />
             ) : null;
+          // ``js_body`` (the Custom template's only param) is the one
+          // field today that holds a multi-line code body — every
+          // other param is a single identifier (class / method /
+          // event_label / etc.). Render it as a tall monospace
+          // ``<textarea>`` instead of the default ``<input>`` so the
+          // operator can paste a real Frida script without it
+          // collapsing to a single horizontally-scrolling line.
+          // Pairs with ``.hookbuilder-row-textarea`` (top-aligns the
+          // label) + ``.hookbuilder-textarea`` (mono font, vertical
+          // resize, ~12 rows visible). Any future template that
+          // ships a multi-line body just names its param ``js_body``
+          // and gets the same treatment for free.
+          const isCodeBody = p.name === "js_body";
           return (
-            <div key={p.name} className="hookbuilder-row">
+            <div
+              key={p.name}
+              className={`hookbuilder-row ${isCodeBody ? "hookbuilder-row-textarea" : ""}`.trim()}
+            >
               <label
                 className="hookbuilder-label"
                 htmlFor={`hookbuilder-param-${p.name}`}
@@ -858,15 +874,50 @@ export function HookBuilder({
                 {p.required && <span className="hookbuilder-required"> *</span>}
               </label>
               <div className="hookbuilder-input-stack">
-                <input
-                  id={`hookbuilder-param-${p.name}`}
-                  className={`hookbuilder-input ${requiredAndMissing ? "hookbuilder-input-bad" : ""}`}
-                  value={value}
-                  placeholder={p.description}
-                  onChange={(e) => onParamChange(p.name, e.target.value)}
-                  spellCheck={false}
-                  autoComplete="off"
-                />
+                {isCodeBody ? (
+                  <textarea
+                    id={`hookbuilder-param-${p.name}`}
+                    className={`hookbuilder-input hookbuilder-textarea ${requiredAndMissing ? "hookbuilder-input-bad" : ""}`}
+                    value={value}
+                    placeholder={
+                      // Multi-line placeholder so the empty state
+                      // shows the operator a known-good shape they
+                      // can use as a starting point. Single-quoted
+                      // string literals to avoid colliding with the
+                      // form's own JSX double quotes; Frida's JS
+                      // engine accepts either.
+                      "Java.perform(function () {\n" +
+                      "  var Foo = Java.use('com.example.Foo');\n" +
+                      "  Foo.bar.implementation = function () {\n" +
+                      "    send({ class: 'Foo', method: 'bar', phase: 'forced' });\n" +
+                      "    return true;\n" +
+                      "  };\n" +
+                      "});"
+                    }
+                    onChange={(e) => onParamChange(p.name, e.target.value)}
+                    spellCheck={false}
+                    autoComplete="off"
+                    rows={12}
+                    // ``off`` for both wrap + autocorrect: code
+                    // bodies must not get soft-wrapped (it changes
+                    // visual line numbers operators are matching to
+                    // Monaco markers) and must never be
+                    // autocorrected (variable names aren't English).
+                    wrap="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                  />
+                ) : (
+                  <input
+                    id={`hookbuilder-param-${p.name}`}
+                    className={`hookbuilder-input ${requiredAndMissing ? "hookbuilder-input-bad" : ""}`}
+                    value={value}
+                    placeholder={p.description}
+                    onChange={(e) => onParamChange(p.name, e.target.value)}
+                    spellCheck={false}
+                    autoComplete="off"
+                  />
+                )}
                 {suggestRow}
               </div>
             </div>

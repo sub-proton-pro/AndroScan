@@ -173,6 +173,14 @@ _TEMPLATE_MODULES: tuple[str, ...] = (
     "androscan.adapters.frida_hooks.force_return_value",
     "androscan.adapters.frida_hooks.force_method_skip",
     "androscan.adapters.frida_hooks.force_string_compare_equal",
+    # Phase 11 candidate — operator-authored JS passthrough. Lives in
+    # the v1 library so the manual-paste flow + (eventually) the
+    # chat-suggested-JS handoff via ``generate_frida_hook`` can reuse
+    # the existing render / parse / Inject pipeline without a parallel
+    # "untemplated JS" code path. Risk is intentionally unrated — the
+    # renderer doesn't analyse the body, so any classification would
+    # be a guess (the template's pentester summary calls this out).
+    "androscan.adapters.frida_hooks.custom",
 )
 
 
