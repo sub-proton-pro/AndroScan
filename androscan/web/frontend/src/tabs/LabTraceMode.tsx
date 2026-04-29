@@ -1,10 +1,13 @@
 /**
  * Trace mode for the Lab tab — the headline UI for Phase 10
- * (sub-step 10.7). The 10.6 placeholder shipped a status-only view;
- * this rewrite is the real surface:
+ * (sub-steps 10.7 + 10.8). The 10.6 placeholder shipped a status-only
+ * view; this rewrite is the real surface:
  *
  *   1. Top-of-pane form: smali entry signature input + hops stepper
- *      (1..6 clamped) + Build / Force-rebuild buttons.
+ *      (1..6 clamped) + Build / Force-rebuild buttons. When the form
+ *      is seeded from an external source (10.8's Inspect → Trace
+ *      cross-tab handoff), a small pill above the input names the
+ *      source so the operator knows the field wasn't typed by hand.
  *   2. Result region: ``BehaviorAnchorCard`` header + ``DecisionTimeline``
  *      + the per-plan ``BypassPlanCard`` list (default plans visible,
  *      advanced plans behind an ``<details>`` expander per DEC-024).
@@ -19,12 +22,12 @@
  * operator clicks Build to fire POST. ``Force re-trace`` always fires
  * POST with ``force=true``.
  *
- * The Trace pane intentionally has no chat dock of its own — operators
- * who want to talk to the LLM about a trace should switch to Manual
- * Hooks mode (which carries the ``ChatDock`` + the ``frida_summary``
- * attachment plumbing from sub-step 4.7). 10.8 will add a ``trace``
- * attachment kind so the Manual Hooks chat can pull the active
- * anchor.
+ * 10.8 chat plumbing: Trace mode itself still has no chat dock of
+ * its own — operators who want to ask the LLM about a trace switch
+ * to Manual Hooks mode, which carries the ``ChatDock``. The active
+ * ``BehaviorAnchor`` is published to the parent ``LabTab`` via the
+ * ``onActiveAnchorChange`` callback so the Manual Hooks chat
+ * builder can fold it into the new ``trace`` ``ChatAttachment``.
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -36,24 +39,56 @@ import {
   fetchTraceStatus,
   listTraceAnchors,
   useTraceAnchor,
+  type BehaviorAnchor,
   type TraceAnchorRow,
   type TraceStatusPayload,
 } from "../api/trace";
+import { useWorkbench } from "../context/WorkbenchContext";
 
 type Props = {
   appId: string | null;
+  /** Phase 10 sub-step 10.8: publish the active ``BehaviorAnchor`` (or
+   *  ``null`` when nothing is loaded) up to the parent ``LabTab`` so the
+   *  Manual Hooks chat builder can fold it into a ``trace``
+   *  ``ChatAttachment``. Pure callback; no rendering responsibility. */
+  onActiveAnchorChange?: (anchor: BehaviorAnchor | null) => void;
 };
+
+/** Heuristic: a Smali method signature is "complete" once it has a
+ *  closing paren and a return descriptor. We use this in 10.8 to decide
+ *  whether to auto-fire the trace on a cross-tab seed (full sig → fire)
+ *  vs. just prefilling the form for the operator to complete (prefix
+ *  → wait). False positives are cheap (the trace skill 404s on a bad
+ *  signature and we fall back to the "missing" empty-state with a
+ *  clear error). */
+function looksLikeCompleteSmaliSignature(s: string): boolean {
+  const trimmed = s.trim();
+  if (!trimmed) return false;
+  const closeIdx = trimmed.lastIndexOf(")");
+  if (closeIdx <= 0) return false;
+  // Return descriptor: V, Z, B, S, C, I, J, F, D, or a class form / array.
+  const ret = trimmed.slice(closeIdx + 1);
+  return /^\[*([VZBSCIJFD]|L[\w/$]+;)$/.test(ret);
+}
 
 const DEFAULT_HOPS = 3;
 const MIN_HOPS = 1;
 const MAX_HOPS = 6;
 
-export function LabTraceMode({ appId }: Props) {
+export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
+  const { pendingTraceEntry, setPendingTraceEntry } = useWorkbench();
+
   // ----- form state ------------------------------------------------------
   const [entryDraft, setEntryDraft] = useState("");
   const [hopsDraft, setHopsDraft] = useState<number>(DEFAULT_HOPS);
   const [activeEntry, setActiveEntry] = useState<string | null>(null);
   const [activeHops, setActiveHops] = useState<number>(DEFAULT_HOPS);
+
+  // 10.8: Track the source label written by the cross-tab seed so the
+  // operator can see "Seeded from Inspect → MainActivity:42" until they
+  // edit the field or fire the trace. Cleared on manual edit / submit /
+  // app change so it never lingers stale.
+  const [seedLabel, setSeedLabel] = useState<string | null>(null);
 
   // ----- status + cached-anchors list ------------------------------------
   const [status, setStatus] = useState<TraceStatusPayload | null>(null);
@@ -72,8 +107,52 @@ export function LabTraceMode({ appId }: Props) {
     setHopsDraft(DEFAULT_HOPS);
     setActiveEntry(null);
     setActiveHops(DEFAULT_HOPS);
+    setSeedLabel(null);
     clear();
   }, [appId, clear]);
+
+  // 10.8 cross-tab seed: pendingTraceEntry is set by the Inspect tab's
+  // BestBanner. We prefill the form, surface a "Seeded from ..." pill,
+  // and *auto-fire* the trace only when the seeded value already has a
+  // complete return descriptor — partial seeds (which are the common
+  // case, since the resolver doesn't carry per-overload params) just
+  // sit in the input field for the operator to complete.
+  useEffect(() => {
+    if (!pendingTraceEntry) return;
+    if (!appId || pendingTraceEntry.appId !== appId) return;
+    const prefix = pendingTraceEntry.entryPrefix;
+    const hops = Math.max(
+      MIN_HOPS,
+      Math.min(MAX_HOPS, pendingTraceEntry.hops || DEFAULT_HOPS),
+    );
+    setEntryDraft(prefix);
+    setHopsDraft(hops);
+    setSeedLabel(pendingTraceEntry.sourceLabel ?? "Seeded externally");
+    if (looksLikeCompleteSmaliSignature(prefix)) {
+      setActiveEntry(prefix.trim());
+      setActiveHops(hops);
+    } else {
+      setActiveEntry(null);
+      clear();
+    }
+    setPendingTraceEntry(null);
+    // ``clear`` is a stable callback; intentional partial deps to avoid
+    // re-firing the seed every time anchor state changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingTraceEntry?.ts, appId]);
+
+  // 10.8: republish the active anchor (or ``null``) to the parent
+  // ``LabTab`` so the Manual Hooks chat builder can fold it into a
+  // ``trace`` ``ChatAttachment``. Effect-based instead of inline so a
+  // build → loaded transition fires the callback exactly once.
+  useEffect(() => {
+    if (!onActiveAnchorChange) return;
+    if (state.kind === "loaded") {
+      onActiveAnchorChange(state.anchor);
+    } else {
+      onActiveAnchorChange(null);
+    }
+  }, [state, onActiveAnchorChange]);
 
   // Status fetch on app change + after Build (so the cache count
   // updates without an explicit reload).
@@ -130,6 +209,7 @@ export function LabTraceMode({ appId }: Props) {
     const hops = Math.max(MIN_HOPS, Math.min(MAX_HOPS, hopsDraft || DEFAULT_HOPS));
     setActiveEntry(entry);
     setActiveHops(hops);
+    setSeedLabel(null);
   };
 
   const onForceRebuild = () => {
@@ -142,6 +222,7 @@ export function LabTraceMode({ appId }: Props) {
     setHopsDraft(row.hops);
     setActiveEntry(row.entry_smali_id);
     setActiveHops(row.hops);
+    setSeedLabel(null);
   };
 
   const onDeleteCached = async (row: TraceAnchorRow) => {
@@ -176,13 +257,33 @@ export function LabTraceMode({ appId }: Props) {
 
       {appId && (
         <>
+          {seedLabel && (
+            <div className="trace-seed-pill" role="status" aria-live="polite">
+              <span className="trace-seed-pill-label">{seedLabel}</span>
+              <button
+                type="button"
+                className="trace-seed-pill-clear"
+                onClick={() => {
+                  setSeedLabel(null);
+                  setEntryDraft("");
+                }}
+                title="Clear the seeded value"
+                aria-label="Clear the seeded value"
+              >
+                ×
+              </button>
+            </div>
+          )}
           <form className="trace-form" onSubmit={onSubmit}>
             <label className="trace-form-field trace-form-entry">
               <span>Entry method (smali signature)</span>
               <input
                 type="text"
                 value={entryDraft}
-                onChange={(e) => setEntryDraft(e.target.value)}
+                onChange={(e) => {
+                  setEntryDraft(e.target.value);
+                  if (seedLabel) setSeedLabel(null);
+                }}
                 placeholder="Lcom/example/Foo;->onClick(Landroid/view/View;)V"
                 autoComplete="off"
                 spellCheck={false}

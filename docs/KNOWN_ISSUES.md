@@ -363,6 +363,52 @@ Use the following format for new entries:
 
 ---
 
+### ISSUE-013: Behavior Trace v1 backward slicing is intra-procedural only
+- status: Open (intentional v1 trade-off — v2 follow-up)
+- impact: Medium
+- area: analysis / Behavior Trace / decision-point predicate origin
+- introduced / observed: 2026-04-29 (Phase 10 v1 complete — sub-step 10.2 specifics)
+- summary:
+  `androscan/analysis/trace_predicate.py` walks predicate origin **inside a single Smali method body only** — no aliasing, no field-flow analysis, no cross-method dataflow. When a predicate register's defining instruction is a method invocation (`invoke-virtual`, `invoke-static`, etc.), the slicer records the call as a `MethodCallOrigin` and stops; it does **not** descend into the callee to determine what the callee actually computes. Similarly, when a predicate register's defining instruction is an `iget` / `sget` (field load), the slicer records the field as a `FieldLoadOrigin` and stops; it does not chase backwards through `iput` / `sput` write sites to find what value was last stored. The honest discriminated-union surface (`PredicateOrigin`'s `MethodCallOrigin`, `FieldLoadOrigin`, `ParamOrigin`, `ConstOrigin`, `UnresolvedOrigin`) preserves the limitation in the data model, and the Trace UI surfaces a "trace may be incomplete" banner via `TraceIncompleteBanner.tsx` whenever any decision point in the closure has `predicate_origin: UnresolvedOrigin` *or* sits in a method tagged `may_have_unresolved_reflection: true` from DEC-023's call-graph store.
+- why it matters:
+  Plenty of real Android gating idioms keep the predicate-computing call right next to the `if` that consumes its result (e.g. `if (rootDetector.isRooted()) { ... }`), and v1 handles those cleanly. Other idioms — multi-step builder predicates, helper-method extractions, field-cached results from a one-time check — produce a `MethodCallOrigin` or `FieldLoadOrigin` that the operator must follow manually in the decompiled source to decide whether to write a hook against the immediate callee or against something deeper in the chain. Per DEC-024's "intra-procedural is honest about its limits" framing, the surface tells the truth (no false `Const`/`Param` claims), but the false-negative rate on what the planner can mechanically suggest a bypass for is the single largest known gap in v1's planner coverage.
+- current workaround:
+  Operators read the decompiled source via the Lab → Manual Hooks "Open in Inspect" handoff (which jumps from a decision point's `MethodRef` to the corresponding source line) and decide manually whether to hook the immediate callee, the field-write site, or some deeper helper. The Frida override templates `force_return_value` and `force_method_skip` work fine on any of those choices once the operator picks one — the limitation is in *suggestion*, not *execution*.
+- recommended fix:
+  Two-part v2 change: (1) extend `trace_predicate.py` with a bounded inter-procedural slicer — descend into callees up to a `MAX_SLICE_DEPTH = 2` (config-knobbed), with a fast deny-list for "clearly stateless library calls" (e.g. `Math.*`, primitive boxing) so the slicer doesn't waste budget; (2) when descending into an `iget` / `sget`, walk the field's recent `iput` / `sput` writes inside the same class only (cross-class field-flow stays out of scope per the same depth rationale). Both passes feed back into the existing `PredicateOrigin` discriminated union — no schema bump needed, just richer leaves. Operator-facing: the "trace may be incomplete" banner becomes proportionately less common; the planner's `force_method_skip` / `force_return_value` plan list grows. Risk: slice depth is a closed economy with the per-anchor LLM token budget; when both grow at once, the per-anchor cost ceiling needs revisiting.
+- related tasks:
+  - `docs/TASKS.md` § Phase 10 — Behavior Trace v1 — sub-step backlog (v1 complete 2026-04-29; capture as v2 follow-up when v2 backlog opens)
+- related docs:
+  - `docs/DECISIONS.md` DEC-024 (Phase 10 — "Decision extraction is intra-procedural" decision clause + closing note 2026-04-29)
+  - `androscan/analysis/trace_predicate.py` (the intra-procedural slicer — `MAX_SLICE_DEPTH` lives here once added)
+  - `androscan/analysis/trace_types.py` (`PredicateOrigin` discriminated union — no schema bump needed)
+  - `androscan/web/frontend/src/components/trace/TraceBanners.tsx` (`TraceIncompleteBanner` surfaces unresolved-origin closures today)
+
+---
+
+### ISSUE-014: Behavior Trace v1 predicate_origin is per-overload imprecise on two-register comparisons
+- status: Open (intentional v1 trade-off — v2 follow-up)
+- impact: Low
+- area: analysis / Behavior Trace / decision-point predicate origin / two-register comparisons
+- introduced / observed: 2026-04-29 (Phase 10 v1 complete — sub-step 10.2 specifics)
+- summary:
+  Smali two-register comparison opcodes (`if-eq`, `if-ne`, `if-lt`, `if-le`, `if-gt`, `if-ge`) compare two registers `vA` and `vB` and branch on the relation. `trace_predicate.py` resolves each operand independently to its own `PredicateOrigin`, but `DecisionPoint.predicate_origin: PredicateOrigin | None` is a *single* origin field (not a 2-tuple). The current implementation reports the **left operand's origin** (`vA`) and surfaces the right operand only via the raw decompiled snippet attached to the decision point. For one-register comparisons (`if-eqz` / `if-nez` / etc.), the surface is precise — the lone register's origin is the only origin, and the data model fits. For two-register comparisons where neither operand traces back deterministically to a method-call origin (e.g. both are `iget` field loads, or one is a `const` and the other an `iget`), the operator looking at the structured `predicate_origin` alone may miss that a field-write hook on the *other* operand's source would be just as valid a bypass site as one on the reported operand's source.
+- why it matters:
+  Most production decision-points the v1 planner has seen on small-fixture and dogfood-app traces are one-register comparisons (`if-eqz vN` against the result of a method call or field load — the textbook "is this thing true?" idiom), so the precision gap mostly affects two-register predicates that compare two non-trivial values (e.g. `if-eq vRoot, vExpected` where both come from independent field loads). The `force_return_value` and `force_method_skip` planner outputs remain correct for the reported operand; they just miss the symmetric bypass site on the unreported operand.
+- current workaround:
+  Operator reads the decompiled snippet on the decision-point card (which shows both operands) and authors a manual hook against the unreported operand's source if the reported one isn't a convenient hook site. The Trace mode UI's `BypassPlanCard.tsx` "Stage in Manual Hooks" handoff already plumbs the operator into the HookBuilder with a partial prefill, so completing the picked operand's hook is a well-trodden v1 path.
+- recommended fix:
+  Schema bump on `DecisionPoint`: change `predicate_origin: PredicateOrigin | None` to `predicate_origins: tuple[PredicateOrigin, ...]` (length 1 for `if-eqz`-class opcodes, length 2 for two-register opcodes). The discriminated-union members don't change; the wire shape on `DecisionPoint` does. Frontend: `PredicateOriginView.tsx` becomes a list renderer (which it almost is already — it currently renders one origin in a card; `BehaviorAnchorCard.tsx` / `DecisionTimeline.tsx` would render N cards instead). Planner: `bypass_planner.py` enumerates plans against each operand independently and the existing risk-tier filtering applies per-operand. Storage: `trace.sqlite` schema_version bumps from 1 to 2 (the payload_json shape changes); per DEC-024's "drop-the-cache invalidation" model, this is a one-line migration. Risk: doubles the per-anchor card count for two-register-heavy methods, which a UI density review should weigh in on before shipping.
+- related tasks:
+  - `docs/TASKS.md` § Phase 10 — Behavior Trace v1 — sub-step backlog (v1 complete 2026-04-29; capture as v2 follow-up when v2 backlog opens)
+- related docs:
+  - `docs/DECISIONS.md` DEC-024 (Phase 10 — closing note 2026-04-29 references this issue by ID alongside ISSUE-013)
+  - `androscan/analysis/trace_types.py` (`DecisionPoint.predicate_origin` field — schema bump lives here)
+  - `androscan/analysis/trace_predicate.py` (resolves each operand; today drops the right operand for two-register opcodes)
+  - `androscan/web/frontend/src/components/trace/PredicateOriginView.tsx` (renders the single origin today — list-renderer in v2)
+
+---
+
 ## 7. Accepted limitations
 
 Use this section for limitations that are currently acceptable and not immediate defects.

@@ -1404,6 +1404,23 @@ button.ghost-mini:disabled {
   font-size: 0.72rem;
 }
 
+/* Phase 10 sub-step 10.8: cross-tab "Trace this behaviour" button on
+ * the Inspect tab's BestBanner. Sits next to ``.best-banner-open`` and
+ * uses the accent colour to signal the cross-tab navigation (the rest
+ * of BestBanner stays in the muted palette). */
+.best-banner-trace {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.72rem;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.best-banner-trace:hover:not(:disabled) {
+  background: var(--panel-2);
+}
+
 .best-banner-loc {
   font-size: 0.85rem;
   word-break: break-word;
@@ -4266,6 +4283,44 @@ code { color: var(--accent); }
 .trace-form-buttons button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Phase 10 sub-step 10.8: "Seeded from <source>" pill that sits above
+ * the trace form whenever ``pendingTraceEntry`` populated the input
+ * field (Inspect → Trace cross-tab handoff). Visually mirrors the
+ * ``.hookbuilder-staged-pill`` BypassPlanCard handoff so operators
+ * recognise the same "this came from somewhere else, not your typing"
+ * affordance across the two cross-mode flows. */
+.trace-seed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.5rem 0 0;
+  padding: 0.25rem 0.6rem;
+  background: var(--panel-2);
+  border: 1px dashed var(--accent);
+  border-radius: 3px;
+  font-size: 0.75rem;
+  color: var(--text);
+  width: fit-content;
+}
+
+.trace-seed-pill-label {
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-seed-pill-clear {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0 0.15rem;
+}
+
+.trace-seed-pill-clear:hover {
+  color: var(--accent);
 }
 
 /* ----- result region states ----- */

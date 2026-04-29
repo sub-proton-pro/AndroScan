@@ -788,7 +788,7 @@ Use the following structure for new entries:
   - **DEC-024** (Phase 10 Behavior Trace — supersedes DEC-023's "Hook Lab" tab name with **Lab** going forward; reuses every Hook Lab v1 substrate unchanged: call-graph SQLite, `frida_hooks/` templates, `generate_frida_hook` skill, per-app `hook_target_package_prefix` allowlist, Frida overlay)
 
 ### DEC-024: Phase 10 — Lab tab "Behavior Trace" mode (gate identification + bypass planning) and the Hook Lab → Lab rename
-- status: Active
+- status: Active *(**v1 complete 2026-04-29** — see closing note at end of entry; remains "Active" because the deferred v2 cross-platform mirroring scope (iOS / WebView / native binary) is still load-bearing for future contributors and is referenced by this DEC's data-model rationale, not by a follow-up DEC)*
 - date: 2026-04-28
 - owners: (project)
 - context:
@@ -853,6 +853,13 @@ Use the following structure for new entries:
   - `docs/STATE.md` (Phase 10 stub to be added when 10.1 lands)
   - `docs/DESIGN_DOC.md` Phase 10 (added in this same commit)
   - `docs/SAFETY_AND_SECURITY.md` (Trace mode adds zero new device-touching surface; existing §12.6 controls cover the bypass flow unchanged)
+- **v1 closing note (2026-04-29):**
+  - Sub-steps 10.0 → 10.8 all landed across one calendar day per planning window. The platform-neutral data-model discipline held up — `BehaviorAnchor` / `DecisionPoint` / `BypassPlan` shipped without one Smali-specific field on the public surface; the Smali specifics live in `predicate_origin: PredicateOrigin` (a discriminated union) and the bypass-plan template parameter dicts (which reference Smali class/method/instruction indices). The platform-neutral data model is therefore not just stipulated but observably held in v1, which clears the design path for the deferred iOS / desktop / native adapters when (if) operator demand surfaces.
+  - The static-enumerate / LLM-interpret split also held up: the deterministic layer (10.1–10.4) ships **77 tests** without an LLM call anywhere in the test surface, and the LLM-tier `trace_behavior` skill (10.5) ships **22 tests** all with mocked LLM at the boundary — no flake risk from real-LLM dependence in CI. The "one LLM call per anchor" budget is preserved end-to-end.
+  - The bypass-template-bound-only policy held: every `BypassPlan` v1 emits references one of three new `frida_hooks/` templates (`force_return_value` / `force_method_skip` / `force_string_compare_equal`), and the deterministic planner refuses anything else. Free-form LLM JS for bypass plans remains v2-deferred per this DEC's "alternatives considered" column.
+  - The Hook Lab → Lab rename completed in 10.6 alongside the routes-and-shell PR per the original sequencing plan; back-compat for `#/hook` URL hashes and `tab="hook"` chat requests is in place and tested. Historical proper-noun usages of "Hook Lab v1" in DEC-023, ISSUE-010 / ISSUE-011 / ISSUE-012, LIMIT-002, and `docs/STATE.md` Phase 6→9 entries remain unchanged per this DEC's rename policy.
+  - **One material implementation deviation worth flagging for v2:** the original DEC text said "the deterministic planner emits up to N plans, the LLM proposes additional ones." 10.4's planner ended up with deterministic plans split across two surfaces — `BehaviorAnchor.plans` (default-visible, risk ≤ `trace.bypass_risk_max`) and `BehaviorAnchor.advanced_plans` (gated behind a UI expander, includes `high`-risk plans regardless of threshold). The LLM in 10.5 augments both lists and additionally writes `rationale: str` per anchor + reclassifies low-confidence decisions (the latter capability was implicit in the DEC text but not explicit). This is more capable than the original sketch, not less, and is captured here so a future contributor reading the DEC + the implementation doesn't trip over the asymmetry.
+  - **v1 limitations and v2 backlog** (now tracked in `docs/KNOWN_ISSUES.md` ISSUE-013 / ISSUE-014): intra-procedural slicing's false-negative rate on production apps is the single largest known gap; the per-overload predicate_origin precision on two-register comparisons where neither operand traces back deterministically to a method-call origin is the second; both are explicitly in scope for the v2 follow-up DEC if/when operator telemetry justifies one. Cross-platform mirroring (iOS / WebView / native binary), inter-procedural slicing, switch-case bypass plans, per-app TTL on cached anchors, and "Trace from here" entry-points on the Manual Hooks call-graph nodes round out the deferred v2 backlog.
 
 ---
 

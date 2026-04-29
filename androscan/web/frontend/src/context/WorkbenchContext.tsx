@@ -112,6 +112,19 @@ type WorkbenchState = {
   pendingHookPrefill: PendingHookPrefill | null;
   setPendingHookPrefill: (p: PendingHookPrefillInput | null) => void;
 
+  // Phase 10 sub-step 10.8: cross-tab "trace this behaviour" intent.
+  // The Inspect tab's ``BestBanner`` writes here when the operator
+  // clicks "Trace this behaviour" on a fused click-to-code result; the
+  // Lab tab's Trace mode reads it on mount / change, prefills the
+  // entry-method form, surfaces a "Seeded from Inspect" pill, and
+  // clears via ``setPendingTraceEntry(null)``. Auto-fires the trace
+  // when ``entryPrefix`` looks like a full signature (ends with a
+  // return descriptor); otherwise just prefills so the operator can
+  // complete the descriptor list. ``ts`` forces re-fire when the same
+  // entry is requested twice in a row.
+  pendingTraceEntry: PendingTraceEntry | null;
+  setPendingTraceEntry: (p: PendingTraceEntryInput | null) => void;
+
   // per-tab chat history (persisted client-side)
   chats: Record<TabId, ChatMessage[]>;
   appendChat: (tab: TabId, msg: ChatMessage) => void;
@@ -146,6 +159,27 @@ export type PendingHookPrefillInput = {
 
 export type PendingHookPrefill = PendingHookPrefillInput & { ts: number };
 
+export type PendingTraceEntryInput = {
+  appId: string;
+  /** Smali entry-method *prefix or full signature*. The Inspect-tab seed
+   *  often loses the descriptor list (the deterministic candidate from
+   *  the resolver only carries class + method name, not the parameter
+   *  descriptors), so the value may be a partial form like
+   *  ``Lcom/example/Foo;->onClick(`` that the operator completes by
+   *  typing. The trace skill validates the final signature server-side. */
+  entryPrefix: string;
+  /** Optional default hops; clamped to [1, 6] in the Trace mode form. */
+  hops?: number;
+  /** Optional human-readable label shown next to the form so the
+   *  operator can tell at a glance that the field was populated by an
+   *  external source rather than typed in by hand (e.g. "Inspect →
+   *  com/example/MainActivity:42"). Cleared the moment the operator
+   *  edits the field or fires Trace. */
+  sourceLabel?: string | null;
+};
+
+export type PendingTraceEntry = PendingTraceEntryInput & { ts: number };
+
 const WorkbenchContext = createContext<WorkbenchState | null>(null);
 
 export function WorkbenchProvider({ children }: { children: ReactNode }) {
@@ -163,6 +197,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     useState<PendingCodeNav | null>(null);
   const [pendingHookPrefill, setPendingHookPrefillState] =
     useState<PendingHookPrefill | null>(null);
+  const [pendingTraceEntry, setPendingTraceEntryState] =
+    useState<PendingTraceEntry | null>(null);
   const [labMode, setLabModeState] = useState<LabMode>(() => loadStoredLabMode());
   const [chats, setChats] = useState<Record<TabId, ChatMessage[]>>({
     reports: [],
@@ -307,6 +343,13 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const setPendingTraceEntry = useCallback(
+    (p: PendingTraceEntryInput | null) => {
+      setPendingTraceEntryState(p ? { ...p, ts: Date.now() } : null);
+    },
+    [],
+  );
+
   const setLabMode = useCallback((m: LabMode) => {
     setLabModeState(m);
     try {
@@ -341,6 +384,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setLabMode,
       pendingHookPrefill,
       setPendingHookPrefill,
+      pendingTraceEntry,
+      setPendingTraceEntry,
       chats,
       appendChat,
       updateChat,
@@ -366,6 +411,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setLabMode,
       pendingHookPrefill,
       setPendingHookPrefill,
+      pendingTraceEntry,
+      setPendingTraceEntry,
       chats,
       appendChat,
       updateChat,

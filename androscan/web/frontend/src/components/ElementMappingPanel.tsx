@@ -17,6 +17,13 @@ type Props = {
   /** Optional: open this candidate in the Code Browser tab, scroll to it
    *  and keep the snippet's whole line range visually highlighted there. */
   onOpenInBrowser?: (file: string, startLine: number, endLine: number) => void;
+  /** Phase 10 sub-step 10.8: cross-tab "Trace this behaviour" handoff.
+   *  Invoked from the ``BestBanner``'s pen-shaped button; receives the
+   *  fuser's pick so the host (``InspectTab``) can convert it into a
+   *  Smali entry-method prefix and seed the Lab → Trace mode form via
+   *  ``setPendingTraceEntry`` + ``setLabMode("trace")`` + ``setTab("lab")``.
+   *  The button only renders when the prop is supplied. */
+  onTraceBehaviour?: (best: ResolutionCandidate) => void;
 };
 
 /**
@@ -81,6 +88,7 @@ export function ElementMappingPanel({
   busy,
   error,
   onOpenInBrowser,
+  onTraceBehaviour,
 }: Props) {
   const [openIdx, setOpenIdx] = useState<number | null>(null);
   const [openSrc, setOpenSrc] = useState<string | null>(null);
@@ -187,6 +195,7 @@ export function ElementMappingPanel({
           best={best}
           alternativesCount={alternatives.length}
           onOpenInBrowser={onOpenInBrowser}
+          onTraceBehaviour={onTraceBehaviour}
         />
       )}
 
@@ -331,10 +340,12 @@ function BestBanner({
   best,
   alternativesCount,
   onOpenInBrowser,
+  onTraceBehaviour,
 }: {
   best: ResolutionCandidate;
   alternativesCount: number;
   onOpenInBrowser?: Props["onOpenInBrowser"];
+  onTraceBehaviour?: Props["onTraceBehaviour"];
 }) {
   const { start, end } = resolutionRange(best);
   const fqMethod =
@@ -359,6 +370,16 @@ function BestBanner({
             title="Open in Code browser"
           >
             <IconOpenIn /> open
+          </button>
+        )}
+        {onTraceBehaviour && (
+          <button
+            type="button"
+            className="best-banner-trace ghost-mini"
+            onClick={() => onTraceBehaviour(best)}
+            title="Trace this behaviour in Lab → Trace mode (seeds the entry-method form from this handler)"
+          >
+            trace ↗
           </button>
         )}
       </header>

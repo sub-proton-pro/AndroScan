@@ -639,6 +639,148 @@ place without cross-referencing five DEC-023 sub-bullets.
   *safety* features — they are scope choices that v2 may re-open with the
   benefit of operator telemetry from real Hook Lab use.
 
+### 12.7 Behavior Trace mode scope (Phase 10 v1 — closed 2026-04-29)
+
+Phase 10 (DEC-024) added a new **"Trace" mode** inside the Lab tab
+(renamed from "Hook Lab" in 10.6 — see DEC-024's "Hook Lab → Lab rename"
+clause; historical `docs/STATE.md` Phase 6→9 references retain the
+original proper noun). Trace mode walks the static call graph from an
+operator-supplied entry method, enumerates every conditional gate in the
+forward closure (≤ `MAX_TRACE_HOPS = 3` by default, hard-capped at 6),
+classifies each gate as `deny` / `allow` / `neutral` with a heuristic
+confidence score, and emits template-bound Frida `BypassPlan`s the
+operator can stage into the existing Hook Lab → Manual Hooks UI for
+injection. This subsection pins the Trace-specific safety posture so
+auditors do not need to re-derive it from §12.6 + DEC-024.
+
+- **Trace itself is read-only.** The new LLM-tier `trace_behavior` skill
+  (10.5; `androscan/llm/skills/trace_behavior.py`) ships with
+  `requires_confirmation=False` per DEC-022's confirmation taxonomy: it
+  walks the call-graph SQLite store (DEC-016), reads decompiled Smali
+  via the existing per-app `<sha>`-keyed cache (DEC-023), runs the
+  deterministic decision-extraction + slicing + classification pipeline
+  (10.1 → 10.4), and asks the LLM **once per anchor** to (a) reclassify
+  low-confidence gates, (b) author rationale strings, (c) propose
+  additional template-bound bypass plans. **Phase 10 adds zero new
+  device-touching surface area** — every dynamic effect (script
+  injection, attach, detach) flows through the existing
+  `POST /api/frida/sessions` route and inherits §12.6's full control
+  list (server-side `hook_target_package_prefix` allowlist with
+  fail-closed HTTP 403 `hook_blocked`, `pyjsparser` JS pre-validation
+  with HTTP 400 `render_parse_error`, JSONL persistence under
+  `apps/<app_id>/<run_ts>/frida/<session>.jsonl`, deterministic
+  pentester summary as the consent surface, no auto-push of
+  `frida-server`).
+- **Bypass plans are template-bound only — same policy as Hook Lab v1
+  hooks.** Every `BypassPlan` v1 emits references one of three new
+  `frida_hooks/` templates added in 10.4:
+  `force_return_value` (risk `low`), `force_method_skip` (risk
+  `medium`), `force_string_compare_equal` (risk `medium`). The
+  deterministic planner (`androscan/analysis/bypass_planner.py`) maps
+  `PredicateOrigin` + `DecisionPoint` characteristics to the
+  appropriate template + parameter dict and refuses to emit anything
+  outside the template catalog. The LLM-tier `trace_behavior` skill in
+  10.5 may suggest *additional* plans, but those plans must also
+  reference one of the catalog templates — free-form LLM JS for bypass
+  plans is **explicitly v2-deferred per DEC-024's "alternatives
+  considered" column**, mirroring the same policy DEC-023 applied to
+  Hook Lab v1 hooks. The free-form path that already exists via
+  `generate_frida_hook` (DEC-022's `requires_confirmation=True` consent
+  class) stays as an operator-driven escape hatch.
+- **Bypass risk taxonomy with operator-configurable threshold.** Each
+  `BypassPlan` ships with `risk: "low" | "medium" | "high"` and a
+  `risks: list[str]` rationale list (e.g. "hooking `String.equals`
+  globally is `high` — touches every equality check in the JVM").
+  `BehaviorAnchor.plans` (default-visible) is filtered by the
+  per-app-overridable `trace.bypass_risk_max` config knob (default
+  `"medium"`); higher-risk plans land in `BehaviorAnchor.advanced_plans`
+  and are gated behind a UI expander in `BehaviorAnchorCard.tsx` that
+  the operator must explicitly click to expand. The threshold is
+  defined in `global_config.yaml`'s new `trace:` section with
+  `CONFIG_FIELD_MAP` + `LIVE_RELOADABLE_FIELDS` plumbing per DEC-014 so
+  per-app overrides surface in Settings → Per-app overrides without a
+  schema migration. **Why the asymmetric default:** `medium` is the
+  ceiling at which the planner's deterministic risk-tier reasoning is
+  comfortable that an operator inspecting the Stage→Inject diff will
+  understand the blast radius; `high` plans need the explicit opt-in to
+  prevent an operator deep in chat-driven workflow from staging a
+  global `String.equals` hook on autopilot.
+- **Bypass injection still goes through the existing Hook Lab v1
+  Stage→Inject flow.** The `BypassPlanCard.tsx` "Stage in Manual Hooks"
+  button (10.7) populates `WorkbenchContext.pendingHookPrefill` with
+  the template id + parameter dict and switches the Lab tab to Manual
+  Hooks mode; from there the operator sees the *same*
+  `HookBuilder.tsx` form they would see for any other hook authored by
+  hand, complete with the rendered JS preview (Monaco read-only),
+  `pyjsparser` markers, deterministic pentester summary, and explicit
+  Stage / Inject buttons. **There is no "one-click bypass" affordance.**
+  An operator coming from Trace mode still has to (1) review the
+  prefilled parameters, (2) click Stage, (3) read the rendered JS +
+  pentester summary, (4) click Inject, and (5) confirm the
+  `hook_target_package_prefix` allowlist accepted the target package —
+  the consent flow DEC-023 + DEC-017 specified for hand-authored hooks
+  is bit-identical to the consent flow for Trace-authored ones.
+- **Per-anchor LLM budget is bounded.** `trace_behavior` runs **one**
+  LLM call per anchor with a populated `BehaviorAnchor` payload
+  (capped at the per-anchor token budget per DEC-022 `MAX_SKILLS_PER_TURN`
+  + per-skill timeout). Per-decision LLM calls are **explicitly
+  rejected** per DEC-024 — they would multiply the round-trip count by
+  ~5–10× per trace and burn the per-turn skill-output budget without
+  buying interpretation quality the per-anchor call doesn't already
+  provide. Closure walks are bounded by `trace.max_hops_default = 3`
+  (config-knobbed, hard-capped at `trace.max_hops_hard_cap = 6`) and a
+  hardcoded `MAX_TRACE_METHODS = 30` second cap that surfaces a
+  "trace truncated, narrow the entry method" affordance via
+  `TraceTruncatedBanner.tsx` rather than silently dropping methods.
+- **Trace cache storage follows the established per-app `<sha>` model.**
+  Anchors land in `apps/<app_id>/.decompiled/<sha>/trace.sqlite`
+  (schema_version 1; mirrors `call_graph.sqlite` / `rag.sqlite` /
+  decompile cache from DEC-016 / DEC-018 / DEC-023) so cache
+  invalidation follows the existing "drop-the-file" rule and inherits
+  §8 (logging/reporting) defaults — same single-user-local file
+  permissions as the rest of `apps/<app_id>/`. The cache stores
+  populated `BehaviorAnchor` JSON payloads keyed by
+  `(entry_method_smali_id, hops)`; **rationale strings authored by the
+  LLM are persisted as part of the payload** and are subject to
+  §12.4's "do not echo cached LLM output back to a fresh LLM round
+  without sanitisation" rule when the chat dock attaches a `trace`
+  attachment for the lab system prompt (10.8 — `androscan/web/chat.py`
+  `ATTACHMENT_BUDGETS["trace"] = 6_000` cap, `_renderTraceAttachment`
+  format in `LabTab.tsx` ensures the persisted rationale strings flow
+  through the same `sanitize_text` pipeline as RAG hits and frida
+  trace tails).
+- **Mirror → Trace cross-tab seeding is metadata-only.** The Inspect
+  tab's `BestBanner` "trace ↗" button (10.8) populates
+  `WorkbenchContext.pendingTraceEntry` with a Smali method-prefix
+  string derived from the `ResolutionCandidate`'s file path + method
+  name (`javaRelPathToSmaliMethodPrefix` in
+  `util/smaliClassToFile.ts`). The Trace mode form auto-fires the
+  trace **only** when the seeded prefix passes the
+  `looksLikeCompleteSmaliSignature` heuristic (matched closing `)` +
+  valid Smali return-type descriptor); otherwise the operator must
+  finish typing the descriptor before Trace will even hit the
+  read-only `trace_behavior` skill. The cross-tab plumbing carries no
+  device handles, no auth tokens, no LLM-generated payloads — purely
+  the operator's own intent expressed as a Smali signature prefix.
+- **What v1 explicitly does *not* ship (captured in `docs/KNOWN_ISSUES.md`
+  ISSUE-013 / ISSUE-014, deferred to v2 per DEC-024):**
+  inter-procedural backward slicing for predicate origin (intra-procedural
+  only — ISSUE-013, the largest known gap in v1's planner coverage);
+  per-overload predicate-origin precision on two-register comparisons
+  where neither operand is a method-call (ISSUE-014); cross-platform
+  `BehaviorAnchor` adapters (iOS / WebView / native binary — DEC-024's
+  platform-neutral data model holds the contract but only ships the
+  Smali implementation in v1); switch-case bypass plans (the planner
+  enumerates `packed-switch` / `sparse-switch` decision points in 10.1
+  but the planner in 10.4 only emits plans for binary-branching
+  predicates); per-app TTL on cached `BehaviorAnchor` rows ("drop the
+  file" stays the only invalidation mechanism in v1); auto-verify
+  bypass after injection (operator-driven verification only — re-tap
+  the anchor, observe the cyan Frida hits flow in). None of these are
+  missing *safety* features — they are scope choices that v2 may
+  reopen with the benefit of operator telemetry from real Trace mode
+  use.
+
 ---
 
 ## 13. Summary

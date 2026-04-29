@@ -27,6 +27,7 @@ const KIND_LABELS: Record<string, string> = {
   logcat: "Recent logcat",
   code: "Decompiled code",
   frida_summary: "Frida trace",
+  trace: "Behavior trace",
 };
 
 function prettyKey(key: string): string {

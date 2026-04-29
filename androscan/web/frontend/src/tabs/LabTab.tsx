@@ -31,6 +31,7 @@ import {
 import type { ChatAttachment } from "../types";
 import { useWorkbench, type LabMode } from "../context/WorkbenchContext";
 import { LabTraceMode } from "./LabTraceMode";
+import type { BehaviorAnchor } from "../api/trace";
 
 /**
  * Lab tab (formerly "Hook Lab"; renamed in Phase 10 sub-step 10.6).
@@ -116,6 +117,26 @@ const LAB_MODES: { id: LabMode; label: string; hint: string }[] = [
 export function LabTab() {
   const { appId, labMode, setLabMode } = useWorkbench();
 
+  // 10.8: track the active ``BehaviorAnchor`` from Trace mode so the
+  // Manual Hooks chat dock can fold it into a ``trace`` ``ChatAttachment``
+  // when the operator hops between modes inside a single anchor's
+  // investigation. Cleared on app change (handled inside ``LabTraceMode``)
+  // and on mode hop away from Trace + Manual Hooks; ``GraphMode`` keeps
+  // the value untouched so a quick Graph-mode side-trip doesn't lose
+  // the chat context the operator just built.
+  const [activeAnchor, setActiveAnchor] = useState<BehaviorAnchor | null>(null);
+  // ``LabTraceMode`` calls ``onActiveAnchorChange`` on a stable callback
+  // identity to avoid re-firing the effect on every state tick.
+  const handleActiveAnchorChange = useCallback(
+    (anchor: BehaviorAnchor | null) => setActiveAnchor(anchor),
+    [],
+  );
+  // Reset the cross-mode anchor reference on app change so a second
+  // project's chat dock never inherits the first one's trace context.
+  useEffect(() => {
+    setActiveAnchor(null);
+  }, [appId]);
+
   return (
     <div className="lab-tab-shell">
       <nav className="lab-mode-rail" role="tablist" aria-label="Lab mode">
@@ -134,8 +155,15 @@ export function LabTab() {
         ))}
       </nav>
       <div className="lab-mode-content">
-        {labMode === "trace" && <LabTraceMode appId={appId} />}
-        {labMode === "manual-hooks" && <ManualHooksMode />}
+        {labMode === "trace" && (
+          <LabTraceMode
+            appId={appId}
+            onActiveAnchorChange={handleActiveAnchorChange}
+          />
+        )}
+        {labMode === "manual-hooks" && (
+          <ManualHooksMode activeAnchor={activeAnchor} />
+        )}
         {labMode === "graph" && <GraphMode />}
       </div>
     </div>
@@ -172,7 +200,16 @@ function GraphMode() {
 // every mode hop).
 // ---------------------------------------------------------------------------
 
-function ManualHooksMode() {
+function ManualHooksMode({
+  activeAnchor,
+}: {
+  /** Phase 10 sub-step 10.8: the active ``BehaviorAnchor`` from Trace
+   *  mode (lifted into ``LabTab``). When non-null, the chat-attachment
+   *  builder folds it into a ``trace`` attachment so the operator can
+   *  ask the LLM about the gates the Trace pipeline classified
+   *  without leaving Manual Hooks mode. */
+  activeAnchor: BehaviorAnchor | null;
+}) {
   const { appId, dossier } = useWorkbench();
   const [selected, setSelected] = useState<SelectedNode | null>(null);
 
@@ -312,8 +349,17 @@ function ManualHooksMode() {
         activeSession,
         hooks: chatHooks,
         traceTail: chatTraceTail,
+        activeAnchor,
       }),
-    [appId, selected, selectedSource, activeSession, chatHooks, chatTraceTail],
+    [
+      appId,
+      selected,
+      selectedSource,
+      activeSession,
+      chatHooks,
+      chatTraceTail,
+      activeAnchor,
+    ],
   );
 
   // -------------------------------------------------------------------------
@@ -408,6 +454,7 @@ function ManualHooksMode() {
                   activeSession,
                   hooks: chatHooks,
                   traceTail: chatTraceTail,
+                  activeAnchor,
                 })}
                 onCollapse={() => chatRef.current?.collapse()}
               />
@@ -620,7 +667,120 @@ type BuildAttachmentsArgs = {
   activeSession: ActiveSession | null;
   hooks: HookStat[] | null;
   traceTail: TraceEvent[] | null;
+  /** 10.8: when non-null the attachment builder emits a ``trace``
+   *  ``ChatAttachment`` (entry method header + per-decision verdict
+   *  list + top-3 ranked bypass plans) capped at the same 6,000 chars
+   *  as the ``code`` attachment so the model can reason about gates
+   *  the operator just identified without leaving Manual Hooks mode. */
+  activeAnchor: BehaviorAnchor | null;
 };
+
+// Soft cap matching the backend ``ATTACHMENT_BUDGETS["trace"] == 6_000``.
+// Mirrors ``CHAT_CODE_BUDGET``; we trim client-side so the operator's
+// "show context" preview matches what the model actually sees.
+const CHAT_TRACE_BUDGET = 6_000;
+// We surface only the top-3 ranked (default-tier) bypass plans in the
+// chat attachment to keep the context budget honest. Operators who want
+// the full ranked list (incl. advanced higher-risk plans) read the
+// Trace mode UI directly.
+const CHAT_TRACE_TOP_PLANS = 3;
+// Per-decision summary lines fold into the same 6_000-char budget
+// alongside the entry header + plans; clipping further at this cap
+// prevents a 200-decision closure from monopolising the attachment
+// budget. Anything above this is replaced with a "+ N more decisions"
+// trailer.
+const CHAT_TRACE_MAX_DECISIONS = 40;
+
+function _renderMethodRefForChat(m: { class_name: string; method_name: string }): string {
+  return `${m.class_name}.${m.method_name}`;
+}
+
+function _renderTraceAttachment(anchor: BehaviorAnchor): string {
+  const entry = anchor.entry_method;
+  const parts: string[] = [];
+  parts.push(
+    `Entry method: ${_renderMethodRefForChat(entry)}` +
+      `(${entry.param_descriptors.join(", ")})${entry.return_descriptor}`,
+  );
+  parts.push(
+    `hops=${anchor.hops} · decisions=${anchor.decisions.length} · ` +
+      `plans=${anchor.plans.length} (+${anchor.advanced_plans.length} advanced)` +
+      (anchor.truncated ? " · TRUNCATED (cap hit)" : "") +
+      (anchor.incomplete ? " · INCOMPLETE (unresolved predicate origins)" : ""),
+  );
+  if (anchor.rationale && anchor.rationale.trim()) {
+    parts.push(`Rationale: ${anchor.rationale.trim()}`);
+  }
+
+  // Per-decision verdict list. One line per gate so the model can
+  // reference them by index without us shipping the full nested
+  // verdict / branch / origin structure.
+  parts.push("");
+  parts.push(`Decision timeline (${anchor.decisions.length}):`);
+  const lowConf = new Set(anchor.low_confidence_decision_indices);
+  const decisions = anchor.decisions.slice(0, CHAT_TRACE_MAX_DECISIONS);
+  decisions.forEach((d, i) => {
+    const verdicts =
+      d.branch_outcome?.verdicts
+        .map((v) => `${v.branch_label}=${v.verdict}(${v.score.toFixed(2)})`)
+        .join(", ") ?? "(unclassified)";
+    const origin =
+      d.predicate_origin?.kind === "method_call"
+        ? ` ← ${_renderMethodRefForChat(d.predicate_origin.method)}`
+        : d.predicate_origin?.kind === "field_read"
+        ? ` ← field ${d.predicate_origin.field.class_name}.${d.predicate_origin.field.field_name}`
+        : d.predicate_origin?.kind === "const"
+        ? ` ← const ${d.predicate_origin.value}`
+        : d.predicate_origin?.kind === "param"
+        ? ` ← param ${d.predicate_origin.register}`
+        : d.predicate_origin?.kind === "composite"
+        ? ` ← composite (${d.predicate_origin.reason})`
+        : "";
+    const flag = lowConf.has(i) ? " [LOW-CONF]" : "";
+    parts.push(
+      `  ${i + 1}. ${_renderMethodRefForChat(d.method)} @${d.instruction_index} ` +
+        `[${d.kind}] ${verdicts}${origin}${flag}`,
+    );
+  });
+  if (anchor.decisions.length > CHAT_TRACE_MAX_DECISIONS) {
+    parts.push(
+      `  + ${anchor.decisions.length - CHAT_TRACE_MAX_DECISIONS} more decision(s) ` +
+        "(truncated for chat budget)",
+    );
+  }
+
+  // Top-N default-tier plans only. Risk taxonomy is locked to
+  // {low, medium, high}; the operator-configurable threshold lives on
+  // the server (DEC-024 / 10.4) and decides the plans/advanced_plans
+  // split — we just take the first N from the default tier.
+  parts.push("");
+  parts.push(`Top ${CHAT_TRACE_TOP_PLANS} bypass plan(s):`);
+  if (anchor.plans.length === 0) {
+    parts.push("  (none synthesised at the configured risk threshold)");
+  } else {
+    anchor.plans.slice(0, CHAT_TRACE_TOP_PLANS).forEach((p, i) => {
+      const target = p.target_method
+        ? _renderMethodRefForChat(p.target_method)
+        : "(no target)";
+      const params = Object.entries(p.params)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(", ");
+      parts.push(
+        `  ${i + 1}. ${p.template_id} risk=${p.risk} → ${target}` +
+          (params ? `\n     params: ${params}` : "") +
+          (p.rationale ? `\n     rationale: ${p.rationale}` : ""),
+      );
+    });
+  }
+
+  let text = parts.join("\n");
+  if (text.length > CHAT_TRACE_BUDGET) {
+    text =
+      text.slice(0, CHAT_TRACE_BUDGET) +
+      `\n/* … truncated; full anchor is ${text.length} chars */`;
+  }
+  return text;
+}
 
 function buildHookChatAttachments({
   appId,
@@ -629,6 +789,7 @@ function buildHookChatAttachments({
   activeSession,
   hooks,
   traceTail,
+  activeAnchor,
 }: BuildAttachmentsArgs): ChatAttachment[] {
   const out: ChatAttachment[] = [];
 
@@ -658,6 +819,17 @@ function buildHookChatAttachments({
       kind: "code",
       name: selected.javaRelPath,
       text: trimmed,
+    });
+  }
+
+  if (activeAnchor) {
+    out.push({
+      kind: "trace",
+      name:
+        activeAnchor.entry_method.class_name +
+        "." +
+        activeAnchor.entry_method.method_name,
+      text: _renderTraceAttachment(activeAnchor),
     });
   }
 
@@ -698,6 +870,11 @@ type SummaryArgs = {
   activeSession: ActiveSession | null;
   hooks: HookStat[] | null;
   traceTail: TraceEvent[] | null;
+  /** 10.8: surfaces the active ``BehaviorAnchor`` from Trace mode in
+   *  the "show context" preview so the operator can tell at a glance
+   *  the chat will see the trace summary. ``null`` when no anchor is
+   *  loaded or the operator hasn't visited Trace mode yet. */
+  activeAnchor: BehaviorAnchor | null;
 };
 
 function buildHookChatContextSummary({
@@ -706,6 +883,7 @@ function buildHookChatContextSummary({
   activeSession,
   hooks,
   traceTail,
+  activeAnchor,
 }: SummaryArgs): string {
   const lines: string[] = [];
   if (selected) {
@@ -720,6 +898,24 @@ function buildHookChatContextSummary({
   } else {
     lines.push("Selected method: — (click a node in the call graph to seed the chat)");
     lines.push("Decompiled source: —");
+  }
+
+  lines.push("");
+  if (activeAnchor) {
+    const entry = activeAnchor.entry_method;
+    lines.push(
+      `Active behaviour trace: ${entry.class_name}.${entry.method_name} ` +
+        `· hops=${activeAnchor.hops} · ${activeAnchor.decisions.length} decision(s) · ` +
+        `${activeAnchor.plans.length} plan(s) (+${activeAnchor.advanced_plans.length} advanced)`,
+    );
+    lines.push(
+      `Trace attachment: included (capped at ${CHAT_TRACE_BUDGET} chars; ` +
+        `top ${CHAT_TRACE_TOP_PLANS} plans + first ${CHAT_TRACE_MAX_DECISIONS} decisions).`,
+    );
+  } else {
+    lines.push(
+      "Active behaviour trace: — (build a trace in Lab → Trace mode to attach it here).",
+    );
   }
 
   if (activeSession) {

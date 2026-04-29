@@ -28,11 +28,23 @@ import { ProjectsSidebar } from "../components/ProjectsSidebar";
 import { ScopedLogcat } from "../components/ScopedLogcat";
 import { useWorkbench } from "../context/WorkbenchContext";
 import type { ChatAttachment } from "../types";
+import {
+  javaRelPathToSmaliMethodPrefix,
+} from "../util/smaliClassToFile";
+import type { ResolutionCandidate } from "../api/inspect";
 
 const PENDING_POLL_MS = 4000;
 
 export function InspectTab() {
-  const { appId, dossier, pendingCodeNav, setPendingCodeNav } = useWorkbench();
+  const {
+    appId,
+    dossier,
+    pendingCodeNav,
+    setPendingCodeNav,
+    setPendingTraceEntry,
+    setLabMode,
+    setTab,
+  } = useWorkbench();
   const packageName = useMemo<string | null>(() => {
     const apk = (dossier as Record<string, unknown> | null)?.apk_info as
       | { package?: string }
@@ -170,6 +182,33 @@ export function InspectTab() {
       setScrollTarget(startLine);
       setHighlightRange([startLine, endLine]);
     });
+  };
+
+  // Cross-tab "Trace this behaviour" — the BestBanner button (Phase 10
+  // sub-step 10.8) hands us the fuser's pick. We turn it into a Smali
+  // entry-method *prefix* (the resolver doesn't carry per-overload
+  // descriptors, so we cap at ``Lcom/example/Foo;->methodName(`` when a
+  // method name is known, else ``Lcom/example/Foo;->``), seed the
+  // pending-trace primitive, flip Lab to Trace mode, and switch tabs.
+  // The Trace mode form prefills + surfaces a "Seeded from Inspect"
+  // pill so the operator can complete the descriptor list and fire
+  // Trace, all without losing the click context.
+  const handleTraceBehaviour = (best: ResolutionCandidate) => {
+    if (!appId) return;
+    const prefix = javaRelPathToSmaliMethodPrefix(best.file, best.method_name);
+    if (!prefix) return;
+    const fileSimple = best.file.split("/").pop() || best.file;
+    const sourceLabel =
+      best.method_name
+        ? `Inspect → ${fileSimple}#${best.method_name}`
+        : `Inspect → ${fileSimple}:${best.line}`;
+    setPendingTraceEntry({
+      appId,
+      entryPrefix: prefix,
+      sourceLabel,
+    });
+    setLabMode("trace");
+    setTab("lab");
   };
 
   const handleTap = async (x: number, y: number) => {
@@ -455,6 +494,7 @@ export function InspectTab() {
                   busy={mapBusy}
                   error={mapError}
                   onOpenInBrowser={handleOpenCandidateInBrowser}
+                  onTraceBehaviour={handleTraceBehaviour}
                 />
               </div>
 

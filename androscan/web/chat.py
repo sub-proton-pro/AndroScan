@@ -47,6 +47,14 @@ ATTACHMENT_BUDGETS: dict[str, int] = {
     "logcat": 2_000,
     "code": 6_000,
     "frida_summary": 4_000,
+    # Phase 10 sub-step 10.8: behaviour-trace summaries from the Lab
+    # tab's Trace mode (entry-method header + per-decision verdict
+    # list + top-3 ranked bypass plans). 6,000 chars matches the
+    # ``code`` budget — same shape (linear human-readable text), same
+    # ceiling, so the model treats them comparably for context
+    # crowding. Pre-trimmed client-side in ``LabTab.tsx`` so this is
+    # a defence-in-depth cap.
+    "trace": 6_000,
     "default": 2_000,
 }
 
@@ -161,8 +169,12 @@ _TAB_SYSTEM_PROMPTS: dict[str, str] = {
     ),
     "lab": (
         "You are a Frida instrumentation assistant. Suggest hooks based on the decompiled code and "
-        "frida-trace summary shown inside <context> blocks. Always present hooks as code blocks the "
-        "user must explicitly stage and confirm before running. Never claim to have executed anything."
+        "frida-trace summary shown inside <context> blocks. If a ``trace`` attachment is present, "
+        "treat its decision-timeline list as authoritative ground truth for which conditional "
+        "gates govern the entry method's behaviour, and prefer recommending bypass plans rooted "
+        "in those gates over speculation from the decompiled code alone. Always present hooks as "
+        "code blocks the user must explicitly stage and confirm before running. Never claim to "
+        "have executed anything."
     ),
 }
 

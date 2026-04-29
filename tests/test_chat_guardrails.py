@@ -239,3 +239,76 @@ def test_rate_limit_kicks_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert (code1, code2) == (200, 200)
     assert code3 == 429
     assert "retry_after_seconds" in resp3
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 sub-step 10.8 — ``trace`` attachment kind
+#
+# The Lab tab's Trace mode publishes the active ``BehaviorAnchor`` to the
+# Manual Hooks chat dock as a ``trace`` ``ChatAttachment``. The backend
+# gives that kind its own per-attachment budget (matching ``code`` at
+# 6,000 chars) and a dedicated chat-dock label. Pin both pieces so a
+# future copy-edit can't silently drop either back to the
+# ``ATTACHMENT_BUDGETS["default"]`` 2,000-char cap (which would clip
+# every realistic trace summary).
+
+
+def test_trace_attachment_has_dedicated_budget() -> None:
+    """``ATTACHMENT_BUDGETS["trace"]`` is set and matches the ``code``
+    budget — the trace summary is the same shape (linear human-readable
+    text) and gets the same ceiling so the model treats them
+    comparably for context crowding."""
+    assert chat_module.ATTACHMENT_BUDGETS["trace"] == 6_000
+    assert chat_module.ATTACHMENT_BUDGETS["trace"] == chat_module.ATTACHMENT_BUDGETS["code"]
+
+
+def test_trace_attachment_truncates_at_its_budget() -> None:
+    """A ``trace`` attachment larger than the budget (6,000 chars) is
+    truncated and reported in the trim list — the default 2,000-char
+    budget would clip every realistic anchor, so this guards against
+    the dictionary key going stale."""
+    body, trims = build_user_message(
+        "?",
+        [{"kind": "trace", "name": "MainActivity.onLogin", "text": "x" * 12_000}],
+    )
+    # The attachment was emitted (not dropped) — ``trace`` budget held.
+    assert '<context name="MainActivity.onLogin" kind="trace">' in body
+    assert "truncated" in body
+    # The trim report flags it as trimmed (not dropped).
+    trim = next((t for t in trims if t.get("kind") == "trace"), None)
+    assert trim is not None
+    assert trim.get("trimmed_to") is not None
+    # Budget headroom: ``truncate_for_budget`` reserves ~80 chars for
+    # the suffix, so the trimmed-to size is just under 6,000.
+    assert 5_500 <= trim["trimmed_to"] <= 6_000
+
+
+def test_trace_attachment_passes_through_below_budget() -> None:
+    """A modest trace summary (well under 6,000 chars) is wrapped in a
+    ``<context kind="trace">`` block verbatim — no truncation, no trim
+    report row."""
+    body, trims = build_user_message(
+        "?",
+        [
+            {
+                "kind": "trace",
+                "name": "Foo.bar",
+                "text": "Entry method: com.foo.Foo.bar()V\nhops=3 · decisions=2 · plans=1",
+            }
+        ],
+    )
+    assert '<context name="Foo.bar" kind="trace">' in body
+    assert "Entry method: com.foo.Foo.bar()V" in body
+    assert not any(t.get("kind") == "trace" for t in trims)
+
+
+def test_lab_system_prompt_mentions_trace_attachment() -> None:
+    """The Lab system prompt names the ``trace`` attachment so the
+    model treats its decision-timeline list as authoritative ground
+    truth for the gates governing the entry method (rather than re-
+    deriving them from the decompiled code alone). Pin so a future
+    prompt edit can't silently drop the Trace integration cue."""
+    prompt = chat_module.system_prompt_for("lab")
+    assert "trace" in prompt.lower()
+    # And the alias path returns the same prompt.
+    assert chat_module.system_prompt_for("hook") == prompt
