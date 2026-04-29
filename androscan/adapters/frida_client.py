@@ -548,28 +548,61 @@ class FridaClient:
     def attach(self, package: str, *, spawn: bool = False) -> FridaSession:
         """Attach to ``package``; optionally spawn it first.
 
-        ``spawn=True`` mirrors the ``frida -f`` flag: the device spawns
-        the process suspended, we attach, the caller loads scripts, and
-        then 4.5's UI code calls ``device.resume(pid)``. 4.3 doesn't yet
-        ship a UI for this; the path exists so 4.4 templates that need
-        instrumentation in the constructor can rely on it.
+        On Android, ``device.attach(<str>)`` resolves the string against
+        ``Process.name`` from ``device.enumerate_processes()`` — which is
+        the *friendly application label* (e.g. ``"WeakBank Low"``), NOT
+        the package id (e.g. ``"com.example.weakbank.low"``). The rest of
+        the workbench (Reports, Inspect, Hook Lab) speaks package ids
+        exclusively, so a naive ``device.attach(package)`` raises Frida's
+        cryptic ``unable to find process with name '<package>'`` even
+        when the app is in the foreground.
+
+        We resolve ``package`` → PID via :meth:`_resolve_running_pid`
+        first (whose primary path is ``device.enumerate_applications()``
+        — there ``Application.identifier`` IS the package id on Android)
+        and always attach by integer PID. This makes attach
+        version-stable across Frida releases and lets us surface a
+        clean "app is not running" error instead of the underlying
+        wire-protocol message.
+
+        ``spawn=True`` mirrors the ``frida -f`` flag: ``device.spawn``
+        accepts the package id directly on Android, returns a PID we
+        attach to immediately. The caller (e.g. 4.5's UI) is
+        responsible for the eventual ``device.resume(pid)`` so script
+        load can race the constructor. Spawn skips the running-PID
+        lookup entirely — by definition a freshly spawned process
+        won't be in ``enumerate_applications`` yet.
         """
         if not isinstance(package, str) or not package.strip():
             raise ValueError("package must be a non-empty string")
         device = self._ensure_device()
-        target: Any = package
         pid: int
         if spawn:
-            pid = int(device.spawn(package))
-            target = pid
+            try:
+                pid = int(device.spawn(package))
+            except Exception as e:
+                raise FridaUnavailableError(
+                    f"frida.spawn({package!r}) failed: {e}"
+                ) from e
+        else:
+            pid = self._resolve_running_pid(device, package)
+            if pid <= 0:
+                # Operator-actionable: launch the app or retry with
+                # spawn. We deliberately surface this as
+                # FridaUnavailableError so the route layer maps it to
+                # a 503 with the message verbatim — the UI shows the
+                # full hint instead of a generic "frida attach failed".
+                raise FridaUnavailableError(
+                    f"app {package!r} is not running on the device. "
+                    "Launch it on the device, or retry with the Spawn "
+                    "(cold-start) option enabled."
+                )
         try:
-            frida_session = device.attach(target)
+            frida_session = device.attach(pid)
         except Exception as e:
-            raise FridaUnavailableError(f"frida.attach({package!r}) failed: {e}") from e
-        # Resolve the actual pid (Frida exposes either ``session.pid`` or
-        # nothing depending on version; fall back to whatever target was).
-        if not spawn:
-            pid = int(getattr(frida_session, "pid", 0) or 0)
+            raise FridaUnavailableError(
+                f"frida.attach(pid={pid}, package={package!r}) failed: {e}"
+            ) from e
         session = FridaSession(
             client=self,
             package=package,
@@ -580,6 +613,61 @@ class FridaClient:
         with self._lock:
             self._sessions[session.session_id] = session
         return session
+
+    def _resolve_running_pid(self, device: Any, package: str) -> int:
+        """Look up the running PID for ``package``; ``0`` if not found.
+
+        Two-stage resolution, both wrapped in broad exception handlers
+        because the underlying Frida APIs have known version drift
+        (``enumerate_applications`` only landed for non-mobile targets
+        in newer releases; older device handles raise on the call):
+
+        1. ``device.enumerate_applications()`` — canonical Android
+           path. ``Application.identifier`` is the package id;
+           ``Application.pid`` is ``0`` for installed-but-not-running
+           apps. We pick the first match whose PID is positive. This
+           is also where multi-process apps surface cleanly, since
+           each process gets its own ``Application`` row in newer
+           Frida releases.
+        2. ``device.enumerate_processes()`` — fallback for non-Android
+           targets (Linux, jailbroken iOS) where ``identifier``
+           mapping isn't available, or for unusual Android setups
+           where the process happens to be named with the package id
+           (some custom ROMs).
+
+        Returns ``0`` (not raising) when neither layer finds a running
+        match, so :meth:`attach` can produce a single canonical error
+        with the full package id in the message.
+        """
+        try:
+            apps = device.enumerate_applications()
+        except Exception as e:
+            logger.debug(
+                "FridaClient: enumerate_applications failed for %s: %s",
+                package, e,
+            )
+            apps = []
+        for app in apps:
+            identifier = getattr(app, "identifier", None)
+            app_pid = int(getattr(app, "pid", 0) or 0)
+            if identifier == package and app_pid > 0:
+                return app_pid
+
+        try:
+            procs = device.enumerate_processes()
+        except Exception as e:
+            logger.debug(
+                "FridaClient: enumerate_processes failed for %s: %s",
+                package, e,
+            )
+            procs = []
+        for proc in procs:
+            name = getattr(proc, "name", None)
+            proc_pid = int(getattr(proc, "pid", 0) or 0)
+            if name == package and proc_pid > 0:
+                return proc_pid
+
+        return 0
 
     def get_session(self, session_id: str) -> Optional[FridaSession]:
         with self._lock:

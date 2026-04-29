@@ -71,9 +71,57 @@ class _StubSession:
         pass
 
 
+class _MatchAnyStr(str):
+    """Sentinel string equal to any other string.
+
+    Lets the stub device's ``enumerate_applications`` synthesize a
+    wildcard ``Application`` row that matches whatever package id the
+    Hook Lab routes pass to ``FridaClient.attach``. Without this, the
+    PID-based attach path (``FridaClient._resolve_running_pid``) would
+    fall through to "app not running" for every route test.
+    """
+
+    def __new__(cls) -> "_MatchAnyStr":
+        return super().__new__(cls, "*any*")
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, str)
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash("*any*")
+
+
+class _StubApplication:
+    """Subset of ``frida.core.Application`` the adapter reads."""
+
+    def __init__(self, identifier: Any, name: Any, pid: int) -> None:
+        self.identifier = identifier
+        self.name = name
+        self.pid = pid
+
+
 class _StubDevice:
     def __init__(self) -> None:
         self._next_pid = 4321
+
+    def enumerate_applications(self) -> list[_StubApplication]:
+        # Pretend every package id the routes ask about is running
+        # with the same PID we'd hand out via spawn — keeps the
+        # existing "session.pid == 4321 / 4322 / ..." assertions
+        # downstream consistent.
+        return [
+            _StubApplication(
+                identifier=_MatchAnyStr(),
+                name=_MatchAnyStr(),
+                pid=self._next_pid,
+            )
+        ]
+
+    def enumerate_processes(self) -> list[Any]:
+        return []
 
     def attach(self, target: Any) -> _StubSession:
         return _StubSession(target if isinstance(target, int) else self._next_pid)

@@ -70,11 +70,85 @@ class _StubSession:
         self.detached = True
 
 
+class _StubApplication:
+    """Mirrors ``frida.core.Application`` (subset the adapter reads)."""
+
+    def __init__(self, identifier: Any, name: Any, pid: int) -> None:
+        self.identifier = identifier
+        self.name = name
+        self.pid = pid
+
+
+class _StubProcess:
+    """Mirrors ``frida.core.Process`` (subset the adapter reads)."""
+
+    def __init__(self, name: Any, pid: int) -> None:
+        self.name = name
+        self.pid = pid
+
+
+class _MatchAnyStr(str):
+    """Sentinel string that compares equal to any other string.
+
+    Lets the stub device synthesize a wildcard ``Application`` for
+    every package the client attaches to, so the bulk of the test
+    suite (which doesn't care about resolution semantics, only that
+    attach succeeds) doesn't have to pre-populate per-test ``apps``
+    lists. Tests that exercise the resolution logic itself (running
+    vs not-running, identifier vs process-name fallback) override
+    ``apps_override`` / ``processes_override`` explicitly.
+    """
+
+    def __new__(cls) -> "_MatchAnyStr":
+        return super().__new__(cls, "*any*")
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, str)
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash("*any*")
+
+
+# Default PID returned by the stub's wildcard Application — matches
+# the historical ``_next_pid`` seed so existing assertions stay valid.
+_DEFAULT_RUNNING_PID = 1234
+
+
 class _StubDevice:
     def __init__(self) -> None:
         self.attach_calls: list[Any] = []
         self.spawn_calls: list[str] = []
-        self._next_pid = 1234
+        self.enumerate_apps_calls = 0
+        self.enumerate_procs_calls = 0
+        self._next_pid = _DEFAULT_RUNNING_PID
+        # When ``None``, ``enumerate_applications`` returns a single
+        # wildcard entry that resolves any package id to
+        # ``_DEFAULT_RUNNING_PID``. Tests can set this to an explicit
+        # list to simulate a particular device snapshot — including
+        # ``[]`` for "app not running on the device".
+        self.apps_override: Optional[list[_StubApplication]] = None
+        self.processes_override: Optional[list[_StubProcess]] = None
+
+    def enumerate_applications(self) -> list[_StubApplication]:
+        self.enumerate_apps_calls += 1
+        if self.apps_override is not None:
+            return list(self.apps_override)
+        return [
+            _StubApplication(
+                identifier=_MatchAnyStr(),
+                name=_MatchAnyStr(),
+                pid=_DEFAULT_RUNNING_PID,
+            )
+        ]
+
+    def enumerate_processes(self) -> list[_StubProcess]:
+        self.enumerate_procs_calls += 1
+        if self.processes_override is not None:
+            return list(self.processes_override)
+        return []
 
     def attach(self, target: Any) -> _StubSession:
         self.attach_calls.append(target)
@@ -162,11 +236,16 @@ def test_attach_returns_session_with_pid_and_package(stub_frida: _StubFridaModul
     client = fc.FridaClient(ring_size=200)
     session = client.attach("com.example.target")
     assert session.package == "com.example.target"
-    assert session.pid == 1234
+    assert session.pid == _DEFAULT_RUNNING_PID
     assert session.session_id  # opaque, but non-empty
     assert client.list_sessions() == [session]
     assert client.get_session(session.session_id) is session
-    assert stub_frida.device.attach_calls == ["com.example.target"]
+    # ATTACH-BY-PID: the client now resolves the package id to a
+    # running PID via ``enumerate_applications`` and attaches by
+    # integer. See FridaClient.attach docstring for why (Android
+    # string-attach matches Process.name, not Application.identifier).
+    assert stub_frida.device.attach_calls == [_DEFAULT_RUNNING_PID]
+    assert stub_frida.device.enumerate_apps_calls == 1
 
 
 def test_attach_with_spawn_uses_pid_target(stub_frida: _StubFridaModule) -> None:
@@ -176,6 +255,9 @@ def test_attach_with_spawn_uses_pid_target(stub_frida: _StubFridaModule) -> None
     # spawn() bumped to 1235; attach was called with that pid.
     assert stub_frida.device.attach_calls == [1235]
     assert session.pid == 1235
+    # Spawn skips the running-PID lookup — by definition a freshly
+    # spawned process isn't in enumerate_applications yet.
+    assert stub_frida.device.enumerate_apps_calls == 0
 
 
 def test_attach_rejects_blank_package(stub_frida: _StubFridaModule) -> None:
@@ -184,6 +266,173 @@ def test_attach_rejects_blank_package(stub_frida: _StubFridaModule) -> None:
         client.attach("")
     with pytest.raises(ValueError):
         client.attach("   ")
+
+
+# ---- Resolution paths exercised by the Hook Lab Inject button ------
+#
+# These reproduce the exact scenario reported on Apr 29: the WeakBank
+# app is in the foreground on an emulator, ``frida-ps -Uai`` shows
+# ``2167  WeakBank Low  com.example.weakbank.low``, and the workbench
+# was naively passing the package id (``com.example.weakbank.low``)
+# straight to ``device.attach`` — which on Android matches the
+# Process.name column, finds nothing, and raises. The fix resolves
+# package id → PID via ``enumerate_applications`` first.
+
+
+def test_attach_resolves_package_id_via_enumerate_applications(
+    stub_frida: _StubFridaModule,
+) -> None:
+    """Android happy path: package id maps to a running PID via
+    ``Application.identifier``; we attach by PID, never by name."""
+    stub_frida.device.apps_override = [
+        _StubApplication(identifier="com.other.app", name="Other", pid=999),
+        _StubApplication(
+            identifier="com.example.weakbank.low",
+            name="WeakBank Low",
+            pid=2167,
+        ),
+        _StubApplication(
+            identifier="com.installed.but.dead",
+            name="Dead",
+            pid=0,
+        ),
+    ]
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example.weakbank.low")
+    assert session.pid == 2167
+    assert session.package == "com.example.weakbank.low"
+    assert stub_frida.device.attach_calls == [2167]
+
+
+def test_attach_falls_back_to_enumerate_processes_when_app_missing(
+    stub_frida: _StubFridaModule,
+) -> None:
+    """Non-Android target (or unusual setup) where the entry isn't in
+    ``enumerate_applications`` but a process with that exact name is
+    in ``enumerate_processes``."""
+    stub_frida.device.apps_override = []
+    stub_frida.device.processes_override = [
+        _StubProcess(name="systemd", pid=1),
+        _StubProcess(name="my-binary", pid=4321),
+    ]
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("my-binary")
+    assert session.pid == 4321
+    assert stub_frida.device.attach_calls == [4321]
+
+
+def test_attach_skips_zero_pid_applications(
+    stub_frida: _StubFridaModule,
+) -> None:
+    """An installed-but-not-running app surfaces as ``pid == 0`` in
+    ``enumerate_applications``; we must not treat that as 'running'
+    and we must continue to ``enumerate_processes`` (and ultimately
+    the friendly 'not running' error if neither layer has it)."""
+    stub_frida.device.apps_override = [
+        _StubApplication(
+            identifier="com.example.weakbank.low",
+            name="WeakBank Low",
+            pid=0,
+        ),
+    ]
+    stub_frida.device.processes_override = []
+    client = fc.FridaClient(ring_size=200)
+    with pytest.raises(fc.FridaUnavailableError) as excinfo:
+        client.attach("com.example.weakbank.low")
+    msg = str(excinfo.value)
+    assert "com.example.weakbank.low" in msg
+    assert "not running" in msg
+    assert "Spawn" in msg  # operator hint to retry with cold-start
+    assert stub_frida.device.attach_calls == []
+
+
+def test_attach_raises_friendly_error_when_app_not_running(
+    stub_frida: _StubFridaModule,
+) -> None:
+    """Both resolution layers come up empty → operator-actionable
+    ``FridaUnavailableError`` (mapped to 503 by the route layer)."""
+    stub_frida.device.apps_override = []
+    stub_frida.device.processes_override = []
+    client = fc.FridaClient(ring_size=200)
+    with pytest.raises(fc.FridaUnavailableError) as excinfo:
+        client.attach("com.example.weakbank.low")
+    msg = str(excinfo.value)
+    assert "com.example.weakbank.low" in msg
+    assert "not running" in msg
+    # Frida.attach was NOT called — we caught it before talking to
+    # the device, so the 503 gets emitted with a clean message
+    # instead of the cryptic "unable to find process with name '...'".
+    assert stub_frida.device.attach_calls == []
+
+
+def test_attach_swallows_enumerate_applications_exceptions(
+    stub_frida: _StubFridaModule,
+) -> None:
+    """Old Frida builds may not implement ``enumerate_applications``
+    on a USB device handle (or it raises for a non-Android target);
+    the resolver degrades to ``enumerate_processes`` rather than
+    bubbling up an attach failure."""
+
+    def _boom() -> Any:
+        raise AttributeError("ancient frida-server")
+
+    stub_frida.device.enumerate_applications = _boom  # type: ignore[assignment]
+    stub_frida.device.processes_override = [
+        _StubProcess(name="com.example.weakbank.low", pid=2167),
+    ]
+    client = fc.FridaClient(ring_size=200)
+    session = client.attach("com.example.weakbank.low")
+    assert session.pid == 2167
+    assert stub_frida.device.attach_calls == [2167]
+
+
+def test_attach_wraps_device_attach_failure(
+    stub_frida: _StubFridaModule,
+) -> None:
+    """If the resolver finds a PID but ``device.attach(pid)`` itself
+    raises (e.g. ``frida-server`` died between enumerate and attach),
+    we still surface a ``FridaUnavailableError`` with both the PID
+    and the package id so the operator has enough context to
+    diagnose without grepping logs."""
+    stub_frida.device.apps_override = [
+        _StubApplication(
+            identifier="com.example.weakbank.low",
+            name="WeakBank Low",
+            pid=2167,
+        ),
+    ]
+
+    def _boom(_target: Any) -> _StubSession:
+        raise RuntimeError("frida-server dropped the connection")
+
+    stub_frida.device.attach = _boom  # type: ignore[assignment]
+    client = fc.FridaClient(ring_size=200)
+    with pytest.raises(fc.FridaUnavailableError) as excinfo:
+        client.attach("com.example.weakbank.low")
+    msg = str(excinfo.value)
+    assert "pid=2167" in msg
+    assert "com.example.weakbank.low" in msg
+    assert "frida-server dropped the connection" in msg
+
+
+def test_attach_with_spawn_wraps_spawn_failure(
+    stub_frida: _StubFridaModule,
+) -> None:
+    """Spawn-path failures (e.g. package not installed, signature
+    mismatch) get the same FridaUnavailableError wrapping treatment
+    as the running-attach failures, so the route's exception ladder
+    can map both to 503 with a clean message."""
+
+    def _boom(_pkg: str) -> int:
+        raise RuntimeError("unable to find application with identifier")
+
+    stub_frida.device.spawn = _boom  # type: ignore[assignment]
+    client = fc.FridaClient(ring_size=200)
+    with pytest.raises(fc.FridaUnavailableError) as excinfo:
+        client.attach("com.example.does.not.exist", spawn=True)
+    msg = str(excinfo.value)
+    assert "frida.spawn" in msg
+    assert "com.example.does.not.exist" in msg
 
 
 def test_detach_removes_session_and_unloads_scripts(
