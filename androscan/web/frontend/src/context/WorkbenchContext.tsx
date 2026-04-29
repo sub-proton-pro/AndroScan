@@ -27,6 +27,26 @@ const TABS: TabId[] = ["reports", "inspect", "lab", "settings"];
 // share / copy of the URL hands out the canonical id.
 const _LEGACY_TAB_REDIRECTS: Readonly<Record<string, TabId>> = { hook: "lab" };
 
+// Phase 10 sub-step 10.7: the Lab tab hosts three modes (Trace / Manual
+// Hooks / Graph) selectable from a left-edge rail. Mode state lives on
+// the workbench so cross-tab actions (10.8's Mirror "Trace this
+// behaviour" button) and intra-tab actions (10.7's BypassPlanCard
+// "Stage in Manual Hooks") can flip the mode programmatically without
+// having to drill imperative refs through the LabTab tree.
+export type LabMode = "trace" | "manual-hooks" | "graph";
+const LAB_MODE_STORAGE_KEY = "androscan.lab.mode";
+const DEFAULT_LAB_MODE: LabMode = "trace";
+
+function loadStoredLabMode(): LabMode {
+  try {
+    const raw = window.localStorage.getItem(LAB_MODE_STORAGE_KEY);
+    if (raw === "trace" || raw === "manual-hooks" || raw === "graph") return raw;
+  } catch {
+    // Privacy mode / disabled storage — fall through to default.
+  }
+  return DEFAULT_LAB_MODE;
+}
+
 function tabFromHash(): TabId {
   const raw = window.location.hash.replace(/^#\/?/, "");
   if (raw in _LEGACY_TAB_REDIRECTS) {
@@ -75,6 +95,23 @@ type WorkbenchState = {
   pendingCodeNav: PendingCodeNav | null;
   setPendingCodeNav: (n: PendingCodeNavInput | null) => void;
 
+  // Phase 10 sub-step 10.7: the active mode inside the Lab tab. Lifted
+  // out of LabTab.tsx so callers in Trace mode (BypassPlanCard's "Stage
+  // in Manual Hooks" button) and the Mirror tab (10.8's "Trace this
+  // behaviour" button) can flip the mode programmatically.
+  labMode: LabMode;
+  setLabMode: (m: LabMode) => void;
+
+  // Phase 10 sub-step 10.7: cross-mode "stage this Frida hook" intent.
+  // BypassPlanCard writes here from Trace mode (and flips ``labMode`` to
+  // ``"manual-hooks"`` so the operator lands in HookBuilder); the
+  // HookBuilder reads on mount / change and clears via
+  // ``setPendingHookPrefill(null)``. ``ts`` forces re-fire when the same
+  // template+params are staged twice in a row (operator clicks Stage,
+  // edits, clicks again).
+  pendingHookPrefill: PendingHookPrefill | null;
+  setPendingHookPrefill: (p: PendingHookPrefillInput | null) => void;
+
   // per-tab chat history (persisted client-side)
   chats: Record<TabId, ChatMessage[]>;
   appendChat: (tab: TabId, msg: ChatMessage) => void;
@@ -95,6 +132,20 @@ export type PendingCodeNavInput = {
 
 export type PendingCodeNav = PendingCodeNavInput & { ts: number };
 
+export type PendingHookPrefillInput = {
+  appId: string;
+  templateId: string;
+  params: Record<string, string>;
+  /** Optional human-readable label shown on the HookBuilder header so
+   *  the operator can tell at a glance that the form was populated by
+   *  an external source rather than typed in by hand (e.g. "Trace plan:
+   *  isPremiumUser"). Cleared the moment the operator picks a different
+   *  template or edits the form. */
+  sourceLabel?: string | null;
+};
+
+export type PendingHookPrefill = PendingHookPrefillInput & { ts: number };
+
 const WorkbenchContext = createContext<WorkbenchState | null>(null);
 
 export function WorkbenchProvider({ children }: { children: ReactNode }) {
@@ -110,6 +161,9 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState("");
   const [pendingCodeNav, setPendingCodeNavState] =
     useState<PendingCodeNav | null>(null);
+  const [pendingHookPrefill, setPendingHookPrefillState] =
+    useState<PendingHookPrefill | null>(null);
+  const [labMode, setLabModeState] = useState<LabMode>(() => loadStoredLabMode());
   const [chats, setChats] = useState<Record<TabId, ChatMessage[]>>({
     reports: [],
     inspect: [],
@@ -246,6 +300,23 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const setPendingHookPrefill = useCallback(
+    (p: PendingHookPrefillInput | null) => {
+      setPendingHookPrefillState(p ? { ...p, ts: Date.now() } : null);
+    },
+    [],
+  );
+
+  const setLabMode = useCallback((m: LabMode) => {
+    setLabModeState(m);
+    try {
+      window.localStorage.setItem(LAB_MODE_STORAGE_KEY, m);
+    } catch {
+      // Privacy mode / quota exceeded — operator's choice doesn't
+      // survive a reload but the runtime UI still tracks it.
+    }
+  }, []);
+
   const value = useMemo<WorkbenchState>(
     () => ({
       tab,
@@ -266,6 +337,10 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setStatus,
       pendingCodeNav,
       setPendingCodeNav,
+      labMode,
+      setLabMode,
+      pendingHookPrefill,
+      setPendingHookPrefill,
       chats,
       appendChat,
       updateChat,
@@ -287,6 +362,10 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       status,
       pendingCodeNav,
       setPendingCodeNav,
+      labMode,
+      setLabMode,
+      pendingHookPrefill,
+      setPendingHookPrefill,
       chats,
       appendChat,
       updateChat,

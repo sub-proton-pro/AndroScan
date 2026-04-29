@@ -43,6 +43,7 @@ import {
   type ParseInfo,
   type RenderResult,
 } from "../api/frida";
+import { useWorkbench } from "../context/WorkbenchContext";
 import { IconChevronDown, IconChevronUp } from "./Icons";
 
 // Note on Monaco asset loading: ``@monaco-editor/react``'s default
@@ -105,6 +106,60 @@ export function HookBuilder({
   const [injectError, setInjectError] = useState<string | null>(null);
   const [persist, setPersist] = useState(true);
 
+  // Phase 10 sub-step 10.7: when a Trace mode ``BypassPlanCard``
+  // clicks "Stage in Manual Hooks" we land here with a populated
+  // form. Surfacing the source label as a small pill on the header
+  // lets the operator tell at a glance that the form was populated
+  // by an external source rather than typed by hand. Cleared the
+  // moment the operator picks a different template or edits a param.
+  const [stagedSourceLabel, setStagedSourceLabel] = useState<string | null>(null);
+
+  // ---- 1a. Consume cross-mode pendingHookPrefill -------------------------
+  // BypassPlanCard writes a prefill into context (template id + params
+  // dict + source label) and flips ``labMode`` to ``manual-hooks``;
+  // we consume it on mount/change, hydrate the form, and clear via
+  // ``setPendingHookPrefill(null)``. The clear-on-consume rule mirrors
+  // ``pendingCodeNav`` so a stage→edit→stage-again sequence reliably
+  // re-applies the prefill.
+  //
+  // The ref-based handoff is needed because changing
+  // ``selectedTemplateId`` re-fires the template-change effect below,
+  // which rebuilds ``paramValues`` from the template's declared
+  // defaults — that would clobber the staged values. We stash the
+  // staged params in a ref *before* setting the template id; the
+  // template-change effect drains the ref into the rebuilt param dict
+  // (overlaying staged values on top of declared defaults) and clears
+  // the ref so subsequent unrelated template changes start clean.
+  const { pendingHookPrefill, setPendingHookPrefill } = useWorkbench();
+  const stagedParamsRef = useRef<Record<string, string> | null>(null);
+  useEffect(() => {
+    if (!pendingHookPrefill) return;
+    if (pendingHookPrefill.appId && appId && pendingHookPrefill.appId !== appId) {
+      // Stage was for a different app — drop it rather than clobber the
+      // current form. Shouldn't happen in practice (Trace mode shows
+      // the same appId) but defensive.
+      setPendingHookPrefill(null);
+      return;
+    }
+    stagedParamsRef.current = { ...pendingHookPrefill.params };
+    setStagedSourceLabel(pendingHookPrefill.sourceLabel ?? null);
+    setRender(null);
+    setRenderError(null);
+    if (pendingHookPrefill.templateId !== selectedTemplateId) {
+      // Template-change effect will pick up stagedParamsRef.
+      setSelectedTemplateId(pendingHookPrefill.templateId);
+    } else {
+      // Same template — apply the staged params directly since the
+      // template-change effect won't fire.
+      setParamValues((prev) => ({ ...prev, ...stagedParamsRef.current }));
+      stagedParamsRef.current = null;
+    }
+    setPendingHookPrefill(null);
+    // ``selectedTemplateId`` excluded from deps — including it would
+    // re-fire the consumer on every template pick.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingHookPrefill, appId, setPendingHookPrefill]);
+
   // ---- 1. Fetch template catalog on mount -------------------------------
 
   useEffect(() => {
@@ -135,10 +190,19 @@ export function HookBuilder({
   }, [templates, selectedTemplateId]);
 
   // Reset / re-seed param values whenever the template changes. We
-  // honour two prefill sources: (a) the param's declared default,
-  // (b) ``class_name`` / ``method_name`` from the selected graph node.
-  // The graph-node prefill always wins so picking a node in the call
-  // graph re-targets the form even after the operator typed something.
+  // honour three prefill sources, applied in increasing priority:
+  //
+  //   1. the param's declared default (lowest),
+  //   2. ``class_name`` / ``method_name`` from the selected graph node,
+  //   3. staged params from a Trace mode "Stage in Manual Hooks"
+  //      (highest — overrides everything because the operator
+  //      explicitly chose this plan).
+  //
+  // The graph-node prefill wins over declared defaults so picking a
+  // node in the call graph re-targets the form even after the
+  // operator typed something. Staged params win over the graph
+  // prefill so Trace plans that target a *different* method than the
+  // currently-selected graph node still land correctly.
   useEffect(() => {
     if (!selectedTemplate) {
       setParamValues({});
@@ -161,8 +225,15 @@ export function HookBuilder({
         : `${selectedTemplate.id}_trace`;
       next["event_label"] = label;
     }
+    // Drain staged params from Trace mode (overrides everything).
+    const staged = stagedParamsRef.current;
+    if (staged) {
+      for (const [k, v] of Object.entries(staged)) {
+        next[k] = v;
+      }
+      stagedParamsRef.current = null;
+    }
     setParamValues(next);
-    // Trigger a fresh render against the seeded values.
     setRender(null);
     setRenderError(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -222,6 +293,9 @@ export function HookBuilder({
 
   const onParamChange = useCallback((name: string, value: string) => {
     setParamValues((prev) => ({ ...prev, [name]: value }));
+    // Operator-edited the form — drop the "Staged from Trace" pill so
+    // the badge doesn't lie about the form's provenance.
+    setStagedSourceLabel(null);
   }, []);
 
   const onSubmit = useCallback(
@@ -302,6 +376,14 @@ export function HookBuilder({
           </button>
         )}
         <h2>Hook Builder</h2>
+        {!collapsed && stagedSourceLabel && (
+          <span
+            className="hookbuilder-staged-pill"
+            title="This form was populated from a Trace mode bypass plan. Edit any field or pick a different template to dismiss this badge."
+          >
+            {stagedSourceLabel}
+          </span>
+        )}
         {!collapsed && (
           <span className="muted small">{PANEL_DESCRIPTION}</span>
         )}
@@ -321,7 +403,10 @@ export function HookBuilder({
           <select
             className="hookbuilder-select"
             value={selectedTemplateId ?? ""}
-            onChange={(e) => setSelectedTemplateId(e.target.value || null)}
+            onChange={(e) => {
+              setSelectedTemplateId(e.target.value || null);
+              setStagedSourceLabel(null);
+            }}
             disabled={!templates || templates.length === 0}
           >
             {!templates && <option value="">loading…</option>}

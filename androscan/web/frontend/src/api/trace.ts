@@ -7,15 +7,21 @@
  * ``androscan.internal.trace_cache.anchor_to_json`` (i.e.
  * ``dataclasses.asdict(anchor)`` with stable key ordering). 10.7's
  * ``BehaviorAnchorCard`` / ``DecisionTimeline`` / ``BypassPlanCard``
- * will treat the response as the structural truth.
+ * consume that shape via the typed surface below.
  *
- * The four functions below mirror the four route shapes — kept thin
+ * The four pure functions mirror the four route shapes — kept thin
  * on purpose so per-component callers can compose them without re-
  * implementing the URL layout. Errors are normalised to a discriminated
  * union (``{ ok: true, ... } | { ok: false, error }``) so callers don't
  * have to remember whether they're dealing with a network error vs an
  * HTTP 4xx vs an HTTP 5xx.
+ *
+ * 10.7 adds the typed ``DecisionPoint`` / ``BypassPlan`` /
+ * ``PredicateOrigin`` shapes plus the ``useTraceAnchor`` React hook
+ * that owns the GET-then-fall-back-to-POST lifecycle for the Trace
+ * mode UI.
  */
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export type TraceCacheStatus = {
   status: "missing" | "ready" | "failed";
@@ -41,28 +47,99 @@ export type TraceAnchorRow = {
   created_at: number;
 };
 
+// ---------------------------------------------------------------------------
+// Typed mirrors of the Python data model (androscan/analysis/trace_types.py).
+// Field names match ``dataclasses.asdict`` output verbatim — the wire format
+// is locked by ``trace_cache.anchor_to_json`` (sort_keys=True).
+
+export type MethodRef = {
+  class_name: string;
+  method_name: string;
+  param_descriptors: string[];
+  return_descriptor: string;
+};
+
+export type FieldRef = {
+  class_name: string;
+  field_name: string;
+  type_descriptor: string;
+};
+
+/**
+ * Discriminated union for predicate origin (10.2's slicer output). The
+ * ``kind`` discriminator is JSON-stable per the Python encoder.
+ */
+export type PredicateOrigin =
+  | { kind: "method_call"; method: MethodRef; invoke_kind: string }
+  | { kind: "field_read"; field: FieldRef; is_static: boolean }
+  | { kind: "const"; value: string; smali_op: string }
+  | { kind: "param"; register: string }
+  | { kind: "composite"; reason: string };
+
+export type Branch = {
+  label: string;
+  /** ``null`` means fall-through to the next instruction. */
+  target_label: string | null;
+};
+
+export type BranchVerdict = {
+  branch_label: string;
+  /** ``"deny" | "allow" | "neutral"`` per 10.3's classifier contract. */
+  verdict: string;
+  /** Signed score; negative = deny pressure, positive = allow pressure. */
+  score: number;
+  reasons: string[];
+};
+
+export type BranchOutcome = {
+  verdicts: BranchVerdict[];
+  /** ``[0.0, 1.0]``; gates with confidence < 0.6 were flagged for LLM
+   *  re-classification by the 10.5 ``trace_behavior`` skill. */
+  confidence: number;
+  reasons: string[];
+};
+
+export type DecisionKind =
+  | "if_eq" | "if_ne" | "if_lt" | "if_le" | "if_gt" | "if_ge"
+  | "if_eqz" | "if_nez" | "if_ltz" | "if_lez" | "if_gtz" | "if_gez"
+  | "packed_switch" | "sparse_switch";
+
+export type DecisionPoint = {
+  method: MethodRef;
+  instruction_index: number;
+  source_line: number | null;
+  kind: DecisionKind;
+  predicate_registers: string[];
+  branches: Branch[];
+  predicate_origin: PredicateOrigin | null;
+  branch_outcome: BranchOutcome | null;
+};
+
+export type BypassPlan = {
+  template_id: string;
+  params: Record<string, string>;
+  rationale: string;
+  /** ``"low" | "medium" | "high"`` per 10.4's locked taxonomy. */
+  risk: string;
+  risks: string[];
+  target_method: MethodRef | null;
+  source_decision_method: MethodRef | null;
+  source_decision_instruction_index: number | null;
+};
+
 /**
  * The canonical ``BehaviorAnchor`` JSON shape (mirrors
- * ``androscan/analysis/trace_types.py::BehaviorAnchor``).
- *
- * Loose typing on inner fields (``decisions`` / ``plans``) for now —
- * 10.7 will tighten these once ``DecisionTimeline`` / ``BypassPlanCard``
- * start consuming them. The shape is locked at the wire level, so
- * tightening here is purely a TypeScript exercise.
+ * ``androscan/analysis/trace_types.py::BehaviorAnchor``). Locked field
+ * names per ``dataclasses.asdict``; new optional fields are additive.
  */
 export type BehaviorAnchor = {
-  entry_method: {
-    class_name: string;
-    method_name: string;
-    param_descriptors: string[];
-    return_descriptor: string;
-  };
+  entry_method: MethodRef;
   hops: number;
   truncated: boolean;
   incomplete: boolean;
-  decisions: unknown[];
-  plans: unknown[];
-  advanced_plans: unknown[];
+  decisions: DecisionPoint[];
+  plans: BypassPlan[];
+  advanced_plans: BypassPlan[];
   rationale: string;
   low_confidence_decision_indices: number[];
 };
@@ -152,4 +229,111 @@ export function deleteTraceAnchor(
     `/api/trace/${encodeURIComponent(appId)}/anchor?${qs.toString()}`,
     { method: "DELETE" },
   );
+}
+
+// ---------------------------------------------------------------------------
+// useTraceAnchor — React hook owning the GET → fall-back-to-POST lifecycle
+// for one ``(appId, entry, hops)`` triple. The Trace mode UI is the only
+// caller; the cached-anchors picker and the form submit funnel through
+// ``setTarget`` and ``build``.
+//
+// State machine (idle → loading → loaded | error → ...):
+//
+//   idle       — no entry/appId supplied yet (form empty)
+//   loading    — GET in flight (cache hit attempt)
+//   loaded     — anchor in state, surfaced for rendering
+//   missing    — GET returned 404 ("not cached"); operator clicks
+//                Build to fire POST
+//   building   — POST in flight (skill invocation)
+//   error      — GET / POST returned a non-404 error, surfaced as a
+//                retryable inline card
+//
+// Re-firing rule: changing ``(appId, entry, hops)`` always cancels the
+// in-flight request and re-runs the cache GET. The ``ts`` bump on
+// ``setTarget`` (similar to ``pendingCodeNav.ts``) lets external callers
+// (the cached-anchors picker writing the same triple back) force a re-
+// load without changing identity.
+
+export type TraceAnchorState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "loaded"; anchor: BehaviorAnchor; from: "cache" | "build" }
+  | { kind: "missing" }
+  | { kind: "building" }
+  | { kind: "error"; status: number; error: string; phase: "get" | "build" };
+
+export type UseTraceAnchorReturn = {
+  state: TraceAnchorState;
+  /** Operator-clicked Build; fires POST against the current target. */
+  build: (force?: boolean) => Promise<void>;
+  /** Operator-clicked Clear; resets to idle without changing target. */
+  clear: () => void;
+};
+
+export function useTraceAnchor(
+  appId: string | null,
+  entry: string | null,
+  hops: number,
+): UseTraceAnchorReturn {
+  const [state, setState] = useState<TraceAnchorState>({ kind: "idle" });
+
+  // Track the in-flight request key so a stale response that arrives
+  // after the operator changed the target doesn't clobber the new state.
+  // Mirrors HookBuilder's renderInflightKeyRef pattern.
+  const keyRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!appId || !entry) {
+      setState({ kind: "idle" });
+      keyRef.current = "";
+      return;
+    }
+    const myKey = `${appId}\u0001${entry}\u0001${hops}`;
+    keyRef.current = myKey;
+    setState({ kind: "loading" });
+    let cancelled = false;
+    void (async () => {
+      const r = await fetchTraceAnchor(appId, entry, hops);
+      if (cancelled || keyRef.current !== myKey) return;
+      if (r.ok) {
+        setState({ kind: "loaded", anchor: r.data, from: "cache" });
+      } else if (r.status === 404) {
+        setState({ kind: "missing" });
+      } else {
+        setState({ kind: "error", status: r.status, error: r.error, phase: "get" });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [appId, entry, hops]);
+
+  const build = useCallback(
+    async (force: boolean = false) => {
+      if (!appId || !entry) return;
+      const myKey = `${appId}\u0001${entry}\u0001${hops}`;
+      keyRef.current = myKey;
+      setState({ kind: "building" });
+      const r = await buildTraceAnchor(appId, entry, hops, force);
+      if (keyRef.current !== myKey) return;
+      if (r.ok) {
+        setState({ kind: "loaded", anchor: r.data, from: "build" });
+      } else {
+        setState({
+          kind: "error",
+          status: r.status,
+          error: r.error,
+          phase: "build",
+        });
+      }
+    },
+    [appId, entry, hops],
+  );
+
+  const clear = useCallback(() => {
+    keyRef.current = "";
+    setState({ kind: "idle" });
+  }, []);
+
+  return { state, build, clear };
 }

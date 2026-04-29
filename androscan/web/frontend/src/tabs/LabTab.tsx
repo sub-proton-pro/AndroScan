@@ -29,7 +29,7 @@ import {
   type TraceEvent,
 } from "../api/frida";
 import type { ChatAttachment } from "../types";
-import { useWorkbench } from "../context/WorkbenchContext";
+import { useWorkbench, type LabMode } from "../context/WorkbenchContext";
 import { LabTraceMode } from "./LabTraceMode";
 
 /**
@@ -49,10 +49,12 @@ import { LabTraceMode } from "./LabTraceMode";
  *     to deep-dive the call graph without the 32% width constraint of
  *     Manual Hooks mode pop into here.
  *
- * Mode selection persists in ``localStorage["lab.mode"]`` so the
- * operator's last choice survives reloads. ``Trace`` is the cold-start
- * default — that signals the new feature without forcing operators
- * who prefer the legacy flow to re-pick every session.
+ * Mode selection persists in ``localStorage["androscan.lab.mode"]`` so
+ * the operator's last choice survives reloads (state owned by
+ * ``WorkbenchContext`` since 10.7 — see ``LabMode`` / ``setLabMode``
+ * on the context). ``Trace`` is the cold-start default — that signals
+ * the new feature without forcing operators who prefer the legacy
+ * flow to re-pick every session.
  *
  * Cross-component wiring inside Manual Hooks mode (DEC-023, sub-steps
  * 4.5–4.8, unchanged from the original Hook Lab tab):
@@ -82,20 +84,13 @@ import { LabTraceMode } from "./LabTraceMode";
  */
 type RightPaneTab = "trace" | "hooks" | "scope";
 
-/** The three modes selectable from the Lab tab's left rail. */
-export type LabMode = "trace" | "manual-hooks" | "graph";
-const LAB_MODE_STORAGE_KEY = "androscan.lab.mode";
-const DEFAULT_LAB_MODE: LabMode = "trace";
-
-function loadStoredLabMode(): LabMode {
-  try {
-    const raw = window.localStorage.getItem(LAB_MODE_STORAGE_KEY);
-    if (raw === "trace" || raw === "manual-hooks" || raw === "graph") return raw;
-  } catch {
-    // localStorage can throw under privacy modes — fall through to default.
-  }
-  return DEFAULT_LAB_MODE;
-}
+// ``LabMode`` itself + the localStorage round-trip lifted into
+// ``WorkbenchContext`` in 10.7 so cross-tab actions (the Mirror →
+// Trace integration in 10.8) and intra-tab actions (BypassPlanCard's
+// "Stage in Manual Hooks" button) can flip the mode without drilling
+// imperative refs through the LabTab tree. Re-exported here for the
+// few legacy importers that already named ``LabTab.LabMode``.
+export type { LabMode };
 
 // Last-N tail of trace events folded into the chat ``frida_summary``
 // attachment. Kept small so the per-kind ATTACHMENT_BUDGETS["frida_summary"]
@@ -119,17 +114,7 @@ const LAB_MODES: { id: LabMode; label: string; hint: string }[] = [
 ];
 
 export function LabTab() {
-  const { appId } = useWorkbench();
-  const [mode, setModeState] = useState<LabMode>(() => loadStoredLabMode());
-
-  const setMode = useCallback((m: LabMode) => {
-    setModeState(m);
-    try {
-      window.localStorage.setItem(LAB_MODE_STORAGE_KEY, m);
-    } catch {
-      // Privacy mode / storage quota — not worth surfacing.
-    }
-  }, []);
+  const { appId, labMode, setLabMode } = useWorkbench();
 
   return (
     <div className="lab-tab-shell">
@@ -139,9 +124,9 @@ export function LabTab() {
             key={m.id}
             type="button"
             role="tab"
-            aria-selected={mode === m.id}
-            className={`lab-mode-button ${mode === m.id ? "lab-mode-button-active" : ""}`}
-            onClick={() => setMode(m.id)}
+            aria-selected={labMode === m.id}
+            className={`lab-mode-button ${labMode === m.id ? "lab-mode-button-active" : ""}`}
+            onClick={() => setLabMode(m.id)}
             title={m.hint}
           >
             {m.label}
@@ -149,9 +134,9 @@ export function LabTab() {
         ))}
       </nav>
       <div className="lab-mode-content">
-        {mode === "trace" && <LabTraceMode appId={appId} />}
-        {mode === "manual-hooks" && <ManualHooksMode />}
-        {mode === "graph" && <GraphMode />}
+        {labMode === "trace" && <LabTraceMode appId={appId} />}
+        {labMode === "manual-hooks" && <ManualHooksMode />}
+        {labMode === "graph" && <GraphMode />}
       </div>
     </div>
   );
