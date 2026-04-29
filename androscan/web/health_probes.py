@@ -462,38 +462,129 @@ def _major_minor(v: Optional[str]) -> Optional[tuple[int, int]]:
         return None
 
 
+# Well-known install locations for ``frida-server`` on Android. These
+# are tried in order when neither (a) the bare command name resolves
+# via the device shell ``$PATH`` nor (b) the running pid's
+# ``/proc/<pid>/exe`` symlink could be read. The first entry matches
+# what AndroScan's own Settings-tab install playbook (see
+# ``frontend/src/tabs/SettingsTab.tsx``) instructs operators to push,
+# which is also the canonical location in the official Frida Android
+# docs (https://frida.re/docs/android/). The remaining entries cover
+# system installs from custom Magisk modules / vendor ROMs; we keep
+# the list short so the worst-case cost is a handful of cheap
+# ``adb shell`` round-trips on the 15s Settings-tab poll cadence.
+_FRIDA_SERVER_DEVICE_PATHS: tuple[str, ...] = (
+    "/data/local/tmp/frida-server",
+    "/system/bin/frida-server",
+    "/system/xbin/frida-server",
+)
+
+
+async def _resolve_frida_server_exe_via_pid(
+    adb_cmd: str,
+    pid: Optional[int],
+    timeout: float,
+) -> Optional[str]:
+    """Look up the on-device ``frida-server`` binary path from ``/proc/<pid>/exe``.
+
+    Returns ``None`` when ``pid`` is missing, when the readlink call
+    fails (process gone, /proc unreadable for the calling shell uid,
+    SELinux denial), or when the link target is empty. Never raises.
+    """
+    if pid is None:
+        return None
+    rc, out, _err = await _run(
+        adb_cmd, "shell", "readlink", f"/proc/{int(pid)}/exe", timeout=timeout,
+    )
+    if rc != 0:
+        return None
+    target = (out or "").strip()
+    return target or None
+
+
 async def probe_frida_version_skew(
     host: dict[str, Any],
     adb_cmd: str = "adb",
     timeout: float = SHORT_TIMEOUT_SEC,
+    *,
+    pid: Optional[int] = None,
 ) -> dict[str, Any]:
     """Compare host ``frida`` CLI version with device ``frida-server`` version.
 
     ``host`` is the dict returned by :func:`probe_frida_version` — we
-    read ``host["version"]`` and compare to ``adb shell frida-server
-    --version``. A major-version mismatch is fatal (Frida's wire
-    protocol is not stable across majors); a minor mismatch is a
-    warning.
+    read ``host["version"]`` and compare to ``adb shell <bin>
+    --version`` where ``<bin>`` is resolved as follows:
+
+    1. If ``pid`` is supplied (the running ``frida-server`` pid from
+       :func:`probe_frida_server`), try ``readlink /proc/<pid>/exe``
+       to learn the *exact* binary that's running. This is the most
+       accurate source — there can never be version skew between what
+       we probe and what the host CLI talks to.
+    2. Try the bare command name ``frida-server`` (works when the
+       binary is on the device shell's ``$PATH``, e.g. installs to
+       ``/system/bin``).
+    3. Fall through to ``_FRIDA_SERVER_DEVICE_PATHS`` in order, which
+       starts with ``/data/local/tmp/frida-server`` — the path
+       AndroScan's own install playbook recommends and the canonical
+       Frida Android install location. Without this fallback the
+       common "I followed the playbook" case showed a red card with
+       ``frida-server: inaccessible or not found`` even though
+       :func:`probe_frida_server` had already found the running pid
+       (``pidof`` matches process names regardless of ``$PATH``).
+
+    A major-version mismatch is fatal (Frida's wire protocol is not
+    stable across majors); a minor mismatch is a warning.
 
     Returns ``{ok, host_version, device_version, severity, error}``
     where ``severity`` ∈ ``{None, "minor", "major"}``. ``ok`` is
-    ``False`` when severity is ``"major"`` or when the device probe
-    fails — the SettingsTab card uses ``ok`` to choose the dot colour.
+    ``False`` when severity is ``"major"`` or when *every* candidate
+    binary path failed — the SettingsTab card uses ``ok`` to choose
+    the dot colour.
     """
     host_version = _normalize_frida_version(host.get("version") if isinstance(host, dict) else None)
 
-    rc, out, err = await _run(
-        adb_cmd, "shell", "frida-server", "--version", timeout=timeout
-    )
-    raw_dev = (out or err or "").strip()
-    device_version = _normalize_frida_version(raw_dev)
-    if rc != 0 or not device_version:
+    # Build the candidate list: pid-resolved exe (if any), then bare
+    # command name, then the well-known install paths. ``dict.fromkeys``
+    # preserves insertion order while deduping — so a pid that resolves
+    # to ``/data/local/tmp/frida-server`` doesn't make us probe that
+    # path twice.
+    candidates: list[str] = []
+    resolved = await _resolve_frida_server_exe_via_pid(adb_cmd, pid, timeout)
+    if resolved:
+        candidates.append(resolved)
+    candidates.append("frida-server")
+    candidates.extend(_FRIDA_SERVER_DEVICE_PATHS)
+    candidates = list(dict.fromkeys(candidates))
+
+    last_rc: int = -1
+    last_out: str = ""
+    last_err: str = ""
+    device_version: Optional[str] = None
+    for binary in candidates:
+        rc, out, err = await _run(
+            adb_cmd, "shell", binary, "--version", timeout=timeout
+        )
+        last_rc, last_out, last_err = rc, (out or ""), (err or "")
+        raw_dev = (out or err or "").strip()
+        parsed = _normalize_frida_version(raw_dev)
+        if rc == 0 and parsed:
+            device_version = parsed
+            break
+
+    if device_version is None:
+        # Surface the *last* shell error (the broadest fallback path
+        # we tried), prefixed with the candidate so the operator can
+        # tell "no frida-server anywhere" from "this specific path
+        # was unreadable".
+        msg = (last_err or last_out or "could not read frida-server --version on device").strip()
+        if not msg:
+            msg = f"could not read frida-server --version on device (rc={last_rc})"
         return {
             "ok": False,
             "host_version": host_version,
             "device_version": None,
             "severity": None,
-            "error": (err or out or "could not read frida-server --version on device").strip()[:300],
+            "error": msg[:300],
         }
 
     h = _major_minor(host_version)

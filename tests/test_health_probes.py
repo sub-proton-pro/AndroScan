@@ -289,7 +289,13 @@ def test_probe_frida_version_skew_major(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_probe_frida_version_skew_device_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``adb shell frida-server --version`` errors → ok=False, no skew opinion."""
+    """Every candidate ``frida-server`` path fails → ok=False, no skew opinion.
+
+    The probe walks bare ``frida-server`` plus every entry in
+    ``_FRIDA_SERVER_DEVICE_PATHS``; if all of them return non-zero with
+    a "not found" stderr the card surfaces the last shell error so the
+    operator can tell "no device" from "binary missing".
+    """
     monkeypatch.setattr(
         "asyncio.create_subprocess_exec",
         _make_subprocess_factory({"adb": _FakeProc(127, b"", b"frida-server: not found\n")}),
@@ -300,6 +306,79 @@ def test_probe_frida_version_skew_device_unreachable(monkeypatch: pytest.MonkeyP
     assert out["ok"] is False
     assert out["severity"] is None
     assert out["device_version"] is None
+    assert "not found" in out["error"]
+
+
+def test_probe_frida_version_skew_resolves_via_pid_readlink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the running pid is known, the probe reads ``/proc/<pid>/exe``
+    and invokes that exact binary — even when it lives outside ``$PATH``.
+
+    Models the operator-followed-the-playbook case: ``frida-server`` was
+    pushed to ``/data/local/tmp/`` (which is not on the device shell's
+    ``$PATH``) and is running as pid 4680. ``readlink`` returns the
+    full path; we then exec it directly and skip the bare-name attempt.
+    """
+    seen_argv: list[tuple[str, ...]] = []
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        seen_argv.append(argv)
+        if argv[1] == "shell" and argv[2] == "readlink":
+            return _FakeProc(0, b"/data/local/tmp/frida-server\n", b"")
+        if argv[1] == "shell" and argv[2] == "/data/local/tmp/frida-server":
+            return _FakeProc(0, b"16.4.10\n", b"")
+        return _FakeProc(127, b"", b"unexpected argv: " + " ".join(argv).encode())
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_version_skew(
+        {"version": "16.4.10"}, "adb", pid=4680,
+    ))
+    assert out["ok"] is True
+    assert out["device_version"] == "16.4.10"
+    assert out["severity"] is None
+    # Readlink must run first; the resolved path is the *only* binary we
+    # probe (no bare-name or fallback-list attempts when readlink wins).
+    binaries = [a[2] for a in seen_argv if a[1] == "shell"]
+    assert binaries == ["readlink", "/data/local/tmp/frida-server"]
+
+
+def test_probe_frida_version_skew_falls_back_to_known_install_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pid known; bare ``frida-server`` fails (not on $PATH) but
+    ``/data/local/tmp/frida-server`` succeeds — the card recovers.
+
+    Regression for the user-reported case where the playbook installs
+    to ``/data/local/tmp/`` and the resulting card stayed red with
+    ``frida-server: inaccessible or not found`` even though the server
+    was actually running.
+    """
+    seen_argv: list[tuple[str, ...]] = []
+    not_found = b"/system/bin/sh: frida-server: inaccessible or not found\n"
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        seen_argv.append(argv)
+        if argv[1] == "shell" and argv[2] == "frida-server":
+            return _FakeProc(127, b"", not_found)
+        if argv[1] == "shell" and argv[2] == "/data/local/tmp/frida-server":
+            return _FakeProc(0, b"16.4.10\n", b"")
+        return _FakeProc(127, b"", b"unexpected: " + " ".join(argv).encode())
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_version_skew(
+        {"version": "16.4.10"}, "adb",
+    ))
+    assert out["ok"] is True
+    assert out["device_version"] == "16.4.10"
+    # Bare name is tried first (cheap, common case for /system/bin
+    # installs), then the canonical /data/local/tmp/ install location.
+    binaries = [a[2] for a in seen_argv if a[1] == "shell"]
+    assert binaries[:2] == ["frida-server", "/data/local/tmp/frida-server"]
+    # No further fallbacks should run once we got a parsable version.
+    assert "/system/bin/frida-server" not in binaries
 
 
 # ---------------------------------------------------------------------------

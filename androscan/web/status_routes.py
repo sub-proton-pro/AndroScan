@@ -138,8 +138,18 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
     # half is up). Cheap when frida-server is not running — the probe
     # short-circuits on the ``adb shell frida-server --version`` failure
     # so we don't pay an extra ~1s on the common "no device" case.
+    #
+    # We forward the pid we just learned from ``probe_frida_server`` so
+    # the skew probe can read ``/proc/<pid>/exe`` and invoke the *exact*
+    # binary that's running, rather than relying on the device shell's
+    # ``$PATH`` (which doesn't include ``/data/local/tmp/`` — the
+    # canonical Frida install location our own Settings playbook
+    # recommends). Without this the card showed red on every install
+    # the playbook itself produces.
     if frida_server_v.get("running"):
-        skew_v = await probe_frida_version_skew(frida_v, "adb")
+        skew_v = await probe_frida_version_skew(
+            frida_v, "adb", pid=frida_server_v.get("pid"),
+        )
     else:
         skew_v = {
             "ok": False,
