@@ -19,6 +19,7 @@ from androscan.web.device_ops import (
     adb_install_apk,
     adb_launch_package,
     adb_pm_path,
+    invalidate_launcher_cache,
     list_avds,
     spawn_emulator_detached,
 )
@@ -120,6 +121,140 @@ _ADB_SHELL_DENYLIST_TOKENS = (
     "remount",
     "fastboot",
 )
+
+# Per-call wall-clock cap for the AVD/model name lookups behind
+# ``/api/device/status``. Both calls are best-effort and the polling
+# interval on the frontend is 3s, so we keep these tight to avoid
+# stretching the status response when adb is briefly slow.
+_DEVICE_NAME_TIMEOUT_SEC = 1.5
+
+# Per-call cap for the ``getprop sys.boot_completed`` probe behind
+# ``/api/device/status``. ``getprop`` is normally instantaneous (the
+# property store is in-memory) but adb itself can stall for a few
+# seconds during the first moments of a fresh emulator attach, so we
+# leave a little headroom while still capping each status call.
+_BOOT_COMPLETED_TIMEOUT_SEC = 2.0
+
+
+async def _resolve_device_name() -> Optional[str]:
+    """Best-effort human-readable name for the currently attached device.
+
+    Used by ``/api/device/status`` so the Mirror View status pill reads
+    e.g. ``device: online (Pixel_2_API_28)`` instead of the literal adb
+    state ``device: online (device)``. Resolution order:
+
+    1. ``adb emu avd name`` — Android emulator console command. Returns
+       the AVD name on its own line followed by ``OK`` (and is silent
+       on physical devices). This is the strongest signal: the operator
+       chose this AVD via the boot wizard, so seeing it back in the
+       status pill closes the loop.
+    2. ``adb shell getprop ro.product.model`` — physical-device
+       fallback. Returns e.g. ``Pixel 6`` or ``sdk_gphone64_arm64``
+       (the AOSP emulator's model string when ``adb emu`` is suppressed
+       e.g. on multi-device-attached errors).
+
+    Returns ``None`` when neither path resolves to a non-empty string.
+    Never raises — every error path is swallowed because the status
+    endpoint must remain a fast happy-path GET even when adb is wedged.
+    """
+    # Try AVD console first — emulator-only, so failure here is benign
+    # for physical devices.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "adb", "emu", "avd", "name",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out_b, _err_b = await asyncio.wait_for(
+                proc.communicate(), timeout=_DEVICE_NAME_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            out_b = b""
+    except (FileNotFoundError, OSError):
+        out_b = b""
+    # ``adb emu avd name`` output:
+    #     Pixel_2_API_28
+    #     OK
+    # We take the first non-empty, non-``OK`` line. On physical devices
+    # adb writes ``error: closed`` to stderr and stdout is empty.
+    for line in (out_b or b"").decode(errors="replace").splitlines():
+        token = line.strip()
+        if token and token.upper() != "OK" and not token.lower().startswith("error"):
+            return token
+
+    # Fall back to product model for physical devices (and for emulators
+    # where ``adb emu`` was rejected, e.g. multi-device attach).
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "adb", "shell", "getprop", "ro.product.model",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out_b, _err_b = await asyncio.wait_for(
+                proc.communicate(), timeout=_DEVICE_NAME_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return None
+        if proc.returncode != 0:
+            return None
+    except (FileNotFoundError, OSError):
+        return None
+    model = (out_b or b"").decode(errors="replace").strip()
+    return model or None
+
+
+async def _resolve_boot_completed() -> bool:
+    """Return ``True`` once Android's ``sys.boot_completed`` flips to ``1``.
+
+    ``adb get-state`` returns ``device`` as soon as the on-device
+    ``adbd`` socket is up — that's typically 10-20 s into a cold boot,
+    long before ``system_server`` / ``ActivityManager`` / ``PackageManager``
+    are actually serving requests. Firing ``adb install`` or ``monkey -p``
+    in that window deterministically fails (``monkey`` dumps its argv as
+    its only "error message" — the literal symptom the user reported).
+
+    AOSP's canonical "system is up" signal is ``getprop sys.boot_completed``
+    flipping to ``1`` (set by ``init`` once the BOOT_COMPLETED broadcast
+    has fired). Every reliable CI / test harness gates on this property.
+
+    Best-effort: any failure (adb missing, getprop timeout, non-zero exit,
+    unexpected output) is treated as ``False`` so the status endpoint stays
+    a fast happy-path GET. Caller is responsible for retrying on the next
+    poll tick.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "adb", "shell", "getprop", "sys.boot_completed",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    try:
+        out_b, _err_b = await asyncio.wait_for(
+            proc.communicate(), timeout=_BOOT_COMPLETED_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return False
+    if proc.returncode != 0:
+        return False
+    # ``getprop`` prints just ``1`` (with a trailing newline) once boot is
+    # complete; an empty line / ``0`` / anything else means "not yet".
+    return (out_b or b"").decode(errors="replace").strip() == "1"
 
 
 def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
@@ -351,7 +486,28 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
 
     @app.get("/api/device/status")
     async def device_status() -> dict[str, Any]:
-        """Quick adb online/offline probe (uses ``adb get-state``)."""
+        """Quick adb online/offline + boot-completion probe.
+
+        Returns ``{online, state, detail, device_name, boot_completed}``:
+
+        * ``online`` / ``state`` come from ``adb get-state``. ``state ==
+          "device"`` means ``adbd`` is reachable — but that fires *very*
+          early in the Android boot sequence, well before ``system_server``
+          (the host of ``ActivityManager`` and ``PackageManager``) is up.
+        * ``boot_completed`` reflects ``getprop sys.boot_completed`` — the
+          AOSP-canonical "the OS has finished booting" signal. The Boot
+          wizard gates the install/launch steps on this *and* ``online``
+          so ``adb install`` / ``monkey -p`` aren't fired into a half-up
+          system (which is exactly the failure mode the user reported:
+          ``monkey`` printing its argv as its only output because its
+          ``IActivityManager`` proxy hadn't been wired yet).
+        * ``device_name`` is best-effort human-readable (AVD name, then
+          ``ro.product.model``); ``None`` when neither path resolves.
+
+        Every probe is individually timeboxed and never raises — the
+        endpoint must remain a fast happy-path GET even when adb is
+        wedged, because the frontend polls it every 3 s.
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
                 "adb", "get-state",
@@ -362,16 +518,39 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3)
             except asyncio.TimeoutError:
                 proc.kill()
-                return {"online": False, "state": "timeout", "detail": ""}
+                return {
+                    "online": False, "state": "timeout", "detail": "",
+                    "device_name": None, "boot_completed": False,
+                }
         except FileNotFoundError:
-            return {"online": False, "state": "no_adb", "detail": "adb not on PATH"}
+            return {
+                "online": False, "state": "no_adb", "detail": "adb not on PATH",
+                "device_name": None, "boot_completed": False,
+            }
         state = (stdout or b"").decode(errors="replace").strip()
         if proc.returncode == 0 and state == "device":
-            return {"online": True, "state": state, "detail": ""}
+            # Run the two best-effort follow-ups concurrently — neither
+            # depends on the other, and both add 200-500 ms each on a
+            # cold-attached emulator. ``return_exceptions=True`` is a
+            # belt-and-braces because both helpers already swallow.
+            device_name, boot_completed = await asyncio.gather(
+                _resolve_device_name(),
+                _resolve_boot_completed(),
+                return_exceptions=False,
+            )
+            return {
+                "online": True,
+                "state": state,
+                "detail": "" if boot_completed else "system still booting",
+                "device_name": device_name,
+                "boot_completed": bool(boot_completed),
+            }
         return {
             "online": False,
             "state": state or "unknown",
             "detail": (stderr or b"").decode(errors="replace").strip()[:300],
+            "device_name": None,
+            "boot_completed": False,
         }
 
     @app.post("/api/adb/shell")
@@ -529,6 +708,12 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
                 return {"package": package, "apk_path": apk_path, "steps": steps, "ok": False}
             inst = await adb_install_apk(apk_path)
             installed_now = inst["ok"]
+            # A fresh install can change the LAUNCHER activity (developer
+            # renamed MainActivity between builds, for example). Drop the
+            # sidecar cache so the next launch re-resolves and we don't
+            # serve a stale component name to ``am start``.
+            if inst["ok"]:
+                invalidate_launcher_cache(app_dir)
             steps.append({
                 "key": "install",
                 "ok": inst["ok"],
@@ -547,13 +732,23 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
                 "reason": "already installed" if installed_now else "install=false",
             })
 
-        # Step 3: launch.
+        # Step 3: launch — uses ``am start -W`` with the resolved LAUNCHER
+        # activity (cached per-app via ``app_dir``), then verifies the
+        # process is actually alive via ``pidof``. Surfaces the parsed
+        # ``LaunchState`` (COLD/WARM/HOT) and ``TotalTime`` so the wizard
+        # can show "started in 678 ms" instead of just a green check.
         if body.launch and installed_now:
-            launch = await adb_launch_package(package)
+            launch = await adb_launch_package(package, app_dir=app_dir)
             steps.append({
                 "key": "launch",
                 "ok": launch["ok"],
                 "exit_code": launch.get("exit_code"),
+                "activity": launch.get("activity"),
+                "launch_state": launch.get("launch_state"),
+                "total_time_ms": launch.get("total_time_ms"),
+                "pid": launch.get("pid"),
+                "verified_running": launch.get("verified_running"),
+                "used_monkey_fallback": launch.get("used_monkey_fallback"),
                 "error": launch.get("error"),
             })
             return {

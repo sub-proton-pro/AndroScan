@@ -373,27 +373,68 @@ def test_api_device_status_offline_when_adb_missing(
     body = r.json()
     assert body["online"] is False
     assert body["state"] == "no_adb"
+    # No name lookup runs when adb itself is missing — the field is
+    # always present so the frontend never sees ``undefined``.
+    assert body["device_name"] is None
+    # boot_completed is also always present and stays False whenever
+    # adb itself can't reach the device.
+    assert body["boot_completed"] is False
 
 
-def test_api_device_status_online(
+def _make_argv_aware_subprocess(
+    plan: dict[tuple[str, ...], tuple[int, bytes, bytes]],
+    *,
+    seen_argv: list[tuple[str, ...]] | None = None,
+):
+    """Return a stub for ``asyncio.create_subprocess_exec`` that dispatches
+    by argv. ``plan`` keys are matched against the *full* argv tuple.
+    Anything not covered by the plan returns rc=1, empty stdout/stderr —
+    tests assert on the recorded ``seen_argv`` to catch typos."""
+
+    class _Proc:
+        def __init__(self, rc: int, out: bytes, err: bytes) -> None:
+            self.returncode = rc
+            self._out = out
+            self._err = err
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self._out, self._err
+
+        def kill(self) -> None:  # noqa: D401 — match real Process API
+            pass
+
+    async def fake_exec(*argv: str, **_kw):
+        if seen_argv is not None:
+            seen_argv.append(argv)
+        rc, out, err = plan.get(argv, (1, b"", b""))
+        return _Proc(rc, out, err)
+
+    return fake_exec
+
+
+def test_api_device_status_online_with_avd_name(
     cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Online emulator that has finished booting: ``adb emu avd name``
+    resolves the AVD label *and* ``getprop sys.boot_completed`` returns
+    ``1``, so the response should report ``online + boot_completed``
+    plus the AVD name for the Mirror View pill."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "apps").mkdir()
 
-    class Proc:
-        returncode = 0
-
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"device\n", b""
-
-        def kill(self) -> None:
-            pass
-
-    async def fake_exec(*_a, **_kw):
-        return Proc()
-
-    monkeypatch.setattr("androscan.web.app.asyncio.create_subprocess_exec", fake_exec)
+    seen: list[tuple[str, ...]] = []
+    plan = {
+        ("adb", "get-state"): (0, b"device\n", b""),
+        # ``adb emu avd name`` prints the AVD then ``OK`` on its own line.
+        ("adb", "emu", "avd", "name"): (0, b"Pixel_2_API_28\nOK\n", b""),
+        # OS is fully booted — system_server is up, install/launch will
+        # behave correctly.
+        ("adb", "shell", "getprop", "sys.boot_completed"): (0, b"1\n", b""),
+    }
+    monkeypatch.setattr(
+        "androscan.web.app.asyncio.create_subprocess_exec",
+        _make_argv_aware_subprocess(plan, seen_argv=seen),
+    )
     app = create_app(cfg, cwd=tmp_path)
     client = TestClient(app)
     r = client.get("/api/device/status")
@@ -401,6 +442,116 @@ def test_api_device_status_online(
     body = r.json()
     assert body["online"] is True
     assert body["state"] == "device"
+    assert body["device_name"] == "Pixel_2_API_28"
+    assert body["boot_completed"] is True
+    # Detail is empty on the fully-booted happy path (no warning needed).
+    assert body["detail"] == ""
+    # The AVD console answered, so we never fell through to the model
+    # fallback — keeps the happy path at one extra adb roundtrip.
+    assert ("adb", "shell", "getprop", "ro.product.model") not in seen
+    # And the boot probe is the only ``getprop`` we issued.
+    assert ("adb", "shell", "getprop", "sys.boot_completed") in seen
+
+
+def test_api_device_status_online_but_still_booting(
+    cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the user reported: ``adb get-state`` returns ``device``
+    (adbd is up) but ``sys.boot_completed`` is still ``0`` — the OS
+    hasn't finished booting. Response must surface ``boot_completed:
+    false`` and a "system still booting" detail so the wizard can keep
+    the install/launch button disabled until the property flips."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "apps").mkdir()
+
+    plan = {
+        ("adb", "get-state"): (0, b"device\n", b""),
+        ("adb", "emu", "avd", "name"): (0, b"Pixel_8_no_play\nOK\n", b""),
+        # The "still booting" state — getprop succeeds but the property
+        # hasn't been set to 1 yet (init writes "" until BOOT_COMPLETED
+        # broadcast fires).
+        ("adb", "shell", "getprop", "sys.boot_completed"): (0, b"\n", b""),
+    }
+    monkeypatch.setattr(
+        "androscan.web.app.asyncio.create_subprocess_exec",
+        _make_argv_aware_subprocess(plan),
+    )
+    app = create_app(cfg, cwd=tmp_path)
+    client = TestClient(app)
+    r = client.get("/api/device/status")
+    assert r.status_code == 200
+    body = r.json()
+    # online is still true (adbd is reachable) — that's what enables the
+    # mirror WebSocket — but the install/launch gate must stay shut.
+    assert body["online"] is True
+    assert body["state"] == "device"
+    assert body["device_name"] == "Pixel_8_no_play"
+    assert body["boot_completed"] is False
+    # The detail field is the surface the Mirror View pill leans on for
+    # its hover/tooltip context.
+    assert "still booting" in body["detail"]
+
+
+def test_api_device_status_online_falls_back_to_model_for_physical_device(
+    cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Physical device: ``adb emu`` is rejected (writes ``error: closed`` to
+    stderr) so the handler falls back to ``getprop ro.product.model``."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "apps").mkdir()
+
+    plan = {
+        ("adb", "get-state"): (0, b"device\n", b""),
+        ("adb", "emu", "avd", "name"): (1, b"", b"error: closed\n"),
+        ("adb", "shell", "getprop", "ro.product.model"): (0, b"Pixel 6\n", b""),
+        ("adb", "shell", "getprop", "sys.boot_completed"): (0, b"1\n", b""),
+    }
+    monkeypatch.setattr(
+        "androscan.web.app.asyncio.create_subprocess_exec",
+        _make_argv_aware_subprocess(plan),
+    )
+    app = create_app(cfg, cwd=tmp_path)
+    client = TestClient(app)
+    r = client.get("/api/device/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["online"] is True
+    assert body["state"] == "device"
+    assert body["device_name"] == "Pixel 6"
+    assert body["boot_completed"] is True
+
+
+def test_api_device_status_online_name_unresolvable_returns_null(
+    cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When neither ``adb emu`` nor ``getprop`` produce a usable name, the
+    field is ``None`` (the frontend then falls back to the raw adb state).
+    Online status is unaffected — name resolution is best-effort."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "apps").mkdir()
+
+    plan = {
+        ("adb", "get-state"): (0, b"device\n", b""),
+        # AVD console returns only ``OK`` — no usable name line.
+        ("adb", "emu", "avd", "name"): (0, b"OK\n", b""),
+        # getprop succeeds but emits nothing.
+        ("adb", "shell", "getprop", "ro.product.model"): (0, b"\n", b""),
+        ("adb", "shell", "getprop", "sys.boot_completed"): (0, b"1\n", b""),
+    }
+    monkeypatch.setattr(
+        "androscan.web.app.asyncio.create_subprocess_exec",
+        _make_argv_aware_subprocess(plan),
+    )
+    app = create_app(cfg, cwd=tmp_path)
+    client = TestClient(app)
+    r = client.get("/api/device/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["online"] is True
+    assert body["state"] == "device"
+    assert body["device_name"] is None
+    # Boot is complete — name resolution is independent.
+    assert body["boot_completed"] is True
 
 
 def test_ws_mirror_first_frame(cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

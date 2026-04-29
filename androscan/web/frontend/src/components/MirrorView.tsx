@@ -129,6 +129,30 @@ export function MirrorView({ onTap, onCollapse, appId = null }: Props) {
     };
   }, []);
 
+  // Drop the rendered frame as soon as the device goes offline. Without
+  // this, the last good screencap keeps showing for the entire offline
+  // window — misleading the operator into thinking the device is still
+  // up (the green status pill is the only clue otherwise). We DO NOT
+  // close the WebSocket: the backend keeps polling ``adb screencap`` and
+  // sends ``type=error`` JSON frames while disconnected, then resumes
+  // sending PNGs the moment the device is back. Reopening the socket on
+  // every offline/online transition would thrash the connection and add
+  // a multi-second blank window after recovery.
+  //
+  // Resetting ``naturalSize`` to null also re-shows the .mirror-empty
+  // placeholder ("Device offline — open the status pill above…") which
+  // the operator needs to discover the boot wizard.
+  useEffect(() => {
+    if (device.online) return;
+    setNaturalSize(null);
+    setImgError(null);
+    if (imgRef.current) imgRef.current.removeAttribute("src");
+    if (lastUrlRef.current) {
+      URL.revokeObjectURL(lastUrlRef.current);
+      lastUrlRef.current = null;
+    }
+  }, [device.online]);
+
   const handleClick = (e: React.MouseEvent<HTMLImageElement>) => {
     const img = imgRef.current;
     if (!img || !naturalSize) return;
@@ -173,12 +197,21 @@ export function MirrorView({ onTap, onCollapse, appId = null }: Props) {
             onClick={() => setPopoverOpen((v) => !v)}
             aria-haspopup="dialog"
             aria-expanded={showWizard}
-            title={`device: ${device.online ? "online" : "offline"} (${device.state})`}
+            title={`device: ${pillStateLabel(device)} (${pillSubtitle(device)})`}
           >
-            <span className={`status-dot ${device.online ? "ok" : "err"}`} aria-hidden />
+            {/*
+              Three pill states:
+                * green dot, "online"  — adbd up + sys.boot_completed=1
+                * amber dot, "booting" — adbd up but boot still in progress
+                * red dot, "offline"   — adbd unreachable (or no device)
+              The amber tier is the new one — without it the operator
+              can't tell whether the install/launch will run cleanly or
+              race the half-up OS.
+            */}
+            <span className={`status-dot ${pillDotClass(device)}`} aria-hidden />
             <span className="mirror-status muted small">
-              device: <strong>{device.online ? "online" : "offline"}</strong>{" "}
-              <span className="muted">({device.state})</span>
+              device: <strong>{pillStateLabel(device)}</strong>{" "}
+              <span className="muted">({pillSubtitle(device)})</span>
             </span>
           </button>
           {showWizard && (
@@ -189,7 +222,9 @@ export function MirrorView({ onTap, onCollapse, appId = null }: Props) {
             >
               <DeviceBoot
                 appId={appId}
-                detail={device.detail || device.state}
+                detail={device.detail || device.device_name || device.state}
+                deviceOnline={device.online}
+                bootCompleted={device.boot_completed ?? false}
                 onRunStart={() => setWizardLocked(true)}
                 onComplete={handleWizardComplete}
                 onDismiss={handleWizardDismiss}
@@ -250,4 +285,37 @@ export function MirrorView({ onTap, onCollapse, appId = null }: Props) {
       <p className="muted small mirror-tip">Tap an element in the mirror to map it to code.</p>
     </div>
   );
+}
+
+/** Render-friendly subtitle for the status pill — prefers the resolved
+ *  AVD / model name (e.g. ``Pixel_2_API_28``) over the raw adb state
+ *  token (``device``, ``offline``, …). Falls back to the state when the
+ *  backend couldn't resolve a name (no device, multi-device-attached
+ *  error, brand-new physical device the model getprop fails on).
+ *  Also used by the button ``title=`` so the tooltip stays in sync
+ *  with the visible label without duplicating the precedence logic. */
+function pillSubtitle(device: DeviceStatus): string {
+  const name = (device.device_name ?? "").trim();
+  if (device.online && name) return name;
+  return device.state;
+}
+
+/** Human-readable status word for the pill. Distinguishes the "adbd is
+ *  up but Android isn't ready yet" state from the fully-booted state
+ *  so the operator doesn't misread an amber-but-not-green pill as a
+ *  ready-to-install device. */
+function pillStateLabel(device: DeviceStatus): "online" | "booting" | "offline" {
+  if (!device.online) return "offline";
+  if (device.boot_completed === false) return "booting";
+  return "online";
+}
+
+/** CSS modifier for the status dot. ``ok`` (green) only when fully
+ *  booted; ``warn`` (amber) for the boot-in-progress window; ``err``
+ *  (red) when adbd is unreachable. The ``warn`` class is reused from
+ *  existing toast styling so no new CSS is required. */
+function pillDotClass(device: DeviceStatus): "ok" | "warn" | "err" {
+  if (!device.online) return "err";
+  if (device.boot_completed === false) return "warn";
+  return "ok";
 }

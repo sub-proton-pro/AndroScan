@@ -171,29 +171,389 @@ def test_adb_install_apk_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert "INSUFFICIENT_STORAGE" in (res["error"] or "")
 
 
-def test_adb_launch_package_aborted(monkeypatch: pytest.MonkeyPatch) -> None:
+# ---------------------------------------------------------------------------
+# Launcher-activity resolution + parser unit tests
+#
+# These exercise the small pure-ish helpers that ``adb_launch_package``
+# composes — keeping them under their own coverage means a parser
+# regression points at one assertion instead of an integration mystery.
+
+
+# Canonical ``cmd package resolve-activity --brief`` output on Android 9+.
+_RESOLVE_ACTIVITY_BRIEF = (
+    b"priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true\n"
+    b"com.example.weakbank.low/.MainActivity\n"
+)
+
+# Canonical ``am start -W`` success output. The ``Status: ok`` line is
+# the structured success marker that replaced our brittle monkey-output
+# heuristics.
+_AM_START_SUCCESS = (
+    b"Starting: Intent { act=android.intent.action.MAIN "
+    b"cat=[android.intent.category.LAUNCHER] "
+    b"cmp=com.example.weakbank.low/.MainActivity }\n"
+    b"Status: ok\n"
+    b"LaunchState: COLD\n"
+    b"Activity: com.example.weakbank.low/.MainActivity\n"
+    b"TotalTime: 678\n"
+    b"WaitTime: 712\n"
+    b"Complete\n"
+)
+
+# ``am start -W`` output when the cached activity component no longer
+# exists (e.g. the developer renamed MainActivity in a reinstall). This
+# is the trigger for the cache-invalidation + re-resolve fallback.
+_AM_START_DOES_NOT_EXIST = (
+    b"Starting: Intent { ... }\n"
+    b"Error type 3\n"
+    b"Error: Activity class {com.example.weakbank.low/.MainActivity} does not exist.\n"
+)
+
+
+def test_resolve_launcher_activity_parses_brief_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--brief`` output has a header line + the component on the next.
+    The parser must pick the component, not the header."""
     monkeypatch.setattr(
         device_ops.asyncio,
         "create_subprocess_exec",
         _make_exec_stub({
-            ("adb", "shell", "monkey"): _StubProc(0, b"** Monkey aborted due to error.\n"),
+            ("adb", "shell", "cmd", "package", "resolve-activity",
+             "--brief", "com.example.weakbank.low"):
+                _StubProc(0, _RESOLVE_ACTIVITY_BRIEF),
         }),
     )
-    res = asyncio.run(device_ops.adb_launch_package("com.example"))
-    assert res["ok"] is False
-    assert "aborted" in (res["error"] or "").lower()
-
-
-def test_adb_launch_package_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        device_ops.asyncio,
-        "create_subprocess_exec",
-        _make_exec_stub({
-            ("adb", "shell", "monkey"): _StubProc(0, b"Events injected: 1\n"),
-        }),
+    res = asyncio.run(
+        device_ops._resolve_launcher_activity("com.example.weakbank.low")
     )
-    res = asyncio.run(device_ops.adb_launch_package("com.example"))
     assert res["ok"] is True
+    assert res["activity"] == "com.example.weakbank.low/.MainActivity"
+
+
+def test_resolve_launcher_activity_handles_missing_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the brief output has no component line (apps with no LAUNCHER
+    intent — services, IMEs) the helper reports an error so the caller
+    can fall back to monkey rather than passing garbage to am start."""
+    monkeypatch.setattr(
+        device_ops.asyncio,
+        "create_subprocess_exec",
+        _make_exec_stub({
+            ("adb", "shell", "cmd", "package", "resolve-activity"):
+                _StubProc(0, b"No activity found\n"),
+        }),
+    )
+    res = asyncio.run(device_ops._resolve_launcher_activity("com.no.launcher"))
+    assert res["ok"] is False
+    assert res["activity"] is None
+
+
+def test_parse_am_start_output_success() -> None:
+    """Structured parse of the canonical ``am start -W`` success output —
+    ``Status: ok``, ``LaunchState: COLD``, ``TotalTime: 678``."""
+    parsed = device_ops._parse_am_start_output(_AM_START_SUCCESS.decode())
+    assert parsed["status"] == "ok"
+    assert parsed["launch_state"] == "COLD"
+    assert parsed["total_time_ms"] == 678
+    assert parsed["error"] is None
+
+
+def test_parse_am_start_output_error() -> None:
+    """When ``am start -W`` reports an error there's no ``Status: ok`` line
+    but there *is* an ``Error: ...`` line we surface for the wizard."""
+    parsed = device_ops._parse_am_start_output(_AM_START_DOES_NOT_EXIST.decode())
+    assert parsed["status"] is None
+    assert parsed["launch_state"] is None
+    assert parsed["total_time_ms"] is None
+    assert parsed["error"] is not None
+    assert "does not exist" in parsed["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Sidecar launcher cache (read / write / invalidate)
+
+
+def test_launcher_cache_round_trip(tmp_path: Path) -> None:
+    """Write then read the same package returns the cached activity;
+    a different package name is treated as a miss (the cache is keyed
+    on package and gets implicitly invalidated when the operator
+    repoints the app at a different APK)."""
+    device_ops.write_launcher_cache(
+        tmp_path, "com.example.app", "com.example.app/.MainActivity",
+    )
+    assert (
+        device_ops.read_launcher_cache(tmp_path, "com.example.app")
+        == "com.example.app/.MainActivity"
+    )
+    # Different package → miss (defensive behaviour, not just key lookup).
+    assert device_ops.read_launcher_cache(tmp_path, "com.other.app") is None
+
+
+def test_launcher_cache_invalidate_drops_file(tmp_path: Path) -> None:
+    """``invalidate_launcher_cache`` removes the sidecar file so the
+    next launch re-resolves. The route calls this after a successful
+    install so a renamed MainActivity in the new APK is picked up."""
+    device_ops.write_launcher_cache(
+        tmp_path, "com.example.app", "com.example.app/.OldActivity",
+    )
+    cache_file = tmp_path / device_ops._LAUNCHER_CACHE_FILENAME
+    assert cache_file.is_file()
+    device_ops.invalidate_launcher_cache(tmp_path)
+    assert not cache_file.exists()
+    # Idempotent — invalidating an already-empty cache is a no-op.
+    device_ops.invalidate_launcher_cache(tmp_path)
+
+
+def test_launcher_cache_no_app_dir_is_noop(tmp_path: Path) -> None:
+    """All cache helpers tolerate ``app_dir=None`` so callers (tests,
+    skills) can opt out of caching without special-casing."""
+    assert device_ops.read_launcher_cache(None, "com.example") is None
+    device_ops.write_launcher_cache(None, "com.example", "com.example/.X")
+    device_ops.invalidate_launcher_cache(None)
+    # Nothing should have leaked into tmp_path because we passed None.
+    assert not list(tmp_path.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# adb_launch_package — full pipeline (resolve → am start → pidof verify)
+
+
+def _launch_pipeline_stub(
+    *,
+    activity_out: bytes = _RESOLVE_ACTIVITY_BRIEF,
+    am_out: bytes = _AM_START_SUCCESS,
+    am_rc: int = 0,
+    pidof_out: bytes = b"12345\n",
+    pidof_rc: int = 0,
+    monkey_out: bytes = b"Events injected: 1\n",
+    monkey_rc: int = 0,
+):
+    """Stub assembling the four-call sequence ``adb_launch_package`` may
+    issue. Tests pass overrides for whichever leg they're exercising."""
+    return _make_exec_stub({
+        ("adb", "shell", "cmd", "package", "resolve-activity"):
+            _StubProc(0 if activity_out else 1, activity_out),
+        ("adb", "shell", "am", "start"): _StubProc(am_rc, am_out),
+        ("adb", "shell", "pidof"): _StubProc(pidof_rc, pidof_out),
+        ("adb", "shell", "monkey"): _StubProc(monkey_rc, monkey_out),
+    })
+
+
+def test_adb_launch_package_am_start_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Resolve → am start ok → pidof returns PID. The wizard sees the
+    full diagnostic surface (activity, COLD/WARM, TotalTime, pid) so
+    the launch row reads "COLD start in 678 ms (com.example/.MainActivity)"
+    instead of a bare green check."""
+    monkeypatch.setattr(
+        device_ops.asyncio, "create_subprocess_exec", _launch_pipeline_stub(),
+    )
+
+    async def no_sleep(_d: float) -> None:
+        return None
+
+    monkeypatch.setattr(device_ops.asyncio, "sleep", no_sleep)
+
+    res = asyncio.run(
+        device_ops.adb_launch_package("com.example.weakbank.low", app_dir=tmp_path)
+    )
+    assert res["ok"] is True
+    assert res["activity"] == "com.example.weakbank.low/.MainActivity"
+    assert res["launch_state"] == "COLD"
+    assert res["total_time_ms"] == 678
+    assert res["pid"] == 12345
+    assert res["verified_running"] is True
+    assert res["used_monkey_fallback"] is False
+    assert res["error"] is None
+    # And the side effect: the sidecar cache now contains the activity
+    # so the next launch skips the resolve roundtrip.
+    assert (
+        device_ops.read_launcher_cache(tmp_path, "com.example.weakbank.low")
+        == "com.example.weakbank.low/.MainActivity"
+    )
+
+
+def test_adb_launch_package_pidof_overrides_am_start_ok(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``am start -W`` prints ``Status: ok`` but the app crashes on
+    startup (e.g. signature mismatch on reinstall) so ``pidof`` returns
+    nothing across all retries. ``pidof`` is the ground truth — the
+    wizard MUST report failure, not a green check."""
+    monkeypatch.setattr(
+        device_ops.asyncio,
+        "create_subprocess_exec",
+        _launch_pipeline_stub(pidof_out=b"", pidof_rc=1),
+    )
+
+    async def no_sleep(_d: float) -> None:
+        return None
+
+    monkeypatch.setattr(device_ops.asyncio, "sleep", no_sleep)
+
+    res = asyncio.run(
+        device_ops.adb_launch_package("com.example.app", app_dir=tmp_path)
+    )
+    assert res["ok"] is False
+    assert res["verified_running"] is False
+    assert res["pid"] is None
+    # Diagnostics still get through so the operator sees what am start
+    # claimed before pidof shot it down.
+    assert res["activity"] == "com.example.weakbank.low/.MainActivity"
+    assert "not running" in (res["error"] or "")
+
+
+def test_adb_launch_package_am_start_failure_with_pid_alive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The inverse: ``am start -W`` claims failure (corrupt output, weird
+    Android quirk) but the process IS alive. ``pidof`` is still ground
+    truth — surface success so we don't false-negative on noisy builds.
+    This is exactly the ``args:``/``data=`` failure mode the user
+    reported with the old monkey heuristic."""
+    monkeypatch.setattr(
+        device_ops.asyncio,
+        "create_subprocess_exec",
+        _launch_pipeline_stub(am_out=b"garbled output\n", am_rc=1),
+    )
+
+    async def no_sleep(_d: float) -> None:
+        return None
+
+    monkeypatch.setattr(device_ops.asyncio, "sleep", no_sleep)
+
+    res = asyncio.run(
+        device_ops.adb_launch_package("com.example.app", app_dir=tmp_path)
+    )
+    assert res["ok"] is True
+    assert res["pid"] == 12345
+    assert res["verified_running"] is True
+    # Timing diagnostics are missing because the parser couldn't latch
+    # onto a Status: ok line — that's fine, the wizard's launchDetail
+    # falls back to "running (pid …)".
+    assert res["total_time_ms"] is None
+
+
+def test_adb_launch_package_falls_back_to_monkey_when_resolve_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """If ``cmd package resolve-activity`` returns no usable component
+    (older Android, mid-rebuild PackageManager) we drop down to the
+    legacy monkey launcher. ``used_monkey_fallback`` flips so the
+    wizard can surface the unusual environment."""
+    monkeypatch.setattr(
+        device_ops.asyncio,
+        "create_subprocess_exec",
+        _launch_pipeline_stub(activity_out=b"No activity found\n"),
+    )
+
+    async def no_sleep(_d: float) -> None:
+        return None
+
+    monkeypatch.setattr(device_ops.asyncio, "sleep", no_sleep)
+
+    res = asyncio.run(
+        device_ops.adb_launch_package("com.example.app", app_dir=tmp_path)
+    )
+    assert res["ok"] is True   # pidof says it's running
+    assert res["used_monkey_fallback"] is True
+    assert res["activity"] is None  # nothing to cache when fallback used
+    # And we did NOT cache an empty activity — would poison subsequent runs.
+    assert device_ops.read_launcher_cache(tmp_path, "com.example.app") is None
+
+
+def test_adb_launch_package_uses_cached_activity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Cache hit short-circuits the resolve roundtrip — we should see
+    ``am start`` and ``pidof`` calls but no ``cmd package`` call."""
+    device_ops.write_launcher_cache(
+        tmp_path, "com.example.app", "com.example.app/.MainActivity",
+    )
+    seen: list[tuple[str, ...]] = []
+
+    async def fake_exec(*args: object, **_kw: object) -> _StubProc:
+        argv = tuple(str(a) for a in args)
+        seen.append(argv)
+        if argv[:5] == ("adb", "shell", "am", "start", "-W"):
+            return _StubProc(0, _AM_START_SUCCESS)
+        if argv[:3] == ("adb", "shell", "pidof"):
+            return _StubProc(0, b"99999\n")
+        return _StubProc(0)
+
+    async def no_sleep(_d: float) -> None:
+        return None
+
+    monkeypatch.setattr(device_ops.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(device_ops.asyncio, "sleep", no_sleep)
+
+    res = asyncio.run(
+        device_ops.adb_launch_package("com.example.app", app_dir=tmp_path)
+    )
+    assert res["ok"] is True
+    assert res["pid"] == 99999
+    # The crucial assertion: no resolve-activity call was made because
+    # the cache hit served the activity name directly.
+    assert not any(
+        argv[:5] == ("adb", "shell", "cmd", "package", "resolve-activity")
+        for argv in seen
+    )
+
+
+def test_adb_launch_package_invalidates_stale_cache_on_does_not_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The "you reinstalled the app and the activity got renamed" case.
+    First am start fails with 'does not exist'; we invalidate the cache,
+    re-resolve to the new activity, and try once more — that one
+    succeeds and the new activity replaces the cached entry."""
+    device_ops.write_launcher_cache(
+        tmp_path, "com.example.app", "com.example.app/.OldActivity",
+    )
+    am_calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*args: object, **_kw: object) -> _StubProc:
+        argv = tuple(str(a) for a in args)
+        if argv[:5] == ("adb", "shell", "am", "start", "-W"):
+            am_calls.append(argv)
+            # First am start uses the cached (stale) activity; second
+            # uses the freshly resolved one. We discriminate by the
+            # ``-n <activity>`` token at the end.
+            if "com.example.app/.OldActivity" in argv:
+                return _StubProc(1, _AM_START_DOES_NOT_EXIST)
+            return _StubProc(0, _AM_START_SUCCESS)
+        if argv[:5] == ("adb", "shell", "cmd", "package", "resolve-activity"):
+            return _StubProc(
+                0,
+                b"priority=0 preferredOrder=0\ncom.example.app/.NewActivity\n",
+            )
+        if argv[:3] == ("adb", "shell", "pidof"):
+            return _StubProc(0, b"4321\n")
+        return _StubProc(0)
+
+    async def no_sleep(_d: float) -> None:
+        return None
+
+    monkeypatch.setattr(device_ops.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(device_ops.asyncio, "sleep", no_sleep)
+
+    res = asyncio.run(
+        device_ops.adb_launch_package("com.example.app", app_dir=tmp_path)
+    )
+    assert res["ok"] is True
+    # Two am start calls: first with the stale activity, second with
+    # the freshly resolved one.
+    assert len(am_calls) == 2
+    assert "com.example.app/.OldActivity" in am_calls[0]
+    assert "com.example.app/.NewActivity" in am_calls[1]
+    # Cache replaced with the new activity name.
+    assert (
+        device_ops.read_launcher_cache(tmp_path, "com.example.app")
+        == "com.example.app/.NewActivity"
+    )
 
 
 # ---------------------------------------------------------------------------
