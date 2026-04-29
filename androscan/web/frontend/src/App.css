@@ -3368,7 +3368,12 @@ code { color: var(--accent); }
 
 .hookbuilder-row {
   display: grid;
-  grid-template-columns: 7rem 1fr;
+  /* Label column widened to 10rem so the longest label rendered today
+   * ("Return descriptor", from force_method_skip) fits on one line
+   * without word-break wrapping. The previous 7rem couldn't even fit
+   * the raw "return_value_expr" identifier — the prettifier helps but
+   * "Return descriptor" still overflows 7rem at the form's font size. */
+  grid-template-columns: 10rem 1fr;
   align-items: center;
   gap: 0.5rem;
 }
@@ -3380,7 +3385,11 @@ code { color: var(--accent); }
 .hookbuilder-label {
   font-size: 0.74rem;
   color: var(--muted);
-  text-transform: lowercase;
+  /* No text-transform: prettyParamName() emits sentence case
+   * ("Class name", "Method name") and the static labels in the form
+   * (Template / Package / Persist) are already title-cased — forcing
+   * lowercase here would just make the form look uniformly less
+   * readable. */
   letter-spacing: 0.02em;
   text-align: right;
   user-select: none;
@@ -3391,6 +3400,18 @@ code { color: var(--accent); }
 }
 
 .hookbuilder-select,
+/* Wraps the input + the optional type-aware suggestion chip strip
+ * (currently only rendered for return_value_expr). The stack lives
+ * inside the second column of the .hookbuilder-row grid so the input
+ * stays aligned with the other rows; the chip strip flows below it
+ * without breaking the label-column alignment. */
+.hookbuilder-input-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
 .hookbuilder-input {
   width: 100%;
   background: var(--panel-2);
@@ -3412,8 +3433,130 @@ code { color: var(--accent); }
   border-color: var(--warn);
 }
 
+/* ---- Type-aware suggestion strip under return_value_expr ----
+ *
+ * Renders one ``.hookbuilder-suggestion-bundle`` per resolved return
+ * type (typically just one — overloads with distinct return types
+ * are rare). Each bundle has a "Return: ``<type>``" caption, a row
+ * of clickable chips (one per curated literal), and an optional
+ * note (e.g. "boxed wrapper — JS true/false won't auto-box"). */
+.hookbuilder-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.hookbuilder-suggestions-empty {
+  /* Empty / no-curated-suggestions case is muted — we don't want it
+   * competing visually with the input itself. */
+  opacity: 0.85;
+}
+
+/* Void-target warning banner: surfaces when the operator has selected
+ * force_return_value but the target method's return type came back as
+ * void. Frida refuses to attach an implementation that returns a
+ * value to a void method, so the form is on a dead-end and we render
+ * a yellow-tinted banner with a one-click pivot to force_method_skip
+ * (which derives the empty return from the descriptor).
+ *
+ * Visual weight is deliberately heavier than the normal suggestion
+ * strip — the operator might otherwise just type "null" into
+ * return_value_expr and click Inject, only to hit the rejection at
+ * attach time. */
+.hookbuilder-suggestions-void {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.6rem;
+  background: rgba(210, 153, 34, 0.1);
+  border: 1px solid rgba(210, 153, 34, 0.45);
+  border-radius: 4px;
+}
+
+.hookbuilder-suggestion-void-msg {
+  flex: 1 1 18rem;
+  font-size: 0.74rem;
+  color: var(--text);
+  line-height: 1.35;
+}
+
+.hookbuilder-suggestion-void-msg strong {
+  color: var(--warn);
+}
+
+.hookbuilder-suggestion-switch {
+  font: inherit;
+  font-size: 0.74rem;
+  background: var(--warn);
+  color: #0b0d12;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+  line-height: 1.2;
+}
+
+.hookbuilder-suggestion-switch:hover {
+  filter: brightness(1.1);
+}
+
+.hookbuilder-suggestion-bundle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.hookbuilder-suggestion-label code {
+  font-size: 0.72rem;
+  color: var(--text);
+}
+
+.hookbuilder-suggestion-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.hookbuilder-suggestion-chip {
+  font: inherit;
+  font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
+  font-size: 0.72rem;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  cursor: pointer;
+  line-height: 1.3;
+  white-space: nowrap;
+  /* Long chips like ``Java.use("...").$new(true)`` would otherwise
+   * push the strip wider than the input column on narrow panels;
+   * the truncate keeps the layout intact and the full text is
+   * already in the chip's title for hover. */
+  max-width: 26rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hookbuilder-suggestion-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.hookbuilder-suggestion-note {
+  flex-basis: 100%;
+  font-style: italic;
+}
+
 .hookbuilder-desc {
-  margin: -0.15rem 0 0.25rem 7.5rem;
+  /* Left-margin tracks the .hookbuilder-row label column width
+   * (10rem) plus a small gap so the description sits flush with the
+   * input column above it. */
+  margin: -0.15rem 0 0.25rem 10.5rem;
 }
 
 .hookbuilder-persist {
