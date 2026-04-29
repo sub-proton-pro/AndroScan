@@ -4,7 +4,10 @@ import type { TabId } from "../types";
 const TABS: { id: TabId; label: string }[] = [
   { id: "reports", label: "Reports" },
   { id: "inspect", label: "Inspect" },
-  { id: "hook", label: "Hook Lab" },
+  // Phase 10 sub-step 10.6: "Hook Lab" → "Lab" — the tab now hosts
+  // Trace + Manual Hooks + Graph modes, so the narrower "Hook Lab"
+  // label no longer fits.
+  { id: "lab", label: "Lab" },
   { id: "settings", label: "Settings" },
 ];
 

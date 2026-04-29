@@ -30,21 +30,32 @@ import {
 } from "../api/frida";
 import type { ChatAttachment } from "../types";
 import { useWorkbench } from "../context/WorkbenchContext";
+import { LabTraceMode } from "./LabTraceMode";
 
 /**
- * Hook Lab tab.
+ * Lab tab (formerly "Hook Lab"; renamed in Phase 10 sub-step 10.6).
  *
- * Three-column layout (DEC-023, sub-steps 4.5 + 4.6):
+ * Hosts three modes selectable via a thin left-edge rail:
  *
- *   ┌──────────┬──────────────────────────┬──────────────────────┐
- *   │          │  CodeView (top)          │  Sessions list       │
- *   │  Call    ├──────────────────────────┤                      │
- *   │  graph   │  HookBuilder (mid)       ├──────────────────────┤
- *   │          ├──────────────────────────┤  [ Trace | Hooks |   │
- *   │          │  ChatDock (bottom)       │    Scope ] panel     │
- *   └──────────┴──────────────────────────┴──────────────────────┘
+ *   * **Trace** (default, NEW) — UI element ➜ decision-point timeline
+ *     ➜ bypass plans. Placeholder for 10.6 (pinned to ``LabTraceMode``);
+ *     full ``BehaviorAnchorCard`` / ``DecisionTimeline`` / ``BypassPlanCard``
+ *     UI lands in 10.7.
+ *   * **Manual Hooks** — the legacy Hook Lab 3-column layout
+ *     (CallGraph | CodeView+HookBuilder+Chat | Sessions+Trace/Hooks/Scope).
+ *     Unchanged from the pre-10.6 surface; operators with established
+ *     muscle memory get the same flow they had.
+ *   * **Graph** — dedicated full-pane CallGraphView. Operators who want
+ *     to deep-dive the call graph without the 32% width constraint of
+ *     Manual Hooks mode pop into here.
  *
- * Cross-component wiring:
+ * Mode selection persists in ``localStorage["lab.mode"]`` so the
+ * operator's last choice survives reloads. ``Trace`` is the cold-start
+ * default — that signals the new feature without forcing operators
+ * who prefer the legacy flow to re-pick every session.
+ *
+ * Cross-component wiring inside Manual Hooks mode (DEC-023, sub-steps
+ * 4.5–4.8, unchanged from the original Hook Lab tab):
  *
  *   * Selecting a method in the call graph emits ``SelectedNode``;
  *     we (a) load its decompiled source into the inline CodeView,
@@ -71,6 +82,21 @@ import { useWorkbench } from "../context/WorkbenchContext";
  */
 type RightPaneTab = "trace" | "hooks" | "scope";
 
+/** The three modes selectable from the Lab tab's left rail. */
+export type LabMode = "trace" | "manual-hooks" | "graph";
+const LAB_MODE_STORAGE_KEY = "androscan.lab.mode";
+const DEFAULT_LAB_MODE: LabMode = "trace";
+
+function loadStoredLabMode(): LabMode {
+  try {
+    const raw = window.localStorage.getItem(LAB_MODE_STORAGE_KEY);
+    if (raw === "trace" || raw === "manual-hooks" || raw === "graph") return raw;
+  } catch {
+    // localStorage can throw under privacy modes — fall through to default.
+  }
+  return DEFAULT_LAB_MODE;
+}
+
 // Last-N tail of trace events folded into the chat ``frida_summary``
 // attachment. Kept small so the per-kind ATTACHMENT_BUDGETS["frida_summary"]
 // (4_000 chars on the backend) doesn't have to truncate aggressively.
@@ -86,7 +112,82 @@ const CHAT_ATTACH_POLL_MS = 2500;
 // here so the operator's "show context" preview matches what the model sees.
 const CHAT_CODE_BUDGET = 6_000;
 
-export function HookLabTab() {
+const LAB_MODES: { id: LabMode; label: string; hint: string }[] = [
+  { id: "trace", label: "Trace", hint: "UI → decision points → bypass plans (NEW)" },
+  { id: "manual-hooks", label: "Manual Hooks", hint: "Legacy Frida hook builder + sessions" },
+  { id: "graph", label: "Graph", hint: "Dedicated call-graph explorer" },
+];
+
+export function LabTab() {
+  const { appId } = useWorkbench();
+  const [mode, setModeState] = useState<LabMode>(() => loadStoredLabMode());
+
+  const setMode = useCallback((m: LabMode) => {
+    setModeState(m);
+    try {
+      window.localStorage.setItem(LAB_MODE_STORAGE_KEY, m);
+    } catch {
+      // Privacy mode / storage quota — not worth surfacing.
+    }
+  }, []);
+
+  return (
+    <div className="lab-tab-shell">
+      <nav className="lab-mode-rail" role="tablist" aria-label="Lab mode">
+        {LAB_MODES.map((m) => (
+          <button
+            key={m.id}
+            type="button"
+            role="tab"
+            aria-selected={mode === m.id}
+            className={`lab-mode-button ${mode === m.id ? "lab-mode-button-active" : ""}`}
+            onClick={() => setMode(m.id)}
+            title={m.hint}
+          >
+            {m.label}
+          </button>
+        ))}
+      </nav>
+      <div className="lab-mode-content">
+        {mode === "trace" && <LabTraceMode appId={appId} />}
+        {mode === "manual-hooks" && <ManualHooksMode />}
+        {mode === "graph" && <GraphMode />}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Graph mode — dedicated full-pane CallGraphView. Same component the Manual
+// Hooks mode uses on the left, but here it gets the full tab width so
+// operators can deep-dive without the 32% column constraint.
+// ---------------------------------------------------------------------------
+
+function GraphMode() {
+  const { appId, dossier } = useWorkbench();
+  const [, setSelected] = useState<SelectedNode | null>(null);
+  const defaultPackage =
+    typeof dossier?.apk_info?.package === "string" ? dossier.apk_info.package : null;
+  return (
+    <div className="lab-graph-mode">
+      <CallGraphView
+        appId={appId}
+        onSelectNode={setSelected}
+        appPackage={defaultPackage}
+        hitsByMethod={null}
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Manual Hooks mode — the legacy Hook Lab 3-column layout, untouched from the
+// pre-10.6 surface. Lifted into its own component so the mode switch is a
+// clean conditional render (avoids re-running ManualHooksMode's effects on
+// every mode hop).
+// ---------------------------------------------------------------------------
+
+function ManualHooksMode() {
   const { appId, dossier } = useWorkbench();
   const [selected, setSelected] = useState<SelectedNode | null>(null);
 
@@ -146,19 +247,14 @@ export function HookLabTab() {
     const grp = centerGroupRef.current;
     if (!grp) return;
     if (hookBuilderCollapsed) {
-      // Expanding — restore the layout the operator had before collapsing.
       grp.setLayout(lastExpandedSizesRef.current ?? HOOK_BUILDER_DEFAULT_LAYOUT);
     } else {
-      // Collapsing — donate the freed pixels to CodeView so the strip sits
-      // just above Chat. Snapshot current sizes first so expand can rewind.
       const sizes = grp.getLayout();
       lastExpandedSizesRef.current = [...sizes];
       const [code, hb, chat] = sizes.length === 3 ? sizes : HOOK_BUILDER_DEFAULT_LAYOUT;
       const delta = hb - HOOK_BUILDER_COLLAPSED_PCT;
       grp.setLayout([code + delta, HOOK_BUILDER_COLLAPSED_PCT, chat]);
     }
-    // ``hookBuilderCollapsed`` is updated by the Panel's onCollapse /
-    // onExpand callbacks, which fire when the size crosses ``collapsedSize``.
   };
 
   useEffect(() => {
@@ -236,26 +332,9 @@ export function HookLabTab() {
   );
 
   // -------------------------------------------------------------------------
-  // Frida → Cytoscape overlay map (sub-step 4.8).
-  //
-  // The overlay is "on" exactly when an active session is pinned. While
-  // ``chatHooks`` is still loading (``null``) we deliberately pass an empty
-  // Map rather than ``null`` so the overlay turns on immediately — the
-  // graph renders dimmed and the hits flow in on the next 2.5s poll. That
-  // matches the rest of the right pane (HookStatsPanel / FridaTracePanel
-  // both surface "session active, no events yet" affordances rather than
-  // hiding their UI). When there's no session, we pass ``null`` so the
-  // graph reverts to its plain 4.2 styling — operators get the static
-  // graph back the moment they detach.
-  //
-  // Keying by class.class_name + method_name matches the call_graph DB's
-  // dotted form (Smali → ".") to the Frida runtime's ``Java.use(name).$className``
-  // (also dotted, with ``$`` for inner-class boundaries on both sides). If
-  // method overloads ever caused an ambiguous hit (same name, different
-  // signatures), the count attached to the node would *under*-count rather
-  // than mis-attribute — hooks attribute by class+method, not by full
-  // descriptor, in 4.6's aggregator. Tracked as an overlay-precision
-  // follow-up in KNOWN_ISSUES (ISSUE-012 in 4.8 docs sweep).
+  // Frida → Cytoscape overlay map (sub-step 4.8). See LabTab docstring for
+  // the full rationale; the keying contract (class.dotted + method) matches
+  // the call_graph DB ↔ Frida runtime symbol shape.
   // -------------------------------------------------------------------------
   const hitsByMethod = useMemo<ReadonlyMap<string, number> | null>(() => {
     if (!activeSession) return null;
@@ -267,7 +346,7 @@ export function HookLabTab() {
   }, [activeSession, chatHooks]);
 
   return (
-    <PanelGroup direction="horizontal" autoSaveId="hook-h" className="tab-panels">
+    <PanelGroup direction="horizontal" autoSaveId="lab-manual-h" className="tab-panels">
       <Panel defaultSize={32} minSize={20} className="panel">
         <CallGraphView
           appId={appId}
@@ -281,10 +360,10 @@ export function HookLabTab() {
         <PanelGroup
           ref={centerGroupRef}
           direction="vertical"
-          autoSaveId="hook-center-v"
+          autoSaveId="lab-manual-center-v"
         >
           <Panel defaultSize={36} minSize={18} className="panel">
-            <HookLabCodeView
+            <LabCodeView
               appId={appId}
               selected={selected}
               onSourceLoaded={onSourceLoaded}
@@ -336,7 +415,7 @@ export function HookLabTab() {
               </button>
             ) : (
               <ChatDock
-                tab="hook"
+                tab="lab"
                 attachments={chatAttachments}
                 contextSummary={buildHookChatContextSummary({
                   selected,
@@ -376,7 +455,7 @@ export function HookLabTab() {
             <span className="sidebar-rail-label">Sessions</span>
           </button>
         ) : (
-          <PanelGroup direction="vertical" autoSaveId="hook-right-v">
+          <PanelGroup direction="vertical" autoSaveId="lab-manual-right-v">
             <Panel defaultSize={36} minSize={18} className="panel">
               <FridaSessionsList
                 selectedSessionId={activeSession?.sessionId ?? null}
@@ -451,14 +530,16 @@ type ActiveSession = {
 };
 
 // ---------------------------------------------------------------------------
-// In-tab CodeView wrapper. Loads the Java source for the selected node via
-// the existing /api/code/{app_id}/file endpoint and renders ``CodeView``
-// with ``emphasizeMethod={method_name}`` so the body is tinted; we don't
-// have a Java line number (the call graph stores Smali lines), but
-// ``emphasizeMethod`` does the heavy lifting visually.
+// In-tab CodeView wrapper (renamed from HookLabCodeView in 10.6 — same
+// implementation, new name to match the Lab umbrella). Loads the Java
+// source for the selected node via the existing /api/code/{app_id}/file
+// endpoint and renders ``CodeView`` with ``emphasizeMethod={method_name}``
+// so the body is tinted; we don't have a Java line number (the call graph
+// stores Smali lines), but ``emphasizeMethod`` does the heavy lifting
+// visually.
 // ---------------------------------------------------------------------------
 
-type HookLabCodeViewProps = {
+type LabCodeViewProps = {
   appId: string | null;
   selected: SelectedNode | null;
   /** Notifies the parent when the loaded Java source changes so it can
@@ -468,7 +549,7 @@ type HookLabCodeViewProps = {
   onSourceLoaded?: (source: string | null) => void;
 };
 
-function HookLabCodeView({ appId, selected, onSourceLoaded }: HookLabCodeViewProps) {
+function LabCodeView({ appId, selected, onSourceLoaded }: LabCodeViewProps) {
   const [source, setSource] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -542,29 +623,9 @@ function HookLabCodeView({ appId, selected, onSourceLoaded }: HookLabCodeViewPro
 }
 
 // ---------------------------------------------------------------------------
-// Chat-attachment plumbing (sub-step 4.7).
-//
-// The Hook Lab chat dock is the LLM's eye into the operator's current
-// pentest state. We forward four kinds of context as ChatAttachment[] so
-// the model can answer questions like "which hook should I add next?" or
-// "did the bypass actually fire?":
-//
-//   1. ``default`` — selected method header (class + method + smali id).
-//      Tiny, always-on, free in any per-kind budget.
-//   2. ``code`` — the decompiled Java file for the selected method, soft-
-//      capped at CHAT_CODE_BUDGET so the operator's "show context" preview
-//      mirrors what the model sees after backend truncation
-//      (``ATTACHMENT_BUDGETS["code"]`` == 6_000).
-//   3. ``frida_summary`` — JSON document combining the active session's
-//      ``hooks`` aggregate (per-(class, method) hits + top return values)
-//      and the last-N trace events tail. Backend ATTACHMENT_BUDGETS already
-//      has a 4_000-char slot for this kind (see DEC-022 / ChatDock).
-//   4. ``default`` — meta footer (active session id / template id / app
-//      id) so the model can disambiguate which app it's analysing without
-//      relying on chat history.
-//
-// Empty attachments are omitted entirely so the operator's "show context"
-// dot accurately reflects whether the model will see Hook Lab data.
+// Chat-attachment plumbing (sub-step 4.7). Unchanged from the original
+// HookLabTab; lifted here verbatim so Manual Hooks mode behaves identically
+// to the pre-10.6 tab.
 // ---------------------------------------------------------------------------
 
 type BuildAttachmentsArgs = {

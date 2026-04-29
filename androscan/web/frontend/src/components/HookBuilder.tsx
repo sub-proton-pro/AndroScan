@@ -62,7 +62,7 @@ const RENDER_DEBOUNCE_MS = 350;
 type Props = {
   appId: string | null;
   /** When the operator picks a method node in the call graph, the
-   *  parent (HookLabTab) passes the class name + method name down so
+   *  parent (LabTab) passes the class name + method name down so
    *  we can prefill the matching params. */
   prefillClassName?: string | null;
   prefillMethodName?: string | null;

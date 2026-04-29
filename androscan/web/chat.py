@@ -50,8 +50,30 @@ ATTACHMENT_BUDGETS: dict[str, int] = {
     "default": 2_000,
 }
 
-ALLOWED_TABS = {"reports", "inspect", "hook"}
+#: Canonical set of tab ids accepted by ``/api/chat``. The forward-looking
+#: name for the Frida instrumentation tab is ``"lab"`` (per Phase 10's
+#: Hook Lab → Lab rename, sub-step 10.6); ``"hook"`` is preserved as a
+#: back-compat alias so existing transcript files (which logged with
+#: ``tab="hook"`` before the rename) replay correctly when the operator
+#: scrolls back. New transcripts going forward write ``tab="lab"`` —
+#: ``_normalise_tab`` collapses the alias down to the canonical name on
+#: the read side.
+ALLOWED_TABS = {"reports", "inspect", "lab", "hook"}
+#: Map from incoming alias → canonical tab id. Kept tiny on purpose —
+#: ``hook`` is the only legacy id; future renames will append here.
+_TAB_ALIASES: dict[str, str] = {"hook": "lab"}
 ALLOWED_ROLES = {"user", "assistant", "system"}
+
+
+def _normalise_tab(tab: str) -> str:
+    """Collapse legacy tab ids (``hook``) to their canonical replacement
+    (``lab``). Pure / idempotent / case-tolerant — every code path that
+    keys off the tab id (system prompt selection, transcript routing,
+    rate-limiting bucket) routes through this so an upgrade-in-place
+    workspace never sees split state across the alias and its
+    canonical name."""
+    t = (tab or "").strip().lower()
+    return _TAB_ALIASES.get(t, t)
 
 # ---------------------------------------------------------------------------
 # Sanitization helpers
@@ -137,7 +159,7 @@ _TAB_SYSTEM_PROMPTS: dict[str, str] = {
         "and code paths are responsible for the selected UI element shown inside <context> blocks. "
         "Use only information in <context>. Be specific about activity / class / method when known."
     ),
-    "hook": (
+    "lab": (
         "You are a Frida instrumentation assistant. Suggest hooks based on the decompiled code and "
         "frida-trace summary shown inside <context> blocks. Always present hooks as code blocks the "
         "user must explicitly stage and confirm before running. Never claim to have executed anything."
@@ -151,7 +173,7 @@ _INJECTION_GUARD = (
 
 
 def system_prompt_for(tab: str) -> str:
-    base = _TAB_SYSTEM_PROMPTS.get(tab, _TAB_SYSTEM_PROMPTS["reports"])
+    base = _TAB_SYSTEM_PROMPTS.get(_normalise_tab(tab), _TAB_SYSTEM_PROMPTS["reports"])
     return f"{base}\n\n{_INJECTION_GUARD}"
 
 
@@ -268,7 +290,10 @@ def append_transcript(
         chat_dir.mkdir(exist_ok=True)
     except OSError:
         return None
-    path = chat_dir / f"{tab}.jsonl"
+    # Normalise the tab so legacy "hook" requests still write into the
+    # canonical "lab.jsonl" file. Mid-rename operators won't see their
+    # transcript split across two filenames.
+    path = chat_dir / f"{_normalise_tab(tab)}.jsonl"
     try:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -410,7 +435,11 @@ def handle_chat_request(
     if not ok:
         return 400, {"ok": False, "error": err}
 
-    tab = str(body["tab"]).strip().lower()
+    # Normalise the tab id so legacy "hook" requests share the rate-limit
+    # bucket + transcript filename + record["tab"] field with their
+    # canonical "lab" successor — operators upgrading mid-rename never
+    # see split state.
+    tab = _normalise_tab(str(body["tab"]))
     allowed, retry = _RATE_LIMITER.check_and_record(tab, now=now)
     if not allowed:
         return 429, {
@@ -524,7 +553,8 @@ async def stream_chat_request(
         yield _sse("error", {"error": err})
         return
 
-    tab = str(body["tab"]).strip().lower()
+    # Same alias-collapsing posture as the non-streaming entry point.
+    tab = _normalise_tab(str(body["tab"]))
     allowed, retry = _RATE_LIMITER.check_and_record(tab, now=now)
     if not allowed:
         yield _sse("error", {

@@ -1,8 +1,8 @@
 import { HealthDot } from "./components/HealthDot";
 import { TabBar } from "./components/TabBar";
 import { WorkbenchProvider, useWorkbench } from "./context/WorkbenchContext";
-import { HookLabTab } from "./tabs/HookLabTab";
 import { InspectTab } from "./tabs/InspectTab";
+import { LabTab } from "./tabs/LabTab";
 import { ReportsTab } from "./tabs/ReportsTab";
 import { SettingsTab } from "./tabs/SettingsTab";
 
@@ -16,7 +16,7 @@ function ActiveTab() {
     <>
       {tab === "reports" && <ReportsTab />}
       {tab === "inspect" && <InspectTab />}
-      {tab === "hook" && <HookLabTab />}
+      {tab === "lab" && <LabTab />}
       <div className="settings-tab-host" hidden={tab !== "settings"}>
         <SettingsTab />
       </div>

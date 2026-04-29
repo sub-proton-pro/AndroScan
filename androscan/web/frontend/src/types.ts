@@ -23,7 +23,13 @@ export type Report = {
   [k: string]: unknown;
 };
 
-export type TabId = "reports" | "inspect" | "hook" | "settings";
+// Phase 10 sub-step 10.6: ``"hook"`` was renamed to ``"lab"`` to reflect
+// the broader scope (Trace mode + Manual Hooks mode + Graph mode under one
+// umbrella). The chat backend still accepts ``"hook"`` as a back-compat
+// alias for legacy transcripts; the frontend has dropped the literal so no
+// new code is allowed to reintroduce the old id. Bookmarks of ``#/hook``
+// are auto-redirected to ``#/lab`` in ``WorkbenchContext.tabFromHash``.
+export type TabId = "reports" | "inspect" | "lab" | "settings";
 
 export type ChatMessage = {
   id: string;

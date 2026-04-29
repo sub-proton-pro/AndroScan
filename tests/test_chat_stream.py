@@ -240,3 +240,92 @@ def test_chat_stream_route_returns_event_stream(tmp_path: Path, monkeypatch: pyt
     assert kinds[-1] == "done"
     assert any(k == "thinking" for k in kinds)
     assert any(k == "content" for k in kinds)
+
+
+# ---------------------------------------------------------------------------
+# Hook Lab → Lab tab rename + back-compat alias (Phase 10 sub-step 10.6).
+#
+# The Hook Lab tab was renamed to ``Lab`` in 10.6. The chat layer accepts
+# both ids (``"hook"`` is the legacy alias) — every request is routed
+# through ``_normalise_tab`` so the system prompt lookup, the rate-limit
+# bucket, and the transcript filename all collapse onto the canonical
+# ``"lab"`` regardless of which alias the client sent. Pinning the
+# round-trip here so a future rename can't accidentally split the alias's
+# state across two buckets.
+
+
+def test_lab_tab_writes_canonical_transcript_filename(tmp_path: Path) -> None:
+    """A request with ``tab="lab"`` writes ``chat/lab.jsonl`` — the
+    canonical filename going forward."""
+    root = tmp_path / "apps"
+    (root / "myapp" / "01-jan-26_12-00-00").mkdir(parents=True)
+
+    streamer = _make_streamer([], ["ok"])
+    asyncio.run(_drain(stream_chat_request(
+        {"tab": "lab", "prompt": "hi", "app_id": "myapp", "run_ts": "01-jan-26_12-00-00"},
+        Config.default(), root, streamer=streamer,
+    )))
+
+    log = (root / "myapp" / "01-jan-26_12-00-00" / "chat" / "lab.jsonl").read_text()
+    record = json.loads(log.strip().splitlines()[-1])
+    assert record["tab"] == "lab"
+    assert record["reply_chars"] == 2
+
+
+def test_legacy_hook_tab_is_aliased_to_lab(tmp_path: Path) -> None:
+    """Legacy ``tab="hook"`` requests still validate, route to the
+    same system prompt, and append to the ``chat/lab.jsonl`` file
+    (NOT a stale ``hook.jsonl``) so an upgraded workspace doesn't end
+    up with split transcripts. The ``record["tab"]`` written to disk
+    is also normalised — chat history readers see one canonical id."""
+    root = tmp_path / "apps"
+    (root / "myapp" / "01-jan-26_12-00-00").mkdir(parents=True)
+
+    streamer = _make_streamer([], ["legacy ok"])
+    asyncio.run(_drain(stream_chat_request(
+        {"tab": "hook", "prompt": "hi", "app_id": "myapp", "run_ts": "01-jan-26_12-00-00"},
+        Config.default(), root, streamer=streamer,
+    )))
+
+    chat_dir = root / "myapp" / "01-jan-26_12-00-00" / "chat"
+    assert (chat_dir / "lab.jsonl").is_file(), "alias must write to canonical filename"
+    assert not (chat_dir / "hook.jsonl").is_file(), "no stale alias filename should appear"
+    record = json.loads((chat_dir / "lab.jsonl").read_text().strip().splitlines()[-1])
+    assert record["tab"] == "lab"
+
+
+def test_lab_and_hook_share_the_same_system_prompt() -> None:
+    """The Frida-instrumentation system prompt is keyed under ``"lab"``;
+    the alias collapse means asking for ``"hook"`` returns the same
+    prompt verbatim. Pin so a future copy-edit of the lab prompt
+    doesn't accidentally only update the alias path."""
+    assert chat_module.system_prompt_for("lab") == chat_module.system_prompt_for("hook")
+    # And distinct from the other tabs (sanity).
+    assert chat_module.system_prompt_for("lab") != chat_module.system_prompt_for("reports")
+
+
+def test_lab_and_hook_share_the_same_rate_limit_bucket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A burst that mixes ``hook`` + ``lab`` tab ids must consume the
+    same rate-limit bucket — otherwise a malicious / buggy client
+    could double its quota by alternating aliases."""
+    root = tmp_path / "apps"
+    (root / "myapp" / "01-jan-26_12-00-00").mkdir(parents=True)
+    monkeypatch.setattr(chat_module, "_RATE_LIMITER", chat_module._TabRateLimiter(1))
+
+    streamer = _make_streamer([], ["ok"])
+    base = time.monotonic()
+    body_lab = {"tab": "lab", "prompt": "hi", "app_id": "myapp", "run_ts": "01-jan-26_12-00-00"}
+    body_hook = {"tab": "hook", "prompt": "hi", "app_id": "myapp", "run_ts": "01-jan-26_12-00-00"}
+
+    e1 = parse_sse(asyncio.run(_drain(
+        stream_chat_request(body_lab, Config.default(), root, streamer=streamer, now=base)
+    )))
+    assert "done" in [k for k, _ in e1]
+
+    # Second call uses the legacy alias — the bucket is shared so it
+    # must trip the rate limiter (1 turn/min).
+    e2 = parse_sse(asyncio.run(_drain(
+        stream_chat_request(body_hook, Config.default(), root, streamer=streamer, now=base + 0.05)
+    )))
+    assert [k for k, _ in e2] == ["error"]
+    assert "rate limit" in e2[0][1]["error"]

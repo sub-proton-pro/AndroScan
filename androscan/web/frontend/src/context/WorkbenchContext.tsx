@@ -19,10 +19,23 @@ import type {
   TriageMap,
 } from "../types";
 
-const TABS: TabId[] = ["reports", "inspect", "hook", "settings"];
+const TABS: TabId[] = ["reports", "inspect", "lab", "settings"];
+
+// Phase 10 sub-step 10.6: a bookmark of ``#/hook`` (the pre-rename id)
+// silently jumps to ``#/lab``. We rewrite the URL via ``replaceState`` so
+// the browser history doesn't grow an extra entry, and so a subsequent
+// share / copy of the URL hands out the canonical id.
+const _LEGACY_TAB_REDIRECTS: Readonly<Record<string, TabId>> = { hook: "lab" };
 
 function tabFromHash(): TabId {
   const raw = window.location.hash.replace(/^#\/?/, "");
+  if (raw in _LEGACY_TAB_REDIRECTS) {
+    const target = _LEGACY_TAB_REDIRECTS[raw];
+    if (typeof window !== "undefined" && window.history?.replaceState) {
+      window.history.replaceState(null, "", `#/${target}`);
+    }
+    return target;
+  }
   return (TABS as string[]).includes(raw) ? (raw as TabId) : "reports";
 }
 
@@ -54,7 +67,7 @@ type WorkbenchState = {
   status: string;
   setStatus: (s: string) => void;
 
-  // Cross-tab "open this file in the Code Browser" intent. The Hook Lab
+  // Cross-tab "open this file in the Code Browser" intent. The Lab
   // graph pane writes here when the operator picks "Open in Inspect" on a
   // node tooltip; the Inspect tab consumes it on mount/change and clears
   // it. ``ts`` forces re-fire when the same target is requested twice in
@@ -100,7 +113,7 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   const [chats, setChats] = useState<Record<TabId, ChatMessage[]>>({
     reports: [],
     inspect: [],
-    hook: [],
+    lab: [],
     settings: [],
   });
 

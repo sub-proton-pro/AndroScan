@@ -70,7 +70,7 @@ import {
   type GraphStatusResponse,
 } from "../api/graph";
 import { useWorkbench } from "../context/WorkbenchContext";
-import { appPackagePrefix } from "../util/appPackage";
+import { appPackagePrefix, isAppPackage } from "../util/appPackage";
 import { classNameToJavaRelPath } from "../util/smaliClassToFile";
 
 // Register extensions exactly once. Idempotent with React strict-mode
@@ -91,7 +91,7 @@ const DEFAULT_HOPS = 2;
 
 type Props = {
   appId: string | null;
-  /** Selected node — drives the in-tab CodeView in HookLabTab. The graph
+  /** Selected node — drives the in-tab CodeView in LabTab. The graph
    *  pane never reads this back; it only fires the callback on click. */
   onSelectNode: (sel: SelectedNode | null) => void;
   /** Dossier package (e.g. ``com.example.weakbank.low``) used by the
@@ -112,7 +112,7 @@ type Props = {
 };
 
 // Stable, dollar-aware join used by both the overlay-builder side
-// (``HookLabTab``) and the consumer side (this component). Inner-class
+// (``LabTab``) and the consumer side (this component). Inner-class
 // boundaries surface differently in Smali ("com.example.Foo$Inner") vs.
 // some Java reflection paths (sometimes ".") — keeping the format
 // explicit avoids silent miss-mapping when the key crosses tiers.
@@ -198,6 +198,18 @@ export function CallGraphView({
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const searchListRef = useRef<HTMLUListElement | null>(null);
 
+  // -------- Browse-mode tree state ---------------------------------------
+  // The dropdown shows a hierarchical Package → Class → Method tree (modeled
+  // on Inspect tab's ``ClassMethodTree``) when the filter is empty. The
+  // typeahead search hits take over the moment the user types. State lives
+  // up here so expansion is preserved across open/close cycles — matches the
+  // Inspect tab's behaviour and avoids the operator having to re-expand to
+  // the same node every time they reopen the dropdown.
+  const [openPkgs, setOpenPkgs] = useState<Record<string, boolean>>({});
+  const [openCls, setOpenCls] = useState<Record<string, boolean>>({});
+  const [showAppSection, setShowAppSection] = useState<boolean>(true);
+  const [showLibSection, setShowLibSection] = useState<boolean>(false);
+
   // Cytoscape ---------------------------------------------------------------
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
@@ -250,6 +262,10 @@ export function CallGraphView({
   // changes so each project gets its own fresh default.
   useEffect(() => {
     userTouchedAppOnly.current = false;
+    // Drop any per-(package, class) expansion state from the previous
+    // project so the dropdown tree opens cleanly for the new app.
+    setOpenPkgs({});
+    setOpenCls({});
   }, [appId]);
   useEffect(() => {
     if (userTouchedAppOnly.current) return;
@@ -408,7 +424,7 @@ export function CallGraphView({
 
   // -------- Render Cytoscape elements when data changes --------------------
   // ``hitsByMethod`` is intentionally in the dep array: a fresh hooks
-  // poll (every 2.5 s in HookLabTab) updates the same Map reference
+  // poll (every 2.5 s in LabTab's Manual Hooks mode) updates the same Map reference
   // identity-wise, so re-rendering on identity change keeps the overlay
   // live without re-laying out unless the underlying data actually
   // moved. We *do* recompute layout when overlay turns on/off because
@@ -561,20 +577,27 @@ export function CallGraphView({
   const flatHits = useMemo(() => flattenHits(searchHits), [searchHits]);
   const flatHitsLength = flatHits.length;
 
+  // Browse-mode tree (Package → Class → Method), shown in the dropdown
+  // when the filter is empty. Recomputed only when the underlying graph,
+  // the App-only-vs-libraries split, or the External toggle change — *not*
+  // on every keystroke (the typeahead path doesn't read this).
+  const browseTree = useMemo(
+    () => buildBrowseTree(graph, appPackage, showExternal),
+    [graph, appPackage, showExternal],
+  );
+
   // Open the dropdown the moment the filter goes non-empty *and* the
-  // input is focused. Close (and reset the active row) when the filter
-  // clears. The blur-outside / click-outside / Escape paths close it
-  // independently below.
+  // input is focused. We deliberately do NOT auto-close when the filter
+  // clears — empty filter switches the dropdown into browse-tree mode
+  // (Package → Class → Method), which mirrors Inspect tab's
+  // ``ClassMethodTree``. The blur-outside / click-outside / Escape paths
+  // close it independently below; the operator picks the close moment.
   useEffect(() => {
-    if (!filter.trim()) {
-      setSearchOpen(false);
-      setActiveHitIdx(0);
-      return;
-    }
+    setActiveHitIdx(0);
+    if (!filter.trim()) return;
     if (document.activeElement === searchInputRef.current) {
       setSearchOpen(true);
     }
-    setActiveHitIdx(0);
   }, [filter]);
 
   // Click-outside handler — only attached while the popover is open so
@@ -627,8 +650,17 @@ export function CallGraphView({
   // Keyboard handler bound to the input. ↑/↓ walk active row,
   // Enter activates, Escape closes. Tab is left to the browser so
   // the operator can move focus out of the input without trapping.
+  // Escape always closes regardless of mode (typeahead vs. browse tree)
+  // so the operator has one consistent dismissal key.
   const onSearchKeyDown = useCallback(
     (e: ReactKeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "Escape") {
+        if (searchOpen) {
+          setSearchOpen(false);
+          e.preventDefault();
+        }
+        return;
+      }
       if (!searchOpen || flatHitsLength === 0) {
         if (e.key === "ArrowDown" && filter.trim()) {
           // Re-open if user pressed down after a programmatic close.
@@ -649,9 +681,6 @@ export function CallGraphView({
           activateHit(hit);
           e.preventDefault();
         }
-      } else if (e.key === "Escape") {
-        setSearchOpen(false);
-        e.preventDefault();
       }
     },
     [searchOpen, flatHits, flatHitsLength, activeHitIdx, filter, activateHit],
@@ -703,24 +732,33 @@ export function CallGraphView({
             onClick={() => {
               if (searchOpen) {
                 setSearchOpen(false);
-              } else if (filter.trim()) {
-                setSearchOpen(true);
-                searchInputRef.current?.focus();
               } else {
+                // Open in either typeahead (filter set) or browse-tree
+                // (filter empty) mode. Either way, focus the input so the
+                // operator can immediately start typing to refine.
+                setSearchOpen(true);
                 searchInputRef.current?.focus();
               }
             }}
             disabled={cgState !== "ready"}
             title={
-              searchOpen ? "Hide suggestions" : "Show suggestions"
+              searchOpen
+                ? "Hide list"
+                : filter.trim()
+                  ? "Show suggestions"
+                  : "Browse packages, classes & methods"
             }
             aria-label={
-              searchOpen ? "Hide suggestions" : "Show suggestions"
+              searchOpen
+                ? "Hide list"
+                : filter.trim()
+                  ? "Show suggestions"
+                  : "Browse packages, classes & methods"
             }
           >
             {searchOpen ? "▲" : "▼"}
           </button>
-          {searchOpen && flatHitsLength > 0 && (
+          {searchOpen && filter.trim() && flatHitsLength > 0 && (
             <SearchDropdown
               hits={searchHits}
               activeIdx={activeHitIdx}
@@ -729,13 +767,42 @@ export function CallGraphView({
               listRef={searchListRef}
             />
           )}
-          {searchOpen && flatHitsLength === 0 && filter.trim() && graph && (
+          {searchOpen && filter.trim() && flatHitsLength === 0 && graph && (
             <div style={searchEmptyStyle}>
               No matches in loaded graph data
               {graph.total_nodes > graph.nodes.length
                 ? ` (truncated to ${graph.nodes.length} of ${graph.total_nodes} — try toggling "App only")`
                 : ""}
             </div>
+          )}
+          {searchOpen && !filter.trim() && (
+            <BrowseTreeDropdown
+              tree={browseTree}
+              graphLoaded={graph != null}
+              openPkgs={openPkgs}
+              setOpenPkgs={setOpenPkgs}
+              openCls={openCls}
+              setOpenCls={setOpenCls}
+              showApp={showAppSection}
+              setShowApp={setShowAppSection}
+              showLib={showLibSection}
+              setShowLib={setShowLibSection}
+              onActivateMethod={(node, klass) => {
+                // Reuse the typeahead activation path so a method click
+                // here behaves identically to picking it from the search
+                // results (focus mode + decompile-pane select + close).
+                activateHit({
+                  kind: "method",
+                  label: `${klass.simple_name || klass.class_name}.${node.method_name}`,
+                  secondary: klass.package || "(default)",
+                  score: 0,
+                  firstNodeId: node.id,
+                  node,
+                  klass,
+                });
+              }}
+              listRef={searchListRef}
+            />
           )}
         </div>
         <label style={toggleLabelStyle}>
@@ -1054,6 +1121,143 @@ export function searchGraph(
  *  then methods (matches visual order in the popover). */
 export function flattenHits(g: SearchHitGroups): SearchHit[] {
   return [...g.packages, ...g.classes, ...g.methods];
+}
+
+// ---------------------------------------------------------------------------
+// Browse-tree dropdown — Package → Class → Method hierarchy
+// ---------------------------------------------------------------------------
+//
+// Shown in the toolbar dropdown when the filter input is empty (i.e. the
+// operator clicked the chevron without typing). Mirrors Inspect tab's
+// ``ClassMethodTree`` shape so the two surfaces feel like one tool: a
+// top-level App vs. Library split (using the shared ``isAppPackage``
+// heuristic), each section collapsible, packages collapsible, classes
+// collapsible. Methods are leaves — clicking one drills the call graph
+// into focus mode at that node and seeds the decompile pane (same control
+// flow as activating a typeahead method hit).
+//
+// Why a tree here at all? When the call-graph package overview is dense
+// (or in the user-reported single-package case) the operator has no way
+// to discover *which* methods exist without first focusing on a package.
+// The tree gives a flat browseable index of every loaded method without
+// requiring the operator to know its name in advance.
+//
+// External / library nodes are filtered the same way as the package
+// overview: the ``showExternal`` toggle gates ``is_external`` nodes;
+// the ``appOnly`` toggle gates the backend ``package_prefix`` filter
+// (which already drops library packages before we see them). We pass
+// ``showExternal`` through so a future change to the toggle's semantics
+// doesn't desync the tree from the rest of the pane.
+// ---------------------------------------------------------------------------
+
+export type BrowseTreePackage = {
+  name: string;
+  /** First method node in the package — drilled-into when the operator
+   *  picks a package row directly. Currently unused (clicks expand
+   *  rather than drill) but exposed so the row can grow a "focus here"
+   *  affordance later without re-walking the data. */
+  firstNodeId: number;
+  classes: BrowseTreeClass[];
+};
+
+export type BrowseTreeClass = {
+  classId: number;
+  fqn: string;
+  simpleName: string;
+  pkg: GraphClass;
+  firstNodeId: number;
+  methods: BrowseTreeMethod[];
+};
+
+export type BrowseTreeMethod = {
+  node: GraphNode;
+  klass: GraphClass;
+};
+
+export type BrowseTree = {
+  app: BrowseTreePackage[];
+  lib: BrowseTreePackage[];
+};
+
+export function buildBrowseTree(
+  graph: GraphListResponse | null,
+  appPackage: string | null,
+  showExternal: boolean,
+): BrowseTree {
+  const empty: BrowseTree = { app: [], lib: [] };
+  if (!graph) return empty;
+  const classMap = buildClassMap(graph.classes);
+
+  // First pass: bucket nodes by class id so each class row has its
+  // (sorted) method list. External nodes / classes obey the same toggle
+  // the package overview uses.
+  const nodesByClass = new Map<number, GraphNode[]>();
+  for (const n of graph.nodes) {
+    if (!showExternal && n.is_external) continue;
+    const cls = classMap.get(n.class_id);
+    if (!cls) continue;
+    if (!showExternal && cls.is_external) continue;
+    let arr = nodesByClass.get(n.class_id);
+    if (!arr) {
+      arr = [];
+      nodesByClass.set(n.class_id, arr);
+    }
+    arr.push(n);
+  }
+
+  // Second pass: bucket classes by package, retaining only classes with
+  // at least one node we'd render. Empty packages are silently dropped.
+  const classesByPkg = new Map<string, GraphClass[]>();
+  for (const cls of graph.classes) {
+    if (!nodesByClass.has(cls.id)) continue;
+    if (!showExternal && cls.is_external) continue;
+    const pkg = cls.package || "(default)";
+    let arr = classesByPkg.get(pkg);
+    if (!arr) {
+      arr = [];
+      classesByPkg.set(pkg, arr);
+    }
+    arr.push(cls);
+  }
+
+  const allPkgs: BrowseTreePackage[] = [];
+  for (const [pkgName, classes] of classesByPkg) {
+    classes.sort((a, b) =>
+      (a.simple_name || a.class_name).localeCompare(
+        b.simple_name || b.class_name,
+      ),
+    );
+    const treeClasses: BrowseTreeClass[] = [];
+    for (const cls of classes) {
+      const nodes = (nodesByClass.get(cls.id) ?? []).slice();
+      nodes.sort((a, b) => a.method_name.localeCompare(b.method_name));
+      if (nodes.length === 0) continue;
+      treeClasses.push({
+        classId: cls.id,
+        fqn: cls.class_name,
+        simpleName: cls.simple_name || cls.class_name,
+        pkg: cls,
+        firstNodeId: nodes[0].id,
+        methods: nodes.map((node) => ({ node, klass: cls })),
+      });
+    }
+    if (treeClasses.length === 0) continue;
+    allPkgs.push({
+      name: pkgName,
+      firstNodeId: treeClasses[0].firstNodeId,
+      classes: treeClasses,
+    });
+  }
+  allPkgs.sort((a, b) => a.name.localeCompare(b.name));
+
+  // App vs. Library split, identical heuristic to ClassMethodTree so the
+  // two surfaces agree on what counts as the operator's own code.
+  const app: BrowseTreePackage[] = [];
+  const lib: BrowseTreePackage[] = [];
+  for (const p of allPkgs) {
+    (isAppPackage(p.name, appPackage) ? app : lib).push(p);
+  }
+  return { app, lib };
 }
 
 function lookupClass(classes: GraphClass[], id: number): GraphClass | undefined {
@@ -1711,6 +1915,213 @@ function SearchDropdown(props: {
     </ul>
   );
 }
+
+/** Browse-tree dropdown — mirrors Inspect tab's ``ClassMethodTree``
+ *  visually (App / Library top-level sections + per-package + per-class
+ *  expand) but renders inside the call-graph search dropdown popover.
+ *  Method clicks are the only "commit" action; package and class clicks
+ *  toggle expansion so the operator can drill down without committing.
+ *
+ *  Reuses the global ``tree-*`` CSS classes so styling stays in sync
+ *  with Inspect tab — change one and both panes update. */
+function BrowseTreeDropdown(props: {
+  tree: BrowseTree;
+  graphLoaded: boolean;
+  openPkgs: Record<string, boolean>;
+  setOpenPkgs: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  openCls: Record<string, boolean>;
+  setOpenCls: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  showApp: boolean;
+  setShowApp: React.Dispatch<React.SetStateAction<boolean>>;
+  showLib: boolean;
+  setShowLib: React.Dispatch<React.SetStateAction<boolean>>;
+  onActivateMethod: (node: GraphNode, klass: GraphClass) => void;
+  listRef: RefObject<HTMLUListElement>;
+}) {
+  const {
+    tree,
+    graphLoaded,
+    openPkgs,
+    setOpenPkgs,
+    openCls,
+    setOpenCls,
+    showApp,
+    setShowApp,
+    showLib,
+    setShowLib,
+    onActivateMethod,
+    listRef,
+  } = props;
+  const isEmpty = tree.app.length === 0 && tree.lib.length === 0;
+
+  if (!graphLoaded) {
+    return (
+      <div style={searchEmptyStyle}>Loading graph data…</div>
+    );
+  }
+  if (isEmpty) {
+    return (
+      <div style={searchEmptyStyle}>
+        No methods loaded yet. Try toggling "App only" or "External" to
+        broaden the package filter.
+      </div>
+    );
+  }
+
+  const renderPackages = (pkgs: BrowseTreePackage[]) =>
+    pkgs.map((p) => {
+      const pkgKey = p.name;
+      const isPkgOpen = openPkgs[pkgKey] ?? false;
+      return (
+        <li key={pkgKey} className="tree-pkg">
+          <button
+            type="button"
+            className="tree-toggle"
+            onClick={() =>
+              setOpenPkgs((s) => ({ ...s, [pkgKey]: !isPkgOpen }))
+            }
+            title={p.name}
+          >
+            <span className="tree-caret">{isPkgOpen ? "▾" : "▸"}</span>
+            <span className="tree-name">{p.name}</span>
+            <span className="muted small"> ({p.classes.length})</span>
+          </button>
+          {isPkgOpen && (
+            <ul className="tree-classes">
+              {p.classes.map((c) => {
+                const clsKey = `${pkgKey}.${c.simpleName}#${c.classId}`;
+                const isClsOpen = openCls[clsKey] ?? false;
+                return (
+                  <li key={clsKey} className="tree-class">
+                    <button
+                      type="button"
+                      className="tree-toggle"
+                      onClick={() =>
+                        setOpenCls((s) => ({ ...s, [clsKey]: !isClsOpen }))
+                      }
+                      title={c.fqn}
+                    >
+                      <span className="tree-caret">
+                        {c.methods.length ? (isClsOpen ? "▾" : "▸") : " "}
+                      </span>
+                      <span className="tree-name">{c.simpleName}</span>
+                      {c.methods.length > 0 && (
+                        <span className="muted small">
+                          {" "}
+                          ({c.methods.length})
+                        </span>
+                      )}
+                    </button>
+                    {isClsOpen && c.methods.length > 0 && (
+                      <ul className="tree-methods">
+                        {c.methods.map((m) => (
+                          <li key={`${m.node.id}`}>
+                            <button
+                              type="button"
+                              className="tree-method"
+                              // Use mousedown so the input doesn't blur
+                              // before activation runs (matches the
+                              // typeahead row pattern above).
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                onActivateMethod(m.node, m.klass);
+                              }}
+                              title={`${c.fqn}.${m.node.method_name}`}
+                            >
+                              {m.node.method_name}()
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </li>
+      );
+    });
+
+  return (
+    <ul
+      ref={listRef}
+      id="callgraph-search-listbox"
+      role="listbox"
+      style={browseTreeDropdownStyle}
+    >
+      <li style={{ listStyle: "none" }}>
+        <button
+          type="button"
+          className="tree-section-head-btn"
+          onClick={() => setShowApp((v) => !v)}
+          aria-expanded={showApp}
+        >
+          <span className="tree-caret">{showApp ? "▾" : "▸"}</span>
+          <span className="tree-section-title">App packages</span>
+          <span className="muted small tree-section-count">
+            {tree.app.length}
+          </span>
+        </button>
+        {showApp &&
+          (tree.app.length === 0 ? (
+            <p className="muted small tree-empty">
+              No app-owned packages — toggle "App only" off to see bundled
+              libraries.
+            </p>
+          ) : (
+            <ul className="tree-root">{renderPackages(tree.app)}</ul>
+          ))}
+      </li>
+      <li style={{ listStyle: "none" }}>
+        <button
+          type="button"
+          className="tree-section-head-btn"
+          onClick={() => setShowLib((v) => !v)}
+          aria-expanded={showLib}
+        >
+          <span className="tree-caret">{showLib ? "▾" : "▸"}</span>
+          <span className="tree-section-title">
+            Android / library packages
+          </span>
+          <span className="muted small tree-section-count">
+            {tree.lib.length}
+          </span>
+        </button>
+        {showLib &&
+          (tree.lib.length === 0 ? (
+            <p className="muted small tree-empty">No library packages.</p>
+          ) : (
+            <ul className="tree-root">{renderPackages(tree.lib)}</ul>
+          ))}
+      </li>
+      <li style={searchHintRowStyle}>
+        <span className="muted small">click a method to focus · esc close</span>
+      </li>
+    </ul>
+  );
+}
+
+const browseTreeDropdownStyle: CSSProperties = {
+  position: "absolute",
+  top: "calc(100% + 4px)",
+  left: 0,
+  right: 0,
+  maxHeight: "60vh",
+  overflowY: "auto",
+  background: "var(--panel-2)",
+  border: "1px solid var(--border)",
+  borderRadius: 4,
+  padding: "0.25rem 0",
+  margin: 0,
+  fontSize: "0.78rem",
+  zIndex: 30,
+  boxShadow: "0 4px 12px rgba(0, 0, 0, 0.3)",
+  // Constrain width — when the toolbar is wide the input can stretch
+  // past where a useful hierarchy is readable, so we cap at a sensible
+  // browse width while still anchoring to the input.
+  minWidth: "20em",
+};
 
 const searchDropdownStyle: CSSProperties = {
   position: "absolute",

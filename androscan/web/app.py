@@ -40,6 +40,7 @@ from androscan.web.graph_routes import (
 from androscan.web.rag_routes import build_rag_router, schedule_rag_build_after_decompile
 from androscan.web.settings_routes import build_settings_router
 from androscan.web.status_routes import build_status_router
+from androscan.web.trace_routes import build_trace_router
 from androscan.web.triage import load_triage, upsert_triage
 
 logger = logging.getLogger(__name__)
@@ -813,6 +814,11 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
 
     app.include_router(build_rag_router(config, _app_dir))
     app.include_router(build_graph_router(config, _app_dir))
+    # Phase 10 sub-step 10.6: per-app Behavior Trace cache routes.
+    # Pure-SQLite reads + a synchronous skill-invocation POST; the route
+    # surface is intentionally narrow so 10.7's frontend can build
+    # against it without further iteration.
+    app.include_router(build_trace_router(_current_config, _app_dir))
     app.include_router(
         build_status_router(
             config_provider=_current_config,

@@ -3696,13 +3696,14 @@ code { color: var(--accent); }
 }
 
 /* ===========================================================================
- * Hook Lab — right-pane tab strip + Hooks/Scope panels (sub-step 4.6).
+ * Lab tab — Manual Hooks mode right-pane tab strip + Hooks/Scope panels
+ * (Hook Lab sub-step 4.6; renamed under the Lab umbrella in 10.6).
  *
  * The tab strip wraps Trace, Hooks, and Scope into a single right-pane slot
- * driven by ``HookLabTab``'s ``rightTab`` state. The CSS namespaces are
- * .right-pane-tabs / .hookstats-* / .scope-* — kept distinct from the
- * existing .trace-* / .frida-session-* prefixes so a grep-by-prefix tells
- * an operator which file owns the styling.
+ * driven by ``LabTab``'s Manual Hooks mode ``rightTab`` state. The CSS
+ * namespaces are .right-pane-tabs / .hookstats-* / .scope-* — kept distinct
+ * from the existing .trace-* / .frida-session-* prefixes so a grep-by-prefix
+ * tells an operator which file owns the styling.
  * =========================================================================== */
 
 .right-pane-tabs {
@@ -4050,4 +4051,135 @@ code { color: var(--accent); }
 
 .scope-empty {
   margin: 0.25rem 0 0 0;
+}
+
+/* ===========================================================================
+ * Lab tab — three-mode left-rail switcher (Phase 10 sub-step 10.6).
+ *
+ * The rail is a thin vertical strip pinned to the left edge of the Lab tab.
+ * Picking a button swaps the right-hand content area between Trace,
+ * Manual Hooks, and Graph modes; the active button gets the same
+ * accent-bar treatment as the top-level .tab-active so the visual hierarchy
+ * stays consistent (top tabs select a tab; this rail selects a mode within
+ * the Lab tab).
+ *
+ * Layout intent:
+ *   ┌───────┬─────────────────────────────────────┐
+ *   │ Trace │                                     │
+ *   │ Manual│   Mode-specific content             │
+ *   │ Graph │                                     │
+ *   └───────┴─────────────────────────────────────┘
+ * =========================================================================== */
+
+.lab-tab-shell {
+  display: flex;
+  flex-direction: row;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+}
+
+.lab-mode-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  flex: 0 0 auto;
+  width: 7.5rem;
+  padding: 0.5rem 0.4rem;
+  border-right: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.lab-mode-button {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-left: 2px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.5rem 0.6rem;
+  text-align: left;
+  border-radius: 3px;
+}
+
+.lab-mode-button:hover {
+  color: var(--text);
+  background: var(--bg);
+}
+
+.lab-mode-button-active,
+.lab-mode-button[aria-selected="true"] {
+  color: var(--accent);
+  background: var(--bg);
+  border-left-color: var(--accent);
+}
+
+.lab-mode-content {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Graph mode is a single full-pane CallGraphView — give it a flex child so
+   the canvas stretches to fill the available space rather than collapsing
+   to its intrinsic size. */
+.lab-graph-mode {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Trace mode placeholder (LabTraceMode.tsx). The full BehaviorAnchorCard /
+   DecisionTimeline / BypassPlanCard land in 10.7; for 10.6 we just lay out
+   the status block + the "10.7 will fill this" notice. */
+.lab-trace-mode {
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  overflow: auto;
+}
+
+.lab-trace-stub {
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  background: var(--panel-2);
+}
+
+.lab-trace-stub p {
+  margin: 0 0 0.5rem 0;
+}
+
+.lab-trace-stub p:last-child {
+  margin-bottom: 0;
+}
+
+.lab-trace-status h3 {
+  margin: 0 0 0.4rem 0;
+  font-size: 0.95rem;
+  color: var(--text);
+}
+
+.lab-trace-status-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.lab-trace-status-grid dt {
+  color: var(--muted);
+}
+
+.lab-trace-status-grid dd {
+  margin: 0;
+  color: var(--text);
 }
