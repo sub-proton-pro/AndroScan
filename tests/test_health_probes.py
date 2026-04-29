@@ -207,7 +207,10 @@ def test_probe_pkg_running_actually_running(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_probe_frida_server_running(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``adb shell pidof frida-server`` returning a pid → ok=True, running=True."""
+    """``adb shell pidof frida-server`` returning a pid → ok=True, running=True,
+    detection=='pidof'. ``ps -A`` runs unconditionally to enrich uid +
+    helper, but the simple factory returns the same canned response
+    for every adb call so the row count is too short to extract uid."""
     monkeypatch.setattr(
         "asyncio.create_subprocess_exec",
         _make_subprocess_factory({"adb": _FakeProc(0, b"4321\n", b"")}),
@@ -216,11 +219,22 @@ def test_probe_frida_server_running(monkeypatch: pytest.MonkeyPatch) -> None:
     assert out["ok"] is True
     assert out["running"] is True
     assert out["pid"] == 4321
+    # ps -A row was empty → can't determine uid / helper. Probe still
+    # reports running because pidof gave us a positive PID.
+    assert out["uid"] is None
+    assert out["helper_running"] is False
+    assert out["detection"] == "pidof"
     assert out["error"] is None
 
 
 def test_probe_frida_server_not_running(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Empty stdout from ``pidof`` → not running, error surfaced."""
+    """Empty stdout from ``pidof``, ``ps``, *and* the host ``frida-ps``
+    fallback → not running, error surfaced, detection is None.
+
+    The factory only knows about ``adb``; the host-side ``frida-ps``
+    fallback gets a ``FileNotFoundError`` from the factory which
+    ``_run`` translates to ``rc=-1`` — same behaviour as a host without
+    frida-tools installed."""
     monkeypatch.setattr(
         "asyncio.create_subprocess_exec",
         _make_subprocess_factory({"adb": _FakeProc(1, b"", b"")}),
@@ -229,11 +243,15 @@ def test_probe_frida_server_not_running(monkeypatch: pytest.MonkeyPatch) -> None
     assert out["ok"] is False
     assert out["running"] is False
     assert out["pid"] is None
+    assert out["uid"] is None
+    assert out["helper_running"] is False
+    assert out["detection"] is None
     assert "frida-server" in out["error"]
 
 
 def test_probe_frida_server_no_device(monkeypatch: pytest.MonkeyPatch) -> None:
-    """adb itself errors (no device) → not ok, stderr forwarded."""
+    """adb itself errors (no device) → not ok, original adb stderr
+    forwarded (takes precedence over the host-side fallback's stderr)."""
     monkeypatch.setattr(
         "asyncio.create_subprocess_exec",
         _make_subprocess_factory({"adb": _FakeProc(1, b"", b"adb: no devices/emulators found\n")}),
@@ -241,7 +259,274 @@ def test_probe_frida_server_no_device(monkeypatch: pytest.MonkeyPatch) -> None:
     out = asyncio.run(hp.probe_frida_server("adb"))
     assert out["ok"] is False
     assert out["running"] is False
+    assert out["uid"] is None
+    assert out["helper_running"] is False
+    assert out["detection"] is None
     assert "no devices" in out["error"]
+
+
+def test_probe_frida_server_versioned_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``pidof frida-server`` misses a versioned binary like
+    ``frida-server-16.7.19-android-arm64`` (kernel ``comm`` is truncated
+    to ``frida-server-16.``), but the ``ps -A`` fallback finds it via
+    the prefix match and also captures uid. detection=='ps'."""
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        # `adb shell pidof frida-server` → no match for the versioned name.
+        if "pidof" in argv:
+            return _FakeProc(1, b"", b"")
+        # `adb shell ps -A` → process is alive, comm truncated by the kernel.
+        if "ps" in argv:
+            return _FakeProc(
+                0,
+                (
+                    b"USER           PID  PPID     VSZ    RSS WCHAN            ADDR S NAME\n"
+                    b"root             1     0   38684   2868 SyS_epoll_wait   0 S init\n"
+                    b"root          7777     1   45000   1500 SyS_poll         0 S frida-server-16.\n"
+                    b"shell         8888  7777   12345    250 SyS_poll         0 S sh\n"
+                ),
+                b"",
+            )
+        return _FakeProc(127, b"", b"unexpected argv")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is True
+    assert out["running"] is True
+    assert out["pid"] == 7777
+    assert out["uid"] == "root"
+    assert out["helper_running"] is False
+    assert out["detection"] == "ps"
+    assert out["error"] is None
+
+
+def test_probe_frida_server_host_fallback_renamed_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stealth-renamed binary: ``pidof`` empty, ``ps -A`` shows nothing
+    matching ``frida-server*`` (the binary was renamed to evade
+    ``/proc/*/comm`` greps), but the host-side ``frida-ps -U`` enumerates
+    processes successfully → running=True, pid=None, detection='frida-ps'.
+
+    Mirrors the exact symptom the operator hit on a real device:
+    ``adb shell pidof frida-server`` and ``ps -A | grep frida`` were both
+    silent, while ``frida-ps -U`` listed every process. The probe should
+    confirm reachability from the host wire-protocol check rather than
+    falsely reporting "not running"."""
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        if "pidof" in argv:
+            return _FakeProc(1, b"", b"")
+        if "ps" in argv:
+            # `ps -A` lists no process whose comm starts with frida-server.
+            return _FakeProc(
+                0,
+                (
+                    b"USER           PID  PPID     VSZ    RSS WCHAN            ADDR S NAME\n"
+                    b"root             1     0   38684   2868 SyS_epoll_wait   0 S init\n"
+                    b"root           430  1     12345    900 SyS_poll         0 S adbd\n"
+                    b"shell         8888  430   12345    250 SyS_poll         0 S sh\n"
+                ),
+                b"",
+            )
+        if argv and argv[0] == "frida-ps":
+            # Host-side enumeration succeeds — wire protocol is alive.
+            return _FakeProc(
+                0,
+                (
+                    b" PID  Name\n"
+                    b"-----  ----------------\n"
+                    b" 1528  Google\n"
+                    b"17371  Clock\n"
+                    b" 2167  WeakBank Low\n"
+                    b"  430  adbd\n"
+                ),
+                b"",
+            )
+        return _FakeProc(127, b"", b"unexpected argv")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is True
+    assert out["running"] is True
+    assert out["pid"] is None  # no on-device PID — wire-protocol confirmation only
+    # uid + helper unknowable without a device-side row to read from.
+    assert out["uid"] is None
+    assert out["helper_running"] is False
+    assert out["detection"] == "frida-ps"
+    assert out["error"] is None
+
+
+def test_probe_frida_server_host_fallback_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``frida-ps -U`` exits non-zero (no USB device, transport error) →
+    fallback fails, probe reports not running."""
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        if "pidof" in argv:
+            return _FakeProc(1, b"", b"")
+        if "ps" in argv:
+            return _FakeProc(0, b"USER PID ... NAME\nroot 1 ... init\n", b"")
+        if argv and argv[0] == "frida-ps":
+            return _FakeProc(
+                1, b"", b"Failed to enumerate processes: unable to connect\n"
+            )
+        return _FakeProc(127, b"", b"unexpected argv")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is False
+    assert out["running"] is False
+    assert out["pid"] is None
+    assert out["detection"] is None
+    assert out["error"]
+
+
+def test_probe_frida_server_host_fallback_missing_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host doesn't have ``frida-ps`` installed → factory raises
+    ``FileNotFoundError`` which ``_run`` swallows as ``rc=-1`` → probe
+    correctly reports not running rather than crashing."""
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        if "pidof" in argv:
+            return _FakeProc(1, b"", b"")
+        if "ps" in argv:
+            return _FakeProc(0, b"USER PID ... NAME\nroot 1 ... init\n", b"")
+        # Anything else (including frida-ps) raises — ``_run`` catches.
+        raise FileNotFoundError(argv[0] if argv else "?")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is False
+    assert out["running"] is False
+    assert out["detection"] is None
+
+
+# ---- uid + helper detection (Settings card warning + diagnostics) ----
+#
+# The uid signal is what catches the "running but unprivileged" failure
+# mode the operator hit on Apr 29: ``frida-server`` started by hand
+# without ``adb root`` runs as uid 2000 (``shell``); ``frida-ps`` works
+# fine because process enumeration is unprivileged, but every
+# ``device.attach(<pid>)`` fails with ``unable to connect to remote
+# frida-server: closed`` once the per-attach helper hits the ptrace
+# barrier on a non-root server. The probe's job is to surface that the
+# server's *uid* is wrong so the Settings card can suggest a restart.
+
+
+def test_probe_frida_server_uid_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Happy path: server running as root + helper observed → uid='root',
+    helper_running=True. This is the state the Settings card considers
+    "fully healthy"; no warning surfaced."""
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        if "pidof" in argv:
+            return _FakeProc(0, b"4758\n", b"")
+        if "ps" in argv:
+            return _FakeProc(
+                0,
+                (
+                    b"USER           PID  PPID     VSZ    RSS WCHAN            ADDR S NAME\n"
+                    b"root             1     0   38684   2868 SyS_epoll_wait   0 S init\n"
+                    b"root          4758     1   45000   1500 SyS_poll         0 S frida-server\n"
+                    b"shell        32098 32096   16266   2567 do_epoll_wait    0 S re.frida.helper\n"
+                ),
+                b"",
+            )
+        return _FakeProc(127, b"", b"unexpected argv")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is True
+    assert out["running"] is True
+    assert out["pid"] == 4758
+    assert out["uid"] == "root"
+    assert out["helper_running"] is True
+    # detection stays "pidof" because layer 1 already confirmed; ps -A
+    # is doing enrichment, not primary detection.
+    assert out["detection"] == "pidof"
+    assert out["error"] is None
+
+
+def test_probe_frida_server_uid_shell_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server running but as the unprivileged ``shell`` user. Probe must
+    still report running=True (process IS up) but uid='shell' so the
+    Settings card can show the "running as shell — app attaches will
+    fail" warning AND the Start-as-root button."""
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        if "pidof" in argv:
+            return _FakeProc(0, b"5500\n", b"")
+        if "ps" in argv:
+            return _FakeProc(
+                0,
+                (
+                    b"USER           PID  PPID     VSZ    RSS WCHAN            ADDR S NAME\n"
+                    b"shell         5500   430   45000   1500 SyS_poll         0 S frida-server\n"
+                ),
+                b"",
+            )
+        return _FakeProc(127, b"", b"unexpected argv")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is True
+    assert out["running"] is True
+    assert out["pid"] == 5500
+    assert out["uid"] == "shell"  # ← the signal the Settings card warns on
+    assert out["helper_running"] is False
+    assert out["error"] is None
+
+
+def test_probe_frida_server_skips_zombie_for_uid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the daemon-fork pattern leaves a transient zombie parent
+    around, ``ps -A`` shows TWO frida-server-ish rows: ``[frida-server]``
+    (zombie, name wrapped in brackets) and ``frida-server`` (the live
+    daemon). The bracketed zombie row shouldn't poison the uid read —
+    we only consider rows whose comm STARTS WITH ``frida-server``
+    (zombie names start with ``[``), and we attribute uid to whichever
+    row matches the pid we ended up resolving.
+
+    Reproduces the exact ``ps -A`` snapshot the operator saw right
+    after launching with ``adb shell "su 0 frida-server -D"``."""
+
+    async def factory(*argv: str, **kwargs: Any) -> _FakeProc:
+        if "pidof" in argv:
+            # pidof returns the LIVE pid (it skips zombies by default).
+            return _FakeProc(0, b"4758\n", b"")
+        if "ps" in argv:
+            return _FakeProc(
+                0,
+                (
+                    b"USER           PID  PPID     VSZ    RSS WCHAN            ADDR S NAME\n"
+                    b"root          4756   430       0      0 -                0 Z [frida-server]\n"
+                    b"root          4758     1   45000   1500 SyS_poll         0 S frida-server\n"
+                ),
+                b"",
+            )
+        return _FakeProc(127, b"", b"unexpected argv")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", factory)
+
+    out = asyncio.run(hp.probe_frida_server("adb"))
+    assert out["ok"] is True
+    assert out["pid"] == 4758
+    # uid attributed to the LIVE row (4758), zombie ([frida-server], 4756)
+    # was filtered out by the bracket-prefix check.
+    assert out["uid"] == "root"
 
 
 def test_probe_frida_version_skew_match(monkeypatch: pytest.MonkeyPatch) -> None:

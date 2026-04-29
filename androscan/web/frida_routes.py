@@ -76,6 +76,16 @@ from androscan.adapters.frida_hooks._jsparse import parse_frida_js
 from androscan.internal.app_meta import load_app_meta
 from androscan.internal.run_folder import create_run_folder
 from androscan.web.per_app_settings import load_app_settings
+# Imported as module-level names (rather than ``from … import``-aliased
+# locals inside ``build_frida_router``) so tests can monkeypatch the
+# binding via ``monkeypatch.setattr(frida_routes, "probe_frida_server", ...)``
+# without having to thread additional injectable callables through the
+# router factory. The start route exercises both: ``probe_frida_server``
+# for the idempotent already-running check and the post-start
+# confirmation poll, and ``_run`` for the ``adb shell`` invocations
+# that probe ``which su`` / ``ls /data/local/tmp/frida-server`` and
+# fire the actual ``su 0 ... -D`` daemon-fork.
+from androscan.web import health_probes as _health
 
 
 logger = logging.getLogger(__name__)
@@ -571,6 +581,171 @@ def build_frida_router(
             # to kill the trace.
             if session.on_event is _push:
                 session.on_event = previous_hook
+
+    # -- frida-server lifecycle (Settings → Start-as-root button) ---------
+    #
+    # Background: the Hook Lab's whole device-side surface depends on
+    # ``frida-server`` being up AND running as root. Operators frequently
+    # restart their emulator (or the server crashes after a version-skew
+    # handshake) and forget to re-launch it; the workbench then surfaces
+    # the same "unable to connect to remote frida-server: closed" error
+    # for every Inject until they manually re-run the
+    # ``adb shell "su 0 /data/local/tmp/frida-server -D"`` incantation.
+    #
+    # This route lets the Settings card auto-fix the common case in one
+    # click. Idempotent on already-running-as-root, refuses to silently
+    # promote an existing non-root server (operator may have started it
+    # that way intentionally for some shell-only workflow), surfaces
+    # clean errors when the device isn't rooted or the binary is
+    # missing instead of letting ``su 0`` fail with a cryptic message.
+
+    _FRIDA_SERVER_BIN = "/data/local/tmp/frida-server"
+    # Number of post-start re-probes before giving up. ~10 * 0.2s = 2s,
+    # which is comfortably above the typical daemon-fork latency on an
+    # emulator (~50-200ms) but tight enough that a stuck start surfaces
+    # as a 502 within the operator's UI patience window.
+    _START_POLL_ATTEMPTS = 10
+    _START_POLL_DELAY = 0.2
+
+    @router.post("/server/start")
+    async def start_frida_server() -> dict[str, Any]:
+        """Start ``frida-server`` as root on the connected device.
+
+        Behaviour matrix:
+
+        * **Already running as root** → 200, ``started=False``,
+          ``already_running=True``. No-op; the operator can hit the
+          button repeatedly without consequence.
+        * **Already running as non-root** → 409. We deliberately don't
+          auto-promote: the running process may belong to a different
+          workflow, and silently kill+restart could surprise the
+          operator. Surfaces the kill command so they can retry.
+        * **Device not rooted (``which su`` returns nothing)** → 409.
+          ``frida-server`` cannot run on a non-rooted device with the
+          permissions it needs to attach into apps; no point pretending
+          we can fix this from the UI.
+        * **Binary missing at the canonical path** → 404. The Settings
+          card already has an install hint with the curl + push commands;
+          we point the operator at it.
+        * **``adb shell`` start command fails** → 502 with the captured
+          stderr.
+        * **Start succeeded but server didn't appear in ``ps``** → 502.
+          Could be a SELinux denial, missing ``CAP_SYS_PTRACE``, or the
+          binary crashed on startup. We include the manual command so
+          the operator can repro outside the workbench and read logcat.
+        """
+        # 1. Already running as root → idempotent no-op.
+        info = await _health.probe_frida_server()
+        if info.get("running") and info.get("uid") == "root":
+            return {
+                "ok": True,
+                "started": False,
+                "already_running": True,
+                "pid": info.get("pid"),
+                "uid": info.get("uid"),
+                "message": "frida-server already running as root.",
+            }
+
+        # 2. Running but not as root — refuse to promote. Operator
+        # should kill manually first because the running process may
+        # be theirs (intentional shell-only workflow) and silently
+        # killing it would surprise them.
+        if info.get("running") and info.get("uid") not in (None, "root"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"frida-server is already running as {info['uid']!r} "
+                    f"(pid {info.get('pid')}). Kill it first, then retry: "
+                    "adb shell \"pgrep -f frida-server | xargs -r kill -9\""
+                ),
+            )
+
+        # 3. Confirm the device is rooted (`su` available).
+        rc_su, out_su, _ = await _health._run(
+            "adb", "shell", "which", "su", timeout=3.0,
+        )
+        if rc_su != 0 or not (out_su or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "device is not rooted: `su` is not available. "
+                    "frida-server needs root to attach into app processes "
+                    "(CAP_SYS_PTRACE on stock Android). Run on a userdebug "
+                    "/ AOSP emulator image, or start frida-server manually "
+                    "in your own way."
+                ),
+            )
+
+        # 4. Confirm the binary exists at the canonical path. We
+        # deliberately don't search alternative paths or push the
+        # binary from the host — the install hint card already does
+        # that, and conflating "install" with "start" would blur the
+        # button's responsibility.
+        rc_ls, _, _ = await _health._run(
+            "adb", "shell", "ls", _FRIDA_SERVER_BIN, timeout=3.0,
+        )
+        if rc_ls != 0:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"frida-server binary not found at {_FRIDA_SERVER_BIN}. "
+                    "Use the install hint on the Settings card to push it "
+                    "first."
+                ),
+            )
+
+        # 5. Fire-and-forget daemonized launch. The triple redirect
+        # (``</dev/null >/dev/null 2>&1``) is what lets ``adb shell``
+        # return immediately — without it, adb keeps the FD chain
+        # alive past the server's own daemon-fork and the call hangs
+        # for the whole shell timeout. The leading ``nohup`` insulates
+        # against SIGHUP propagation when adb shell tears its session
+        # down behind us. ``-D`` is frida-server's own self-daemonize
+        # (parent forks then exits, child reparents to init).
+        start_cmd = (
+            f"su 0 sh -c 'nohup {_FRIDA_SERVER_BIN} -D "
+            f">/dev/null 2>&1 </dev/null &'"
+        )
+        rc_start, out_start, err_start = await _health._run(
+            "adb", "shell", start_cmd, timeout=5.0,
+        )
+        if rc_start != 0:
+            err_blob = (err_start or out_start or "unknown error").strip()
+            raise HTTPException(
+                status_code=502,
+                detail=f"frida-server failed to start: {err_blob[:300]}",
+            )
+
+        # 6. Re-probe with a small backoff to confirm the daemon-fork
+        # actually landed AND the server is running as root. We poll
+        # rather than sleep-and-probe-once because the fork latency
+        # varies (cold cache vs warm, debug vs userdebug image).
+        for _attempt in range(_START_POLL_ATTEMPTS):
+            await asyncio.sleep(_START_POLL_DELAY)
+            info2 = await _health.probe_frida_server()
+            if info2.get("running") and info2.get("uid") == "root":
+                return {
+                    "ok": True,
+                    "started": True,
+                    "already_running": False,
+                    "pid": info2.get("pid"),
+                    "uid": info2.get("uid"),
+                    "message": "frida-server started as root.",
+                }
+
+        # 7. Started but didn't appear → most likely SELinux denial,
+        # missing ambient cap, or a crash on startup. Hand the operator
+        # the manual command + a logcat pointer.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "frida-server start command succeeded but the server "
+                f"didn't appear in `ps -A` after "
+                f"{_START_POLL_ATTEMPTS * _START_POLL_DELAY:.1f}s. "
+                "Check device logcat or run manually: "
+                f"adb shell \"su 0 {_FRIDA_SERVER_BIN} -D\""
+            ),
+        )
 
     return router, ws_router
 

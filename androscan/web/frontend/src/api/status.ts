@@ -44,6 +44,51 @@ export type GlobalStatus = {
     frida_server: StatusCard & {
       running: boolean;
       pid: number | null;
+      /**
+       * Which probe layer confirmed reachability:
+       *   * ``"pidof"`` — `adb shell pidof frida-server` matched (canonical install).
+       *   * ``"ps"`` — `adb shell ps -A` found a `frida-server*` comm (versioned binary).
+       *   * ``"frida-ps"`` — host-side `frida-ps -U` succeeded but the
+       *     on-device process name didn't match (renamed/stealth binary
+       *     or `frida-gadget` injected into the target app). ``pid`` is
+       *     ``null`` in this case because no on-device PID was observed.
+       *   * ``null`` — not running.
+       *
+       * The Settings card uses this to label host-confirmed reachability
+       * as "running (host-confirmed via frida-ps)" rather than the
+       * confusing "pid ?".
+       */
+      detection: "pidof" | "ps" | "frida-ps" | null;
+      /**
+       * Device-side username the server runs as
+       * (``"root"`` | ``"shell"`` | ``"u0_a123"`` | ``...``);
+       * ``null`` when we couldn't determine it (host-confirmed-only
+       * detection where there's no on-device PID, or ``ps -A`` itself
+       * failed).
+       *
+       * The Settings card surfaces a yellow warning when this is
+       * anything other than ``"root"``: ``device.attach(<pid>)``
+       * against an app process needs CAP_SYS_PTRACE, which only root
+       * holds on stock Android. A ``"shell"`` server lets ``frida-ps``
+       * succeed (process enumeration is unprivileged) but every
+       * Inject fails with ``unable to connect to remote frida-server:
+       * closed`` once the per-attach helper hits the ptrace barrier.
+       *
+       * Drives the visibility of the Start-as-root action button on
+       * the Frida-server card: shown when ``running === false`` OR
+       * ``uid !== "root"``.
+       */
+      uid: string | null;
+      /**
+       * Whether ``re.frida.helper`` (the per-attach ptrace shim
+       * frida-server forks) is currently observable in ``ps -A``.
+       *
+       * Present during an active attach, absent in steady state — so
+       * ``false`` is the normal idle case and is NOT an error signal
+       * by itself. Plumbed through for diagnostics; no UX wired off
+       * of it directly today.
+       */
+      helper_running: boolean;
       host_version: string | null;
       device_version: string | null;
       version_skew: null | "minor" | "major";

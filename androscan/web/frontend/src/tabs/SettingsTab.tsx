@@ -33,6 +33,7 @@ import {
 } from "../api/status";
 import { rebuildRagIndex } from "../api/rag";
 import { rebuildGraph } from "../api/graph";
+import { startFridaServer } from "../api/frida";
 import { IconCheck, IconCopy } from "../components/Icons";
 import { useWorkbench } from "../context/WorkbenchContext";
 
@@ -693,7 +694,10 @@ function StatusPanel() {
             <StatusCardView card={globalStatus.tools.jadx} />
             <StatusCardView card={globalStatus.tools.apktool} />
             <StatusCardView card={globalStatus.tools.frida} />
-            <FridaServerStatusCard card={globalStatus.tools.frida_server} />
+            <FridaServerStatusCard
+              card={globalStatus.tools.frida_server}
+              onRefresh={reload}
+            />
             <StatusCardView card={globalStatus.device} extras={[
               globalStatus.device.connected
                 ? `state: ${globalStatus.device.state ?? "unknown"}`
@@ -1018,11 +1022,40 @@ function CallGraphStatusCard({
  */
 function FridaServerStatusCard({
   card,
+  onRefresh,
 }: {
   card: GlobalStatus["tools"]["frida_server"];
+  onRefresh?: () => void | Promise<void>;
 }) {
+  // ``detection`` tells us how the probe found frida — when it's
+  // "frida-ps" we know reachability was confirmed via the host-side
+  // wire-protocol enumeration, NOT a device-side process scan, so
+  // there's no on-device PID to display. Show a label that makes the
+  // detection method explicit instead of the misleading "pid ?".
+  const runStatus =
+    card.running
+      ? card.pid != null
+        ? `pid ${card.pid}`
+        : card.detection === "frida-ps"
+          ? "running (host-confirmed via frida-ps — renamed binary or frida-gadget)"
+          : "running"
+      : "not running";
+  // ``uid`` warning: server is up but as a non-root user (typically
+  // ``shell``, when the operator forgot ``adb root`` or ran the binary
+  // directly without ``su 0``). Process listing works (frida-ps is
+  // unprivileged) but ``device.attach(<pid>)`` against an app fails
+  // with ``unable to connect to remote frida-server: closed`` once
+  // the per-attach helper hits the ptrace barrier on a non-root server.
+  // The Start-as-root button below uses the same signal to decide
+  // whether to show itself.
+  const uidWarning =
+    card.running && card.uid != null && card.uid !== "root"
+      ? `running as ${card.uid} — app attaches will fail unless restarted as root`
+      : "";
   const extras: (string | undefined)[] = [
-    card.running ? `pid ${card.pid ?? "?"}` : "not running",
+    runStatus,
+    card.uid ? `uid ${card.uid}` : "",
+    uidWarning,
     card.device_version ? `device ${card.device_version}` : "",
     card.host_version ? `host ${card.host_version}` : "",
     card.device_abi ? `abi ${card.device_abi}` : "",
@@ -1034,12 +1067,96 @@ function FridaServerStatusCard({
       : "",
   ];
 
+  // The Start-as-root button shows for two distinct failure modes
+  // that share the same fix (``adb shell "su 0 frida-server -D"``):
+  //   1. Server is down entirely (``!running``) — most common after
+  //      an emulator reboot or a version-skew handshake crashed it.
+  //   2. Server is up but as non-root (``uid !== "root"``) — operator
+  //      forgot the privilege escalation step.
+  // Both states leave Inject broken in identical ways.
+  const needsStart = !card.running || (card.uid != null && card.uid !== "root");
+
   // Only surface the install hint when the device half is down. When
   // running we keep the card terse — the existing version-skew badge
   // already handles the "running but mismatched" case.
-  const hint = !card.running ? <FridaServerInstallHint card={card} /> : null;
+  const installHint = !card.running ? <FridaServerInstallHint card={card} /> : null;
 
-  return <StatusCardView card={card} extras={extras} actions={hint} />;
+  const actions = (
+    <>
+      {needsStart && <FridaServerStartButton onRefresh={onRefresh} />}
+      {installHint}
+    </>
+  );
+
+  return <StatusCardView card={card} extras={extras} actions={actions} />;
+}
+
+/** "Start frida-server (as root)" action button + transient
+ *  in-flight / error state. Lives next to the install-hint disclosure
+ *  on the Frida-server card.
+ *
+ *  Refreshes the parent's status payload on success so the operator
+ *  sees the card flip from red (or yellow uid-warning) to green
+ *  without having to wait for the 15s auto-poll.
+ */
+function FridaServerStartButton({
+  onRefresh,
+}: {
+  onRefresh?: () => void | Promise<void>;
+}) {
+  const [inFlight, setInFlight] = useState(false);
+  const [lastError, setLastError] = useState<string | null>(null);
+  const [lastSuccess, setLastSuccess] = useState<string | null>(null);
+
+  const click = async () => {
+    setInFlight(true);
+    setLastError(null);
+    setLastSuccess(null);
+    const r = await startFridaServer();
+    setInFlight(false);
+    if (r.ok) {
+      // ``already_running`` distinguishes the no-op idempotent path
+      // (button hit twice, second hit is a no-op) from an actual
+      // start — both render the same green confirmation.
+      setLastSuccess(
+        r.data.already_running
+          ? "Already running as root."
+          : `Started as root (pid ${r.data.pid ?? "?"}).`,
+      );
+    } else {
+      // The route returns a structured detail string for every
+      // failure path (see ``frida_routes.start_frida_server``); we
+      // surface it verbatim so the operator can read the actionable
+      // hint (kill command, install playbook pointer, manual fallback
+      // command) inline without opening DevTools.
+      setLastError(r.error || `HTTP ${r.status}`);
+    }
+    // Refresh the card after both success and failure: success so
+    // the green state shows; failure so a transient probe state
+    // (e.g. server-now-up-but-still-shell after a partial start)
+    // re-renders the warning extras correctly.
+    if (onRefresh) await onRefresh();
+  };
+
+  return (
+    <div className="frida-server-start">
+      <button
+        type="button"
+        className="frida-server-start-btn"
+        onClick={click}
+        disabled={inFlight}
+        title="Run `adb shell su 0 /data/local/tmp/frida-server -D` and confirm via re-probe"
+      >
+        {inFlight ? "Starting…" : "Start frida-server (as root)"}
+      </button>
+      {lastSuccess && (
+        <div className="frida-server-start-ok">{lastSuccess}</div>
+      )}
+      {lastError && (
+        <div className="frida-server-start-err">{lastError}</div>
+      )}
+    </div>
+  );
 }
 
 /**

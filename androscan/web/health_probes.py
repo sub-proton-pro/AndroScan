@@ -220,35 +220,185 @@ async def probe_frida_version(frida_cmd: str = "frida") -> dict[str, Any]:
 async def probe_frida_server(
     adb_cmd: str = "adb",
     timeout: float = SHORT_TIMEOUT_SEC,
+    *,
+    frida_ps_cmd: str = "frida-ps",
 ) -> dict[str, Any]:
-    """Is ``frida-server`` running on the connected device?
+    """Is ``frida-server`` reachable on the connected device?
 
-    Strategy: ``adb shell pidof frida-server`` (cheap, no root needed for
-    ``pidof`` on standard emulator images). Returns ``{ok, running, pid,
-    error}``. Probe never raises; falls back to ``ok=False`` when adb
-    itself is unreachable so the Settings card can show the same red dot
-    for "no device" and "no frida-server" without the aggregator
-    needing special-case logic.
+    Three-layer strategy, cheapest first; later layers only fire when
+    earlier ones come up empty:
+
+    1. ``adb shell pidof frida-server`` — exact-name match. Hits when
+       the operator installed via the AndroScan playbook (binary at
+       ``/data/local/tmp/frida-server``) or any other path where the
+       file is named exactly ``frida-server``. Single adb call → fast
+       steady-state cost for the canonical install.
+    2. ``adb shell ps -A`` with a ``comm`` prefix match. Catches the
+       common "ran the GitHub release binary as-is" case, e.g.
+       ``/data/local/tmp/frida-server-16.7.19-android-arm64``. The
+       kernel ``comm`` field is capped at 15 chars
+       (``TASK_COMM_LEN``) but always starts with ``frida-server``,
+       so the prefix match holds.
+    3. **Host-side** ``frida-ps -U``. Authoritative — uses the same
+       wire protocol as the operator's manual ``frida-ps -U`` check.
+       Fires when (a) the on-device binary was deliberately renamed
+       to evade ``/proc/*/comm`` greps (a common stealth tactic when
+       testing apps that detect frida by name), or (b) the operator
+       is running ``frida-gadget`` injected into the target app —
+       there's no separate ``frida-server`` process at all in that
+       mode. Returns ``running=True, pid=None`` because no on-device
+       PID is observable; the version-skew probe handles the
+       missing pid by falling through to its known-paths candidate
+       list.
+
+    Returns ``{ok, running, pid, uid, helper_running, detection, error}``:
+
+    * ``ok`` mirrors ``running``.
+    * ``pid`` is the on-device process id when layers 1 or 2 hit;
+      ``None`` when only layer 3 confirms reachability.
+    * ``uid`` is the device-side username the server runs as (``"root"``,
+      ``"shell"``, ``"u0_a123"``, ``...``); ``None`` when we couldn't
+      determine it (layer 3 only, or ``ps -A`` failed). The Settings
+      card surfaces a warning when this isn't ``"root"`` because
+      attaching into other-uid app processes requires CAP_SYS_PTRACE
+      ambient capabilities, which only root has on stock Android — a
+      shell-uid frida-server can list processes (``frida-ps`` works)
+      but every ``device.attach(<pid>)`` against an app fails with
+      ``unable to connect to remote frida-server: closed`` once the
+      per-process helper hits the ptrace barrier.
+    * ``helper_running`` is ``True`` when ``re.frida.helper`` (the
+      per-attach ptrace shim frida-server forks) is observable in
+      ``ps -A``. Useful for diagnosing the "server is up but helper
+      crashes mid-handshake" failure mode (typically a SELinux denial
+      or a version-skew handshake error). The helper is short-lived
+      between attaches — a ``False`` here just means "no active
+      attach right now", not "broken".
+    * ``detection`` is ``"pidof" | "ps" | "frida-ps" | None`` so
+      callers can tell which layer succeeded (the Settings card uses
+      it to label the host-confirmed case as "running (host-confirmed)"
+      rather than the misleading "pid ?").
+
+    Probe never raises; falls back to ``ok=False`` when every layer
+    fails so the Settings card can show the same red dot for "no
+    device" and "no frida-server" without the aggregator needing
+    special-case logic.
 
     The Hook Lab adapter (:mod:`androscan.adapters.frida_client`) talks
     to ``frida-server`` over the standard host-to-device USB transport;
     if this probe is red there is no point hammering the device with
     ``frida.attach`` calls.
     """
+    detection: Optional[str] = None
+
+    # ----- Layer 1: pidof (exact-name match) -----
     rc, out, err = await _run(adb_cmd, "shell", "pidof", "frida-server", timeout=timeout)
     tok = (out or "").strip().split()
     pid: Optional[int] = None
     if tok:
         try:
             pid = int(tok[0])
+            detection = "pidof"
         except ValueError:
             pid = None
-    running = pid is not None and rc == 0
+
+    # ----- Layer 2: ps -A (always; enriches uid + helper, also serves
+    # as fallback PID source for renamed/versioned binaries) -----
+    #
+    # Previously this only ran when layer 1 missed; we now always run
+    # it because the uid + helper signals it provides are first-class
+    # diagnostics (the Settings card warns when uid != "root", and the
+    # mid-handshake "closed" failure mode is most reliably detected by
+    # noticing that the helper isn't present). Cost is one extra adb
+    # round-trip per poll (~50ms on an emulator); the value is being
+    # able to tell "running but unprivileged" apart from "running
+    # correctly" without any extra operator action.
+    fallback_err = ""
+    uid: Optional[str] = None
+    helper_running = False
+    rc2, out2, err2 = await _run(
+        adb_cmd, "shell", "ps", "-A", timeout=timeout,
+    )
+    fallback_err = (err2 or "").strip()
+    if rc2 == 0:
+        for line in (out2 or "").splitlines():
+            parts = line.split()
+            # Typical toybox `ps -A` row: USER PID PPID VSZ RSS WCHAN ADDR S NAME.
+            # Last column is the (truncated) command name; column 0 is
+            # USER, column 1 is PID. Header row is skipped naturally
+            # because parts[-1] is the literal "NAME" (no startswith
+            # match) and `int(parts[1])` would raise on "PID" anyway.
+            if len(parts) < 2:
+                continue
+            comm = parts[-1]
+            # frida-server row(s) — extract pid (when layer 1 missed)
+            # and uid. Skips zombies whose `ps` rendering wraps the
+            # name in brackets ("[frida-server]") because the
+            # ``startswith`` check intentionally requires the bare
+            # name. We always overwrite uid with the live row's value
+            # so a transient zombie ahead of the live row in the
+            # listing doesn't poison the read.
+            if comm.startswith("frida-server"):
+                try:
+                    row_pid = int(parts[1])
+                except ValueError:
+                    continue
+                if pid is None:
+                    pid = row_pid
+                    detection = "ps"
+                if row_pid == pid:
+                    uid = parts[0] or None
+                continue
+            # re.frida.helper / re.frida.helper-32 / re.frida.helper-64
+            # — frida-server forks one of these per attach to do the
+            # ptrace work in a separate process (so a crashed helper
+            # doesn't take down the whole server). Presence here just
+            # means at least one attach is in flight; absence is the
+            # quiescent steady state, NOT an error signal by itself.
+            if comm.startswith("re.frida.helper"):
+                helper_running = True
+
+    # ----- Layer 3: host-side frida-ps -U (authoritative) -----
+    # Fires only when the device-side checks miss — covers stealth-renamed
+    # binaries and frida-gadget setups. Uses a generous timeout because
+    # `frida-ps` enumerates every process on the device (can take a
+    # few seconds on a busy emulator); cap at max(timeout * 4, 4.0)
+    # so a sluggish enumeration doesn't block the aggregator forever
+    # while still being cheap enough for the Settings card's 15s poll.
+    host_confirmed = False
+    host_err = ""
+    if pid is None:
+        host_timeout = max(timeout * 4.0, 4.0)
+        rc3, out3, err3 = await _run(
+            frida_ps_cmd, "-U", timeout=host_timeout,
+        )
+        # rc3 == 0 with non-empty stdout means the USB transport is
+        # alive AND at least one process was enumerated.
+        if rc3 == 0 and (out3 or "").strip():
+            host_confirmed = True
+            detection = "frida-ps"
+        elif rc3 != -1:
+            # Real frida-ps failure (transport unreachable, no USB
+            # device, etc.) — propagate its stderr. Skip rc3 == -1
+            # which means ``frida-ps`` isn't installed on the host:
+            # that's not actionable for "is frida-server running on
+            # the device" and would otherwise mask the canonical
+            # "frida-server not running on device" fallback message.
+            host_err = (err3 or "").strip()
+
+    running = pid is not None or host_confirmed
+    # Error precedence when nothing succeeded: pidof stderr first (most
+    # informative when adb itself is broken — "no devices/emulators
+    # found"), then ps stderr, then frida-ps stderr, then a generic
+    # fallback string.
+    err_msg = (err or "").strip() or fallback_err or host_err
     return {
         "ok": running,
         "running": running,
         "pid": pid,
-        "error": None if running else ((err or "").strip()[:300] or "frida-server not running on device"),
+        "uid": uid,
+        "helper_running": helper_running,
+        "detection": detection,
+        "error": None if running else (err_msg[:300] or "frida-server not running on device"),
     }
 
 

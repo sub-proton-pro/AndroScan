@@ -16,6 +16,7 @@ plumbing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -840,3 +841,249 @@ def test_session_create_returns_503_when_frida_unavailable(
     r = test_client.post("/api/frida/sessions", json=_ok_session_body(app_id, app_package))
     assert r.status_code == 503
     assert "frida_unavailable" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# /api/frida/server/start
+#
+# We monkeypatch the two seams the route uses (``_health.probe_frida_server``
+# for the idempotent already-running check + post-start confirmation poll,
+# and ``_health._run`` for the ``adb shell`` invocations) so the tests are
+# fully hermetic — no real adb or frida-server is touched.
+#
+# Each test stages the seam responses to model one branch of the route's
+# decision tree (already-running / non-root / no-su / no-binary /
+# start-fail / start-but-no-show / happy path) and asserts the route
+# returns the matching status code + payload shape.
+
+import androscan.web.frida_routes as fr
+
+
+def _stage_run_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    plan: dict[str, tuple[int, str, str]],
+) -> list[tuple[str, ...]]:
+    """Replace ``frida_routes._health._run`` with a stub that dispatches
+    by a substring lookup against the ``adb shell <cmd>`` argv tail.
+
+    ``plan`` keys are substrings (e.g. ``"which su"``); the first key
+    found anywhere in the joined argv determines the canned response.
+    Returns the captured argv list so tests can assert what got run.
+    """
+    captured: list[tuple[str, ...]] = []
+
+    async def fake_run(*argv: str, timeout: float = 5.0, **kwargs: Any):
+        captured.append(tuple(argv))
+        joined = " ".join(argv)
+        for needle, (rc, out, err) in plan.items():
+            if needle in joined:
+                return rc, out, err
+        return 127, "", f"unstubbed: {joined}"
+
+    monkeypatch.setattr(fr._health, "_run", fake_run)
+    return captured
+
+
+def _stage_probe_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    sequence: list[dict[str, Any]],
+) -> list[int]:
+    """Replace ``frida_routes._health.probe_frida_server`` with a stub
+    that returns successive entries from ``sequence`` (last entry is
+    repeated when the route polls past the planned length).
+
+    Returns a one-element list whose single int is the call counter
+    (mutable so tests can assert how many polls were made).
+    """
+    counter = [0]
+
+    async def fake_probe(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        idx = min(counter[0], len(sequence) - 1)
+        counter[0] += 1
+        return sequence[idx]
+
+    monkeypatch.setattr(fr._health, "probe_frida_server", fake_probe)
+    return counter
+
+
+def test_start_frida_server_already_running_as_root_is_noop(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idempotent path: server is already running as root → 200 with
+    ``started=False, already_running=True``. Critically, the route
+    must NOT shell out to adb at all in this case (the operator
+    pressing the button repeatedly would otherwise spam adb)."""
+    _stage_probe_sequence(monkeypatch, [
+        {"running": True, "uid": "root", "pid": 4758},
+    ])
+    captured = _stage_run_responses(monkeypatch, {})  # nothing should run
+
+    r = client.post("/api/frida/server/start")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["started"] is False
+    assert body["already_running"] is True
+    assert body["pid"] == 4758
+    assert body["uid"] == "root"
+    # Adb was not invoked — the early-return path skipped all shells.
+    assert captured == []
+
+
+def test_start_frida_server_running_as_shell_refuses_to_promote(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server is up but as the unprivileged ``shell`` user → 409 with
+    a clear hint to kill+restart manually. We deliberately don't
+    auto-kill: the running process may be the operator's deliberate
+    shell-only workflow."""
+    _stage_probe_sequence(monkeypatch, [
+        {"running": True, "uid": "shell", "pid": 5500},
+    ])
+    captured = _stage_run_responses(monkeypatch, {})
+
+    r = client.post("/api/frida/server/start")
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "shell" in detail
+    assert "5500" in detail
+    assert "kill" in detail.lower()
+    assert captured == []
+
+
+def test_start_frida_server_no_su_returns_clean_error(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Device is not rooted (`which su` exits non-zero / empty stdout) →
+    409 with a user-actionable message instead of letting `su 0 ...`
+    fail later with a cryptic kernel error."""
+    _stage_probe_sequence(monkeypatch, [
+        {"running": False, "uid": None, "pid": None},
+    ])
+    captured = _stage_run_responses(monkeypatch, {
+        "which su": (1, "", ""),
+    })
+
+    r = client.post("/api/frida/server/start")
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "not rooted" in detail
+    assert "su" in detail
+    # Only `which su` was invoked — we bailed before checking the binary.
+    assert any("which su" in " ".join(a) for a in captured)
+    assert not any("/data/local/tmp/frida-server" in " ".join(a) for a in captured)
+
+
+def test_start_frida_server_binary_missing_returns_404(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`su` is available but the binary isn't pushed yet → 404 pointing
+    at the install hint card."""
+    _stage_probe_sequence(monkeypatch, [
+        {"running": False, "uid": None, "pid": None},
+    ])
+    _stage_run_responses(monkeypatch, {
+        "which su": (0, "/system/xbin/su\n", ""),
+        "ls /data/local/tmp/frida-server": (1, "", "No such file or directory"),
+    })
+
+    r = client.post("/api/frida/server/start")
+    assert r.status_code == 404, r.text
+    detail = r.json()["detail"]
+    assert "/data/local/tmp/frida-server" in detail
+    assert "install hint" in detail.lower() or "install" in detail.lower()
+
+
+def test_start_frida_server_happy_path_starts_and_confirms(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server is down, `su` works, binary present, start command
+    succeeds, post-start probe confirms running-as-root → 200 with
+    ``started=True``."""
+    _stage_probe_sequence(monkeypatch, [
+        # First call: pre-start state.
+        {"running": False, "uid": None, "pid": None},
+        # Re-probes after start: came up as root.
+        {"running": True, "uid": "root", "pid": 4758},
+    ])
+    captured = _stage_run_responses(monkeypatch, {
+        "which su": (0, "/system/xbin/su\n", ""),
+        "ls /data/local/tmp/frida-server": (0, "/data/local/tmp/frida-server\n", ""),
+        "su 0 sh -c": (0, "", ""),
+    })
+
+    r = client.post("/api/frida/server/start")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["started"] is True
+    assert body["already_running"] is False
+    assert body["pid"] == 4758
+    assert body["uid"] == "root"
+    # All four expected adb commands fired in order: which su, ls,
+    # the daemon-fork start, and at least one re-probe (probe is via
+    # the patched probe_frida_server fn, not _run, so it's not in
+    # captured — but the start command IS).
+    joined_calls = [" ".join(a) for a in captured]
+    assert any("which su" in c for c in joined_calls)
+    assert any("ls /data/local/tmp/frida-server" in c for c in joined_calls)
+    assert any("nohup /data/local/tmp/frida-server -D" in c for c in joined_calls)
+
+
+def test_start_frida_server_start_command_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `adb shell "su 0 ..."` invocation itself fails (non-zero
+    exit) → 502 with the captured stderr."""
+    _stage_probe_sequence(monkeypatch, [
+        {"running": False, "uid": None, "pid": None},
+    ])
+    _stage_run_responses(monkeypatch, {
+        "which su": (0, "/system/xbin/su\n", ""),
+        "ls /data/local/tmp/frida-server": (0, "/data/local/tmp/frida-server\n", ""),
+        "su 0 sh -c": (1, "", "su: permission denied"),
+    })
+
+    r = client.post("/api/frida/server/start")
+    assert r.status_code == 502, r.text
+    detail = r.json()["detail"]
+    assert "failed to start" in detail
+    assert "permission denied" in detail
+
+
+def test_start_frida_server_started_but_doesnt_appear(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Start command succeeded but the server doesn't appear in the
+    re-probe → 502 with the manual fallback command included."""
+    # Pre-start probe says down; every subsequent re-probe also says
+    # down (server crashed on startup, e.g. SELinux denial).
+    _stage_probe_sequence(monkeypatch, [
+        {"running": False, "uid": None, "pid": None},
+    ])
+    _stage_run_responses(monkeypatch, {
+        "which su": (0, "/system/xbin/su\n", ""),
+        "ls /data/local/tmp/frida-server": (0, "/data/local/tmp/frida-server\n", ""),
+        "su 0 sh -c": (0, "", ""),
+    })
+    # Speed up the test by short-circuiting the poll delay.
+    monkeypatch.setattr(asyncio, "sleep", lambda _s: _NoopAwait())
+
+    r = client.post("/api/frida/server/start")
+    assert r.status_code == 502, r.text
+    detail = r.json()["detail"]
+    assert "didn't appear" in detail
+    assert "logcat" in detail.lower()
+    # Manual fallback command for the operator to copy-paste.
+    assert "su 0 /data/local/tmp/frida-server -D" in detail
+
+
+class _NoopAwait:
+    """Awaitable that resolves immediately — used to skip ``asyncio.sleep``
+    in the start-but-no-show test so the 10*0.2s poll loop doesn't add
+    2 seconds to the test wall-clock."""
+
+    def __await__(self):
+        if False:
+            yield
+        return None

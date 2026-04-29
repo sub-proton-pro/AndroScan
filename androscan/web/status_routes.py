@@ -210,6 +210,29 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
                 "label": "frida-server (device)",
                 "running": bool(frida_server_v.get("running")),
                 "pid": frida_server_v.get("pid"),
+                # Which probe layer confirmed reachability:
+                # ``"pidof" | "ps" | "frida-ps" | None``. Surfaced so the
+                # Settings card can label host-confirmed reachability
+                # ("frida-ps") differently from the on-device pidof / ps
+                # paths — operators using a renamed binary or
+                # frida-gadget see "running (host-confirmed)" instead of
+                # the misleading "pid ?".
+                "detection": frida_server_v.get("detection"),
+                # Device-side identity of the running server. ``"root"``
+                # is required for app attaches to succeed (ptrace barrier
+                # against other-uid app processes); ``"shell"`` is the
+                # common bug state when the operator forgot ``adb root``
+                # or ran the binary directly without ``su 0``. The
+                # frontend uses this to surface a yellow warning + the
+                # Start-as-root action button on the card.
+                "uid": frida_server_v.get("uid"),
+                # Whether ``re.frida.helper`` is currently observable in
+                # ``ps -A`` — present during an active attach, absent
+                # in steady state. Surfaced for diagnostics; the frontend
+                # doesn't wire any UX off of it directly today, but it's
+                # the cheapest place to capture the signal so it's
+                # available for the live Trace panel later.
+                "helper_running": bool(frida_server_v.get("helper_running")),
                 "host_version": skew_v.get("host_version") or frida_v.get("version"),
                 "device_version": skew_v.get("device_version"),
                 "version_skew": skew_v.get("severity"),

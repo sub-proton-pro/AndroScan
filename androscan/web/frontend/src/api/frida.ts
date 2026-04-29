@@ -212,6 +212,40 @@ export function createSession(body: CreateSessionBody) {
   return _send<CreateSessionResult>("/api/frida/sessions", "POST", body);
 }
 
+/** Result shape for ``POST /api/frida/server/start``.
+ *
+ * The route is idempotent — calling it when frida-server is already
+ * running as root returns ``ok=true, started=false, already_running=true``
+ * without doing anything device-side. ``started=true`` only when this
+ * call actually fired the daemon-fork.
+ *
+ * Failure paths surface via the standard ``FridaResult`` envelope (``ok=false``)
+ * with ``status`` carrying the HTTP code so the Settings card can branch:
+ *   * 409 → device not rooted, or running as non-root that we won't auto-promote.
+ *   * 404 → binary not pushed to ``/data/local/tmp/frida-server`` yet.
+ *   * 502 → start command failed, or server didn't appear in ``ps`` after the start.
+ */
+export type StartServerResult = {
+  ok: true;
+  started: boolean;
+  already_running: boolean;
+  pid: number | null;
+  uid: string | null;
+  message: string;
+};
+
+/** Start ``frida-server`` as root on the connected device.
+ *
+ * Wired to the "Start frida-server (as root)" button on the Settings
+ * tab's Frida-server card; shown when the card detects the server is
+ * either down OR running as a non-root uid (which can list processes
+ * but can't ``ptrace`` into apps, so every Inject would fail with
+ * ``unable to connect to remote frida-server: closed``).
+ */
+export function startFridaServer() {
+  return _send<StartServerResult>("/api/frida/server/start", "POST");
+}
+
 export function listSessions() {
   return _read<{ sessions: FridaSessionInfo[] }>("/api/frida/sessions");
 }
