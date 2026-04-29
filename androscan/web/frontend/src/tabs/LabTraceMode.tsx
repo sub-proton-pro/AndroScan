@@ -89,15 +89,24 @@ function looksLikeCompleteSmaliSignature(s: string): boolean {
  *  methodPrefix}``. Used by the method picker to decide whether to fire
  *  the autocomplete query and what to filter by:
  *
- *    ``Lcom/example/Foo;->``         → ``{ smaliClass: "Lcom/example/Foo;",
- *                                          methodPrefix: "" }``
- *    ``Lcom/example/Foo;->onCli``    → ``{ smaliClass: "Lcom/example/Foo;",
- *                                          methodPrefix: "onCli" }``
- *    ``Lcom/example/Foo;->onClick(`` → null (already past the ``(``;
- *                                       descriptor list is being typed,
- *                                       picker would be misleading)
- *    ``Lcom/example/Foo;``           → null (no ``->`` separator yet)
- *    ``junk``                        → null
+ *    ``Lcom/example/Foo;->``           → ``{ smaliClass: "Lcom/example/Foo;",
+ *                                            methodPrefix: "" }``
+ *    ``Lcom/example/Foo;->onCli``      → ``{ smaliClass: "Lcom/example/Foo;",
+ *                                            methodPrefix: "onCli" }``
+ *    ``Lcom/example/Foo;->onClick(``   → ``{ smaliClass: "Lcom/example/Foo;",
+ *                                            methodPrefix: "onClick" }``
+ *                                        (Inspect → Trace seed shape — the
+ *                                         resolver knows the method but not
+ *                                         the descriptors. Operator wants
+ *                                         the picker to surface overloads;
+ *                                         we strip the trailing ``(`` for
+ *                                         the query so all ``onClick(...)*``
+ *                                         appear.)
+ *    ``Lcom/example/Foo;->onClick(L``  → null (operator is now typing
+ *                                        descriptors deliberately — picker
+ *                                        would be misleading)
+ *    ``Lcom/example/Foo;``             → null (no ``->`` separator yet)
+ *    ``junk``                          → null
  */
 function classPrefixContext(
   s: string,
@@ -108,10 +117,18 @@ function classPrefixContext(
   const klass = t.slice(0, sep + 1); // include the ``;``
   if (!/^L[\w/$]+;$/.test(klass)) return null;
   const tail = t.slice(sep + 3);
-  // Once the operator has typed any non-name char (``(``, space, etc.)
-  // we step out of picker mode — they're past method-name selection.
-  if (!/^[\w$]*$/.test(tail)) return null;
-  return { smaliClass: klass, methodPrefix: tail };
+  // Picker activates while the operator is in "method-name selection"
+  // mode. We accept three tail shapes:
+  //   ""          — bare prefix, show all methods on the class.
+  //   "onCli"     — partial name, filter by prefix.
+  //   "onClick("  — name + lone opening paren (the 10.8 Inspect → Trace
+  //                 seed shape). Strip the trailing ``(`` for the query
+  //                 so all overloads of the method appear.
+  // Anything inside the parens (``onClick(L...``) means the operator
+  // is past name-selection; the picker would be misleading there.
+  const m = tail.match(/^([\w$]*)\(?$/);
+  if (!m) return null;
+  return { smaliClass: klass, methodPrefix: m[1] };
 }
 
 const DEFAULT_HOPS = 3;
