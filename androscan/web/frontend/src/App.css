@@ -160,6 +160,33 @@ body {
   margin-left: auto;
 }
 
+/* Modifier applied to ``.pane-head`` when its containing pane is in a
+   chevron-collapsed state. Two responsibilities:
+
+   1. Override ``justify-content: space-between`` (the default for
+      ``.pane-head``) with ``flex-start``. The default works while the
+      header has trailing children (subtitle / counter / actions block);
+      a collapsed pane typically hides those, leaving just the chevron
+      button + ``<h2>``, which ``space-between`` would shove to opposite
+      edges of the strip — chevron at the left, title floating at the
+      far right. ``flex-start`` keeps both anchored on the left next to
+      each other, matching the collapsed Chat / sidebar-rail look
+      operators are already used to.
+
+   2. Strip the bottom border + padding + margin so the collapsed strip
+      reads as a single thin row rather than a header on top of an
+      empty body. Same three properties the per-pane
+      ``.hooklab-builder.collapsed .pane-head`` rule used to set;
+      lifted up here so any future collapsible pane (Decompiled,
+      Sessions, Mirror, …) can opt in by adding this one class to its
+      header instead of writing a per-pane rule. */
+.pane-head-collapsed {
+  justify-content: flex-start;
+  margin-bottom: 0;
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
 .center-empty {
   display: flex;
   align-items: center;
@@ -3354,10 +3381,23 @@ code { color: var(--accent); }
   padding-bottom: 0.4rem;
   gap: 0;
 }
-.hooklab-builder.collapsed .pane-head {
-  margin-bottom: 0;
-  border-bottom: 0;
-  padding-bottom: 0;
+/* Per-pane collapsed-header rules (margin / border / padding strip)
+   are no longer needed here — the shared ``.pane-head-collapsed``
+   modifier (added next to ``.pane-head``) covers them, and the
+   HookBuilder header opts in by appending that class when
+   ``collapsed`` is true. */
+
+/* Decompiled pane wrapper — mirrors ``.hooklab-builder``'s
+   collapsed-state padding tweak so the thin top strip looks
+   identical regardless of which pane in the centre column is
+   folded. ``gap: 0`` is harmless here (the wrapper isn't a flex
+   container today) but kept symmetric in case the wrapper is ever
+   converted to one, so the same operator-facing strip height
+   guarantees apply uniformly across the centre column's collapsible
+   panes. */
+.hooklab-decompiled.collapsed {
+  padding-bottom: 0.4rem;
+  gap: 0;
 }
 
 .hookbuilder-form {

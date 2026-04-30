@@ -764,7 +764,7 @@ export function HookBuilder({
           : "pane-scroll hooklab-builder"
       }
     >
-      <header className="pane-head">
+      <header className={`pane-head ${collapsed ? "pane-head-collapsed" : ""}`.trim()}>
         {onToggle && (
           <button
             type="button"

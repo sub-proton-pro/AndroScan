@@ -17,7 +17,7 @@ import { FridaSessionsList } from "../components/FridaSessionsList";
 import { FridaTracePanel } from "../components/FridaTracePanel";
 import { HookBuilder } from "../components/HookBuilder";
 import { HookStatsPanel } from "../components/HookStatsPanel";
-import { IconChevronLeft, IconChevronUp } from "../components/Icons";
+import { IconChevronDown, IconChevronLeft, IconChevronUp } from "../components/Icons";
 import { ScopeInspectorPanel } from "../components/ScopeInspectorPanel";
 import { fetchSource } from "../api/code";
 import {
@@ -279,6 +279,23 @@ function ManualHooksMode({
     }
   };
 
+  // Decompiled pane (top of the centre vertical PanelGroup) is the
+  // third foldable surface in this column. Unlike Hook Builder it can
+  // use ``react-resizable-panels``' built-in collapsible/collapsedSize
+  // pair directly — there's no neighbour-pinning intent here (Hook
+  // Builder needed the manual ``setLayout`` dance to land the strip
+  // flush against Chat's top edge; the Decompiled pane sits at the
+  // top of the column already, so the freed pixels can land wherever
+  // ``react-resizable-panels`` chooses to put them).
+  const decompiledRef = useRef<ImperativePanelHandle>(null);
+  const [decompiledCollapsed, setDecompiledCollapsed] = useState(false);
+  const toggleDecompiled = () => {
+    const p = decompiledRef.current;
+    if (!p) return;
+    if (decompiledCollapsed) p.expand();
+    else p.collapse();
+  };
+
   useEffect(() => {
     setSelected(null);
     setActiveSession(null);
@@ -393,11 +410,22 @@ function ManualHooksMode({
           direction="vertical"
           autoSaveId="lab-manual-center-v"
         >
-          <Panel defaultSize={36} minSize={18} className="panel">
+          <Panel
+            ref={decompiledRef}
+            defaultSize={36}
+            minSize={4}
+            collapsible
+            collapsedSize={4}
+            onCollapse={() => setDecompiledCollapsed(true)}
+            onExpand={() => setDecompiledCollapsed(false)}
+            className="panel"
+          >
             <LabCodeView
               appId={appId}
               selected={selected}
               onSourceLoaded={onSourceLoaded}
+              collapsed={decompiledCollapsed}
+              onToggle={toggleDecompiled}
             />
           </Panel>
           <PanelResizeHandle className="resize-v" />
@@ -579,9 +607,29 @@ type LabCodeViewProps = {
    *  re-fetching. ``null`` means "no source available" (no selection,
    *  load error, or path missing in the cache). */
   onSourceLoaded?: (source: string | null) => void;
+  /** Optional collapse state. When ``collapsed`` is true the header
+   *  strip stays visible (with the chevron + title), but the body
+   *  (subtitle, empty-state hint, loading / error message, and the
+   *  ``CodeView`` itself) is hidden. The parent panel
+   *  (``react-resizable-panels`` Panel with ``collapsible``) handles
+   *  the actual size shrinking — this prop just controls what the
+   *  pane *renders* in its strip. */
+  collapsed?: boolean;
+  /** Click handler for the chevron in the header. Driven by the
+   *  parent (which owns the ``ImperativePanelHandle`` ref it needs
+   *  to call ``.expand()`` / ``.collapse()`` on). When omitted the
+   *  chevron button isn't rendered, leaving the pane permanently
+   *  expanded. */
+  onToggle?: () => void;
 };
 
-function LabCodeView({ appId, selected, onSourceLoaded }: LabCodeViewProps) {
+function LabCodeView({
+  appId,
+  selected,
+  onSourceLoaded,
+  collapsed = false,
+  onToggle,
+}: LabCodeViewProps) {
   const [source, setSource] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -622,16 +670,37 @@ function LabCodeView({ appId, selected, onSourceLoaded }: LabCodeViewProps) {
   }, [appId, selected?.javaRelPath]);
 
   return (
-    <div className="pane-scroll" style={hostStyle}>
-      <header className="pane-head">
+    <div
+      className={
+        collapsed
+          ? "pane-scroll hooklab-decompiled collapsed"
+          : "pane-scroll hooklab-decompiled"
+      }
+      style={hostStyle}
+    >
+      <header className={`pane-head ${collapsed ? "pane-head-collapsed" : ""}`.trim()}>
+        {onToggle && (
+          <button
+            type="button"
+            className="logcat-toggle-btn"
+            onClick={onToggle}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? "Expand decompiled" : "Collapse decompiled"}
+            title={collapsed ? "Expand decompiled" : "Collapse decompiled"}
+          >
+            {collapsed ? <IconChevronUp size={10} /> : <IconChevronDown size={10} />}
+          </button>
+        )}
         <h2>Decompiled</h2>
-        <span className="muted small">
-          {selected
-            ? `${selected.className}.${selected.methodName}`
-            : "click a graph node to open its source"}
-        </span>
+        {!collapsed && (
+          <span className="muted small">
+            {selected
+              ? `${selected.className}.${selected.methodName}`
+              : "click a graph node to open its source"}
+          </span>
+        )}
       </header>
-      {!selected && (
+      {!collapsed && !selected && (
         <p className="muted small">
           Java file from the jadx decompile cache lands here when you click a
           method in the call-graph pane (left). Method body is tinted via
@@ -639,13 +708,15 @@ function LabCodeView({ appId, selected, onSourceLoaded }: LabCodeViewProps) {
           the file.
         </p>
       )}
-      {selected && loading && <p className="muted small">loading {selected.javaRelPath}…</p>}
-      {selected && loadError && (
+      {!collapsed && selected && loading && (
+        <p className="muted small">loading {selected.javaRelPath}…</p>
+      )}
+      {!collapsed && selected && loadError && (
         <p className="muted small" style={{ color: "var(--accent)" }}>
           {loadError}
         </p>
       )}
-      {selected && source != null && (
+      {!collapsed && selected && source != null && (
         <div style={codeWrapStyle}>
           <CodeView source={source} emphasizeMethod={selected.methodName} />
         </div>
