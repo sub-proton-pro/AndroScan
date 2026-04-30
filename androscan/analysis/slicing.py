@@ -1,5 +1,6 @@
-"""Intra-procedural backward slicer for decision predicates — Phase 10
-sub-step 10.2.
+"""Backward slicer for decision predicates — Phase 10 sub-step 10.2,
+extended in Phase 11 sub-step 11.4 to support **bounded
+inter-procedural descent** through stateless helper methods.
 
 Given a :class:`androscan.analysis.decisions.MethodDecisions` (one
 method's body of branches + raw instruction stream), trace each
@@ -43,13 +44,42 @@ encodes "compare against this value", and the value itself is rarely
 the bypass lever). v2 may widen this to a full
 ``tuple[PredicateOrigin, ...]`` when both sides matter equally.
 
-Out of scope for v1
--------------------
+Phase 11 sub-step 11.4 — bounded inter-procedural descent
+---------------------------------------------------------
 
-* Aliasing / field-flow / escape analysis (DEC-024 limitation).
-* Inter-procedural slicing — the slicer never crosses method
-  boundaries; ``MethodCallOrigin`` carries the called method's
-  :class:`MethodRef` but doesn't recurse into its body.
+The v1 slicer terminated at every :class:`MethodCallOrigin` without
+inspecting the callee. v2 extends this: when the slicer would
+otherwise terminate at a :class:`MethodCallOrigin` AND the callee is
+known to be stateless (per :func:`is_stateless` + the
+:data:`_STATELESS_LIB_DENYLIST` short-circuit) AND the descent budget
+permits, the slicer **descends into the callee** and re-runs
+:func:`_slice_register` on the callee's ``return-*`` instruction's
+source register. The descended :class:`PredicateOrigin` *replaces*
+the original :class:`MethodCallOrigin` in the slicer's output:
+operators see the new terminal (e.g. ``ConstOrigin("premium")`` for
+a getter that returns a constant), not the surface-level call.
+
+Bounded by:
+
+* :data:`MAX_SLICE_DEPTH` (default ``2``; hard cap ``4`` in code) —
+  configurable via ``trace.max_slice_depth`` in 11.6.
+* :class:`_DescentBudget`'s ``visited`` set keyed on
+  ``(class_smali, method_name, descriptor)`` — terminates cycles +
+  prevents redundant re-descent into hub helpers.
+* :func:`is_stateless` — type-driven analyzer over the callee's body
+  looking for side effects (field/array writes, monitor, throw,
+  reflection, calls to other stateful methods).
+
+Closed economy: the same :class:`_DescentBudget` is shared between
+method descent and 11.5's field-write-site walking (DEC-025) so an
+aggressive method descent doesn't exhaust budget for a subsequent
+field-write-site walk.
+
+Out of scope for v1 (still out for v2; deferred to v3 / Phase 12)
+-----------------------------------------------------------------
+
+* Aliasing / field-flow / escape analysis (DEC-024 / DEC-025
+  limitation).
 * SSA / phi-node reconstruction — the slicer follows the most-recent
   definition in linear instruction order; control-flow joins are
   flattened (the most-recent definition along the textual order wins).
@@ -66,6 +96,7 @@ import re
 from typing import Optional
 
 from androscan.analysis.decisions import MethodDecisions
+from androscan.analysis.smali_parser import ClassDecl
 from androscan.analysis.trace_types import (
     CompositeOrigin,
     ConstOrigin,
@@ -81,6 +112,108 @@ from androscan.analysis.trace_types import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_WALK = 64
+
+# ---------------------------------------------------------------------------
+# Phase 11 sub-step 11.4 — bounded inter-procedural descent
+
+#: Default maximum descent depth (helper-method hops the slicer will
+#: chase past a v1 :class:`MethodCallOrigin` terminal). 11.6 promotes
+#: this to a ``trace.max_slice_depth`` config knob; until then this
+#: module constant is the single source of truth.
+MAX_SLICE_DEPTH = 2
+
+#: Hard cap regardless of operator config (defensive). Even if 11.6's
+#: config knob is set higher, descent stops at this depth — operators
+#: rarely benefit from chains longer than 4 hops, and the worst-case
+#: per-anchor cost grows linearly so an unlucky misconfig shouldn't
+#: blow the per-anchor budget.
+HARD_CAP_DEPTH = 4
+
+#: Curated list of stdlib classes whose methods we treat as stateless
+#: without inspecting their Smali (we don't ship Android SDK / JDK
+#: smali in any test or runtime path, so we have to assume statelessness
+#: from the class identity). Two value shapes:
+#:
+#:   * ``None`` → every method on the class is treated as stateless
+#:     (whole-class entry, used when *every* common operation on the
+#:     class is genuinely pure).
+#:   * ``frozenset[str]`` → only the listed method names are treated
+#:     as stateless (per-method allowlist; methods not in the set are
+#:     treated as stateful — defensive for classes where some methods
+#:     allocate or throw).
+#:
+#: Hand-curated, intentionally small, easy to audit. Lives next to
+#: :class:`_DescentBudget` so additions are local + auditable. Per
+#: the 11.4 planning checkpoint, the v1 seed is:
+#:
+#: * ``Ljava/lang/Math;`` (whole class — every static is pure).
+#: * Primitive boxing classes (whole class each — getters / parsers
+#:   / value-of / compareTo / equals / hashCode are all pure).
+#: * ``Ljava/lang/String;`` per-method allowlist (length / charAt /
+#:   substring / equals / hashCode / isEmpty / indexOf — explicit
+#:   allowlist; methods that allocate like ``concat`` / ``replace``
+#:   / ``trim`` / ``toLowerCase`` are NOT included so they fall
+#:   through to "stateful" defensively).
+#: * ``Lkotlin/jvm/internal/Intrinsics;`` (whole class — Kotlin's
+#:   compiler-injected null-check + equality helpers).
+#: * ``Ljava/lang/Object;`` per-method allowlist (hashCode / equals /
+#:   toString / getClass — extremely common in
+#:   ``if obj.equals(...)`` predicates; planning-checkpoint
+#:   addition on top of the spec's seed).
+_STATELESS_LIB_DENYLIST: dict[str, Optional[frozenset[str]]] = {
+    # Whole-class entries (every method pure).
+    "Ljava/lang/Math;": None,
+    "Ljava/lang/Integer;": None,
+    "Ljava/lang/Long;": None,
+    "Ljava/lang/Boolean;": None,
+    "Ljava/lang/Float;": None,
+    "Ljava/lang/Double;": None,
+    "Ljava/lang/Byte;": None,
+    "Ljava/lang/Short;": None,
+    "Ljava/lang/Character;": None,
+    "Lkotlin/jvm/internal/Intrinsics;": None,
+    # Per-method allowlists.
+    "Ljava/lang/String;": frozenset({
+        "length", "charAt", "substring", "equals", "hashCode",
+        "isEmpty", "indexOf",
+    }),
+    "Ljava/lang/Object;": frozenset({
+        "hashCode", "equals", "toString", "getClass",
+    }),
+}
+
+
+@dataclasses.dataclass
+class _DescentBudget:
+    """Mutable budget shared across method descent and (in 11.5)
+    field-write-site walking.
+
+    ``remaining_depth`` decrements as the descent recurses into
+    helper methods; reaches zero when the descent has consumed its
+    full :data:`MAX_SLICE_DEPTH` allotment. ``visited`` keys on
+    ``(class_smali_descriptor, method_name, smali_descriptor)``
+    triples — descent skips any callee already in the set, which
+    both terminates cycles and prevents repeated work on hub helpers
+    that appear in many decision slices.
+
+    Mutability is the chosen posture per the 11.4 planning checkpoint:
+    "closed economy" in the spec text implies the same budget instance
+    flows across passes, not that each pass instantiates a fresh
+    immutable copy. The mutable form is also slightly cheaper (no
+    ``dataclasses.replace`` per recursive call). Tests build fresh
+    instances per ``slice_predicate_origins`` call so the budget
+    never leaks across boundaries.
+    """
+    remaining_depth: int
+    visited: set[tuple[str, str, str]]
+
+    @classmethod
+    def fresh(cls, max_depth: int = MAX_SLICE_DEPTH) -> "_DescentBudget":
+        """Build a fresh budget with the configured max depth (clamped
+        to :data:`HARD_CAP_DEPTH`). Default factory used by the
+        public :func:`slice_predicate_origins` entry point when the
+        caller doesn't supply its own."""
+        return cls(remaining_depth=min(max(max_depth, 0), HARD_CAP_DEPTH), visited=set())
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +339,10 @@ def slice_predicate_origins(
     method_decisions: MethodDecisions,
     *,
     max_walk: int = DEFAULT_MAX_WALK,
+    classes_by_smali: Optional[dict[str, ClassDecl]] = None,
+    decisions_by_method_sig: Optional[dict[str, MethodDecisions]] = None,
+    reflective_method_sigs: frozenset[str] = frozenset(),
+    descent_budget: Optional[_DescentBudget] = None,
 ) -> MethodDecisions:
     """Return a :class:`MethodDecisions` with every decision's
     ``predicate_origin`` populated (or ``None`` on slice failure).
@@ -214,11 +351,48 @@ def slice_predicate_origins(
     :func:`dataclasses.replace`. Callers can chain
     ``slice_predicate_origins(method_decisions)`` directly into 10.3's
     classifier without bookkeeping.
+
+    Phase 11 sub-step 11.4 — bounded inter-procedural descent. When
+    ``classes_by_smali`` AND ``decisions_by_method_sig`` are both
+    provided, the slicer descends past v1 :class:`MethodCallOrigin`
+    terminals into stateless helper-method bodies (up to
+    :data:`MAX_SLICE_DEPTH` hops). When either is ``None``, the
+    slicer falls back to v1 intra-procedural behaviour — every
+    :class:`MethodCallOrigin` surfaces as a terminal regardless of
+    callee statelessness. Tests and ad-hoc callers that only care
+    about v1 semantics can omit both arguments entirely; the public
+    signature stays backwards-compatible.
+
+    ``reflective_method_sigs`` is a hint set of method signatures the
+    call-graph indexer flagged as ``may_have_unresolved_reflection``;
+    :func:`is_stateless` treats any descent into one of these as
+    stateful (defensive — reflection results can have arbitrary side
+    effects). When omitted, no method is treated as reflective —
+    safe for tests but the production caller (the ``trace_behavior``
+    skill) populates this from the call-graph SQLite cache.
+
+    ``descent_budget`` lets a caller share a budget across multiple
+    slice calls (the "closed economy" pattern from DEC-025 — 11.5's
+    field-write-site walking will draw from the same budget). When
+    omitted, a fresh budget is built per call.
     """
     instructions = method_decisions.instructions
     enriched: list[DecisionPoint] = []
+    descent_enabled = (
+        classes_by_smali is not None and decisions_by_method_sig is not None
+    )
+    budget = descent_budget if descent_budget is not None else _DescentBudget.fresh()
     for dp in method_decisions.decision_points:
         origin = _slice_one(dp, instructions, max_walk=max_walk)
+        if descent_enabled and origin is not None:
+            origin = _maybe_descend(
+                origin,
+                budget=budget,
+                max_walk=max_walk,
+                classes_by_smali=classes_by_smali,  # type: ignore[arg-type]
+                decisions_by_method_sig=decisions_by_method_sig,  # type: ignore[arg-type]
+                reflective_method_sigs=reflective_method_sigs,
+            )
         enriched.append(dataclasses.replace(dp, predicate_origin=origin))
     return dataclasses.replace(method_decisions, decision_points=tuple(enriched))
 
@@ -234,6 +408,10 @@ def slice_one_decision(
     walk where the caller may hold the decision separately from the
     enclosing :class:`MethodDecisions`. Returns the origin (or
     ``None`` on slice failure) without wrapping.
+
+    No inter-procedural descent — for descent the caller must use
+    :func:`slice_predicate_origins` with the optional
+    ``classes_by_smali`` + ``decisions_by_method_sig`` kwargs.
     """
     return _slice_one(decision, instructions, max_walk=max_walk)
 
@@ -466,3 +644,378 @@ def _combine_two_origins(
     pa = _origin_priority(a)
     pb = _origin_priority(b)
     return a if pa >= pb else b
+
+
+# ===========================================================================
+# Phase 11 sub-step 11.4 — bounded inter-procedural descent
+# ===========================================================================
+#
+# The descent layer sits ABOVE the v1 slicer. The v1 :func:`_slice_one`
+# stays untouched — it always terminates at the closest defining
+# instruction, including :class:`MethodCallOrigin` for invoke-* +
+# move-result patterns. The descent code below decides, AFTER v1
+# slicing, whether to chase past a :class:`MethodCallOrigin` into the
+# callee's body and re-slice. The descended :class:`PredicateOrigin`
+# *replaces* the original (operator sees the new terminal, not the
+# chain that produced it).
+
+
+# Smali ``return`` / ``return-wide`` / ``return-object`` (NOT
+# ``return-void`` — void methods have no return register to slice).
+_RE_RETURN_WITH_REG = re.compile(
+    r"^return(?:-wide|-object)?\s+(?P<src>[vp]\d+)\s*$"
+)
+
+
+def _denylist_says_stateless(class_desc: str, method_name: str) -> Optional[bool]:
+    """Three-valued lookup against :data:`_STATELESS_LIB_DENYLIST`.
+
+    Returns ``True`` if the class is whole-class-listed OR the method
+    is in the per-method allowlist; ``False`` if the class is in the
+    deny-list with an allowlist that doesn't include this method
+    (treat as stateful — defensive); ``None`` if the class isn't in
+    the deny-list at all (caller falls through to body-walking).
+    """
+    entry = _STATELESS_LIB_DENYLIST.get(class_desc)
+    if entry is None and class_desc not in _STATELESS_LIB_DENYLIST:
+        return None
+    if entry is None:
+        # Whole-class entry — every method is stateless.
+        return True
+    return method_name in entry
+
+
+def is_stateless(
+    method_sig: str,
+    *,
+    classes_by_smali: dict[str, ClassDecl],
+    decisions_by_method_sig: dict[str, MethodDecisions],
+    reflective_method_sigs: frozenset[str] = frozenset(),
+    visited: Optional[set[tuple[str, str, str]]] = None,
+) -> bool:
+    """Type-driven analyzer — does the body of ``method_sig`` have
+    any side effect we'd care about for slicer descent?
+
+    Walks the method's instruction stream looking for:
+
+    * ``iput-*`` / ``sput-*`` / ``aput-*`` (field / array writes —
+      definitely stateful).
+    * ``monitor-enter`` / ``monitor-exit`` (synchronization —
+      defensively stateful; locks observe shared state).
+    * ``throw vN`` (exception throw — short-circuits the method's
+      return value semantics; descending past this would claim the
+      wrong terminal).
+    * ``invoke-*`` to non-stateless callees (recursive — reuses the
+      ``visited`` set to terminate cycles; cycles are treated as
+      stateful per the v2 defensive default — see the cycle test
+      fixture in ``Helpers.smali`` for the rationale).
+    * The method is flagged ``may_have_unresolved_reflection`` in
+      the call graph (passed via ``reflective_method_sigs``) —
+      reflection results can have arbitrary effects.
+
+    Pure-arithmetic / comparison / ``move-*`` / ``return-*`` /
+    ``nop`` / ``goto*`` / ``if-*`` / ``const-*`` / ``new-instance``
+    / ``new-array`` / type-cast / ``instance-of`` / field READS
+    (``iget-*`` / ``sget-*`` — read, no write) / array READS
+    (``aget-*``) / ``move-result-*`` / ``move-exception`` are all
+    stateless from the operator's perspective.
+
+    Returns ``True`` when no side effect is found and every recursed
+    callee is also stateless.
+
+    The ``method_sig`` lookup uses the canonical smali signature
+    (``Lcom/example/Foo;->bar(I)V``) to find the
+    :class:`MethodDecisions` body. When the signature isn't in
+    ``decisions_by_method_sig``, the analyzer falls back to the
+    deny-list (handles stdlib classes we have no Smali source for);
+    when the deny-list also doesn't know the method, the analyzer
+    returns ``False`` (defensive — assume stateful when uncertain).
+    """
+    if visited is None:
+        visited = set()
+
+    # Cycle break — if we're already analyzing this method up the
+    # stack, treat as stateful (defensive — don't claim purity
+    # without proof). The cycle case is rare in practice but
+    # mutual-recursion between helpers does happen.
+    parsed = _parse_signature_for_cycle_key(method_sig)
+    if parsed in visited:
+        return False
+    visited.add(parsed)
+    try:
+        # Reflection check — single most-restrictive predicate.
+        if method_sig in reflective_method_sigs:
+            return False
+
+        # Body lookup. When the method has no decisions registered
+        # (linear method body — no if-* / *-switch), it still has an
+        # instruction stream IF ``parse_decisions`` parsed it. v1's
+        # parser only emits ``MethodDecisions`` for methods with at
+        # least one decision, so linear stateless helpers like
+        # ``return v0`` won't appear in ``decisions_by_method_sig``.
+        # Fall back to the deny-list for those.
+        md = decisions_by_method_sig.get(method_sig)
+        if md is None:
+            class_desc, method_name, _ = parsed
+            denylist = _denylist_says_stateless(class_desc, method_name)
+            if denylist is not None:
+                return denylist
+            # Method body unknown + not on the deny-list. Could be
+            # an external (Android framework) method we don't model,
+            # an in-app linear method the parser skipped, or just
+            # something the analyzer hasn't been taught about. The
+            # safe default is False (assume stateful) — descending
+            # into a method we can't see is the bad case.
+            return False
+
+        # Body-walking — examine every instruction.
+        for line in md.instructions:
+            if _line_is_stateful(
+                line,
+                classes_by_smali=classes_by_smali,
+                decisions_by_method_sig=decisions_by_method_sig,
+                reflective_method_sigs=reflective_method_sigs,
+                visited=visited,
+            ):
+                return False
+        return True
+    finally:
+        # Pop the cycle-key on the way out so siblings don't see this
+        # method as already-visited (only ancestors should).
+        visited.discard(parsed)
+
+
+def _line_is_stateful(
+    line: str,
+    *,
+    classes_by_smali: dict[str, ClassDecl],
+    decisions_by_method_sig: dict[str, MethodDecisions],
+    reflective_method_sigs: frozenset[str],
+    visited: set[tuple[str, str, str]],
+) -> bool:
+    """Per-instruction stateful check used by :func:`is_stateless`.
+    Returns ``True`` iff the line constitutes a side effect the
+    analyzer cares about. Conservative — any line we can't parse
+    cleanly is ``True`` (assume stateful)."""
+    op_match = _RE_OPCODE_DEST.match(line)
+    if not op_match:
+        # Unparseable line — could be a comment / directive that
+        # slipped through. Defensively treat as stateless (don't
+        # block on parser quirks).
+        return False
+    opcode = op_match.group("op")
+
+    # Field / array writes.
+    if opcode.startswith("iput") or opcode.startswith("sput") or opcode.startswith("aput"):
+        return True
+    # Synchronization (monitor-enter / monitor-exit). Even though
+    # monitor-enter is in :data:`_NO_DEF_OPCODES`, locks observe
+    # shared state and are the wrong thing to descend past.
+    if opcode.startswith("monitor-"):
+        return True
+    # Exception throw.
+    if opcode == "throw":
+        return True
+    # Invoke — recurse on the callee.
+    if opcode.startswith("invoke-"):
+        inv = _RE_INVOKE.match(line)
+        if not inv:
+            # Malformed invoke line — defensive False on the
+            # statelessness side (assume stateful).
+            return True
+        callee_owner = inv.group("owner")
+        callee_name = inv.group("method")
+        callee_sig = (
+            f"{callee_owner}->{callee_name}"
+            f"({inv.group('params')}){inv.group('ret')}"
+        )
+        # Constructor invocation (`<init>`) is part of object
+        # construction; if the new instance escapes to a field
+        # we'd already have caught the `iput-object`. Treat
+        # constructor calls themselves as stateless for the
+        # analyzer (they don't write the caller's state).
+        if callee_name in ("<init>", "<clinit>"):
+            return False
+        # Recurse — `is_stateless` handles deny-list short-circuit
+        # + body lookup + cycle termination internally.
+        if is_stateless(
+            callee_sig,
+            classes_by_smali=classes_by_smali,
+            decisions_by_method_sig=decisions_by_method_sig,
+            reflective_method_sigs=reflective_method_sigs,
+            visited=visited,
+        ):
+            return False
+        return True
+    return False
+
+
+def _parse_signature_for_cycle_key(method_sig: str) -> tuple[str, str, str]:
+    """Split a smali method signature into the
+    ``(class_smali, method_name, descriptor)`` triple used as the
+    cycle / visited key.
+
+    ``Lcom/example/Foo;->bar(I)V`` → ``("Lcom/example/Foo;", "bar", "(I)V")``.
+
+    Falls back to ``("", method_sig, "")`` on a malformed input so
+    the visited set still has *some* key (degraded but doesn't crash).
+    """
+    arrow = method_sig.find("->")
+    if arrow < 0:
+        return ("", method_sig, "")
+    class_part = method_sig[:arrow]
+    rest = method_sig[arrow + 2:]
+    paren = rest.find("(")
+    if paren < 0:
+        return (class_part, rest, "")
+    return (class_part, rest[:paren], rest[paren:])
+
+
+def _maybe_descend(
+    origin: PredicateOrigin,
+    *,
+    budget: _DescentBudget,
+    max_walk: int,
+    classes_by_smali: dict[str, ClassDecl],
+    decisions_by_method_sig: dict[str, MethodDecisions],
+    reflective_method_sigs: frozenset[str],
+) -> PredicateOrigin:
+    """If ``origin`` is a :class:`MethodCallOrigin` AND the descent
+    budget permits AND the callee is stateless AND we have its body,
+    descend one hop and re-slice.
+
+    The descended :class:`PredicateOrigin` *replaces* ``origin``
+    (operator sees the new terminal). When any precondition fails,
+    ``origin`` is returned unchanged — the v1 terminal remains the
+    operator's view.
+
+    Recursive: the re-slice may itself produce a
+    :class:`MethodCallOrigin` (deeper helper chain), in which case
+    we recurse with the budget decremented. The recursion bottoms
+    out either when the budget hits zero (terminal stays as
+    :class:`MethodCallOrigin` — operator sees "stopped at depth N"),
+    when the callee resolves to a non-method-call origin (the new
+    terminal), or when the callee is non-stateless / external / not
+    in our corpus (descent skipped, original kept).
+    """
+    if not isinstance(origin, MethodCallOrigin):
+        return origin
+    if budget.remaining_depth <= 0:
+        return origin
+    callee_sig = origin.method.smali_signature
+    cycle_key = _parse_signature_for_cycle_key(callee_sig)
+    if cycle_key in budget.visited:
+        # Already descended into this callee in the current top-level
+        # slice — don't redo work. Surface the v1 terminal so the
+        # operator at least sees the call (vs. a misleading "no
+        # origin").
+        return origin
+    # External callee → not in the in-app classes index → can't
+    # descend (no Smali body for stdlib / framework classes).
+    callee_class_desc = cycle_key[0]
+    if callee_class_desc not in classes_by_smali:
+        return origin
+    # Statelessness gate. Use a fresh visited set for the
+    # is_stateless walk so it doesn't pollute the descent's own
+    # visited set (the two passes have different semantics: descent
+    # tracks "have I already descended into this", is_stateless
+    # tracks "am I already analyzing this on the current
+    # statelessness recursion stack").
+    if not is_stateless(
+        callee_sig,
+        classes_by_smali=classes_by_smali,
+        decisions_by_method_sig=decisions_by_method_sig,
+        reflective_method_sigs=reflective_method_sigs,
+    ):
+        return origin
+    descended = _descend_into_callee(
+        origin,
+        budget=budget,
+        max_walk=max_walk,
+        classes_by_smali=classes_by_smali,
+        decisions_by_method_sig=decisions_by_method_sig,
+        reflective_method_sigs=reflective_method_sigs,
+    )
+    if descended is None:
+        return origin
+    return descended
+
+
+def _descend_into_callee(
+    origin: MethodCallOrigin,
+    *,
+    budget: _DescentBudget,
+    max_walk: int,
+    classes_by_smali: dict[str, ClassDecl],
+    decisions_by_method_sig: dict[str, MethodDecisions],
+    reflective_method_sigs: frozenset[str],
+) -> Optional[PredicateOrigin]:
+    """Re-run :func:`_slice_register` on the callee's ``return-*``
+    instruction's source register. The callee's body is sourced from
+    ``decisions_by_method_sig`` (via the canonical smali signature
+    on ``origin.method``).
+
+    Returns the descended :class:`PredicateOrigin`, or ``None`` if
+    the callee's body isn't available, has no return-with-register,
+    or the inner slice itself fails. Caller decides whether to fall
+    back to the original on ``None``.
+    """
+    callee_sig = origin.method.smali_signature
+    cycle_key = _parse_signature_for_cycle_key(callee_sig)
+    md = decisions_by_method_sig.get(callee_sig)
+    if md is None:
+        # Linear method (no decisions parsed) — no instruction stream
+        # available even though the callee is in our index. Could
+        # extend the parser to emit MethodDecisions for branchless
+        # methods too, but that's a 11.7+ ergonomics fix; for now
+        # the descent stops here.
+        return None
+    # Find the `return-*` (with a source register) — typically the
+    # last real instruction in the body. Walk from the end backwards
+    # for cheap last-return semantics; multiple returns (rare) take
+    # the textually-last one, matching the v1 slicer's "most-recent
+    # definition wins" framing.
+    return_index = -1
+    return_reg: Optional[str] = None
+    for k in range(len(md.instructions) - 1, -1, -1):
+        m = _RE_RETURN_WITH_REG.match(md.instructions[k])
+        if m:
+            return_index = k
+            return_reg = m.group("src")
+            break
+    if return_index < 0 or return_reg is None:
+        # `return-void` (no return register) or no return at all —
+        # nothing to slice further; preserve v1 terminal.
+        return None
+
+    # Mark this callee visited + decrement depth BEFORE recursing so
+    # the inner re-slice's own descent attempts see the updated
+    # budget (closed economy — same instance shared across the
+    # entire slice operation).
+    budget.visited.add(cycle_key)
+    budget.remaining_depth -= 1
+    try:
+        inner = _slice_register(
+            return_reg,
+            return_index,
+            md.instructions,
+            max_walk=max_walk,
+        )
+        if inner is None:
+            return None
+        # Recursive descent — the inner slice may itself produce a
+        # MethodCallOrigin. _maybe_descend handles the budget check.
+        return _maybe_descend(
+            inner,
+            budget=budget,
+            max_walk=max_walk,
+            classes_by_smali=classes_by_smali,
+            decisions_by_method_sig=decisions_by_method_sig,
+            reflective_method_sigs=reflective_method_sigs,
+        )
+    finally:
+        # Restore depth on the way out so a *sibling* decision in the
+        # caller method can still descend into a different helper.
+        # The visited entry stays — we never want to descend into
+        # the same callee twice in one top-level slice operation.
+        budget.remaining_depth += 1

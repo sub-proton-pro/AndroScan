@@ -261,3 +261,424 @@ def test_predicate_origin_round_trips_through_json_for_all_variants() -> None:
         decoded = json.loads(payload)
         assert decoded["predicate_origin"] is not None, sig
         assert decoded["predicate_origin"]["kind"] == expected_kind, sig
+
+
+# ===========================================================================
+# Phase 11 sub-step 11.4 — bounded inter-procedural descent
+# ===========================================================================
+#
+# Descent harness: parse classes + decisions WITH branchless bodies
+# (so pure helper methods are reachable via ``decisions_by_method_sig``),
+# build the side-indices, and slice with descent enabled.
+
+
+def _parse_and_slice_with_descent(
+    *,
+    reflective: frozenset[str] = frozenset(),
+    max_depth: int = slicing.MAX_SLICE_DEPTH,
+) -> dict[str, decisions.MethodDecisions]:
+    """Variant of :func:`_parse_and_slice` that enables Phase 11.4
+    bounded inter-procedural descent. Returns a dict keyed by smali
+    signature so each test can pin one fixture method independently.
+    """
+    classes, _ = smali_parser.parse_classes(_roots())
+    mds, _ = decisions.parse_decisions(_roots(), classes, include_branchless=True)
+    classes_by_smali = {c.class_desc: c for c in classes}
+    decisions_by_sig = {md.method_signature: md for md in mds}
+    out: dict[str, decisions.MethodDecisions] = {}
+    for md in mds:
+        if not md.decision_points:
+            # Branchless methods don't get sliced; they're only used
+            # as descent targets (consumed via ``decisions_by_sig``).
+            continue
+        sliced = slicing.slice_predicate_origins(
+            md,
+            classes_by_smali=classes_by_smali,
+            decisions_by_method_sig=decisions_by_sig,
+            reflective_method_sigs=reflective,
+            descent_budget=slicing._DescentBudget.fresh(max_depth=max_depth),
+        )
+        out[md.method_signature] = sliced
+    return out
+
+
+# --- Descent positive paths ------------------------------------------------
+
+
+def test_descent_one_hop_resolves_through_pure_getter() -> None:
+    """``gateOneHopGetter`` slices to ``MethodCallOrigin(pureGetFlag)``;
+    depth-1 descent re-slices ``pureGetFlag`` and finds a const-string,
+    so the operator-visible terminal is ``ConstOrigin("premium")``."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateOneHopGetter()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, ConstOrigin), f"expected ConstOrigin, got {type(origin).__name__}"
+    assert origin.value == '"premium"'
+    assert origin.smali_op == "const-string"
+
+
+def test_descent_two_hop_chain_resolves_to_terminal_const() -> None:
+    """Two-hop chain: ``gateTwoHopChain → pureGetA → pureGetB → const/4``.
+    With ``MAX_SLICE_DEPTH=2`` (and the chain's actual depth=2) the
+    descent walks both helpers and the operator sees the terminal
+    ``const/4 0x1`` as ``ConstOrigin("0x1")``."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateTwoHopChain()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, ConstOrigin)
+    assert origin.value == "0x1"
+
+
+def test_descent_depth_cap_stops_at_max_slice_depth() -> None:
+    """Three-hop chain (``gateThreeHopChainCapped → pureChainHopOne →
+    pureChainHopTwo → pureChainHopThree → const/4``) exceeds the v1
+    ``MAX_SLICE_DEPTH=2`` cap. The descent stops at the depth-2
+    helper; the operator-visible terminal is
+    ``MethodCallOrigin(pureChainHopThree)`` — the helper at the
+    boundary, NOT the original surface call (per the spec: "operator
+    sees the new terminal, not the chain that produced it")."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateThreeHopChainCapped()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.method.method_name == "pureChainHopThree"
+
+
+def test_descent_max_depth_zero_disables_descent_entirely() -> None:
+    """Setting ``max_depth=0`` on the budget should preserve every
+    v1 ``MethodCallOrigin`` terminal regardless of callee statelessness
+    — useful as a kill-switch + sanity check that descent is the only
+    mechanism producing the new terminals."""
+    sliced = _parse_and_slice_with_descent(max_depth=0)
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateOneHopGetter()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.method.method_name == "pureGetFlag"
+
+
+def test_descent_cross_class_resolves_through_classes_by_smali() -> None:
+    """``gateCrossClassDescent`` calls ``Lcom/trace/Slices;->getFlag()Z``
+    — a method on a sibling class. The descent should find ``Slices``
+    via ``classes_by_smali``, find the body via
+    ``decisions_by_method_sig``, classify it stateless, walk its
+    ``return v0`` source register and find the ``const/4 0x1``.
+    Terminal becomes ``ConstOrigin("0x1")``."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateCrossClassDescent()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, ConstOrigin), f"expected ConstOrigin, got {type(origin).__name__}"
+    assert origin.value == "0x1"
+
+
+# --- Descent negative paths (descent blocked) ------------------------------
+
+
+def test_descent_blocked_when_callee_writes_field() -> None:
+    """``gateStatefulFieldWriteCallee`` calls ``statefulIputCallee``
+    which contains ``iput-boolean``. ``is_stateless`` returns False;
+    descent is skipped; v1 ``MethodCallOrigin`` terminal preserved."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateStatefulFieldWriteCallee()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.method.method_name == "statefulIputCallee"
+
+
+def test_descent_blocked_when_callee_is_external() -> None:
+    """``gateExternalAndroidCallee`` calls ``Landroid/util/Log;->d(...)``
+    — an Android framework class with no Smali in our corpus. The
+    callee is NOT in ``classes_by_smali``; descent is skipped; v1
+    terminal preserved."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(
+        sliced["Lcom/trace/Helpers;->gateExternalAndroidCallee(Ljava/lang/String;)V"]
+    )
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.method.class_name == "android.util.Log"
+    assert origin.method.method_name == "d"
+
+
+def test_descent_falls_back_to_v1_when_descent_kwargs_omitted() -> None:
+    """Public API contract: when ``classes_by_smali`` and
+    ``decisions_by_method_sig`` are both omitted, the slicer behaves
+    exactly like v1 — every ``MethodCallOrigin`` terminal is surfaced
+    unchanged. This is the backwards-compat path for tests + ad-hoc
+    callers that don't care about descent."""
+    classes, _ = smali_parser.parse_classes(_roots())
+    mds, _ = decisions.parse_decisions(_roots(), classes, include_branchless=True)
+    by_sig = {md.method_signature: md for md in mds}
+    md = by_sig["Lcom/trace/Helpers;->gateOneHopGetter()V"]
+    sliced = slicing.slice_predicate_origins(md)  # no descent kwargs
+    dp = _only_decision(sliced)
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.method.method_name == "pureGetFlag"
+
+
+# --- ``is_stateless`` analyzer — direct unit tests -------------------------
+
+
+def _is_stateless_harness() -> tuple[
+    dict[str, "smali_parser.ClassDecl"],
+    dict[str, decisions.MethodDecisions],
+]:
+    """Shared fixture loader for ``is_stateless`` unit tests."""
+    classes, _ = smali_parser.parse_classes(_roots())
+    mds, _ = decisions.parse_decisions(_roots(), classes, include_branchless=True)
+    return (
+        {c.class_desc: c for c in classes},
+        {md.method_signature: md for md in mds},
+    )
+
+
+def test_is_stateless_returns_true_for_pure_const_return() -> None:
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->pureGetFlag()Ljava/lang/String;",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is True
+
+
+def test_is_stateless_returns_false_for_iput_field_write() -> None:
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->statefulIputCallee()I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is False
+
+
+def test_is_stateless_returns_false_for_sput_field_write() -> None:
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->statefulSputCallee()I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is False
+
+
+def test_is_stateless_returns_false_for_aput_array_write() -> None:
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->statefulAputCallee([I)I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is False
+
+
+def test_is_stateless_returns_false_for_monitor_enter() -> None:
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->statefulMonitorCallee()I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is False
+
+
+def test_is_stateless_returns_false_for_throw() -> None:
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->statefulThrowCallee()I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is False
+
+
+def test_is_stateless_returns_true_for_pure_arithmetic_only() -> None:
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->pureArithmeticOnly(II)I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is True
+
+
+# --- ``_STATELESS_LIB_DENYLIST`` deny-list short-circuit -------------------
+
+
+def test_denylist_string_length_treated_as_stateless() -> None:
+    """``String.length`` is in the per-method allowlist on the
+    String class entry → analyzer returns True for any caller body
+    that only invokes allowlisted String methods."""
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->pureStringLength(Ljava/lang/String;)I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is True
+
+
+def test_denylist_math_abs_treated_as_stateless() -> None:
+    """``Math.abs`` falls under the whole-class ``Math`` deny-list
+    entry → caller body that only invokes Math methods is stateless."""
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->pureMathAbs(I)I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is True
+
+
+def test_denylist_object_hashcode_treated_as_stateless() -> None:
+    """``Object.hashCode`` is the planning-checkpoint addition on top
+    of the spec's seed — verify it actually short-circuits to True."""
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->pureObjectHashCode(Ljava/lang/Object;)I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is True
+
+
+def test_denylist_kotlin_intrinsics_areequal_treated_as_stateless() -> None:
+    """``Kotlin.Intrinsics`` is whole-class deny-listed; ``areEqual``
+    is the hot Kotlin codegen call site for ``==`` comparisons."""
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->pureKotlinAreEqual(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is True
+
+
+def test_denylist_string_concat_NOT_treated_as_stateless() -> None:
+    """``String.concat`` is NOT in the per-method allowlist (it
+    allocates) → defensive False. This pins the per-method allowlist
+    enforcement (without it, the whole-class fallback would
+    spuriously claim concat is pure)."""
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->statefulStringConcat(Ljava/lang/String;)Ljava/lang/String;",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is False
+
+
+# --- Reflection deny-list --------------------------------------------------
+
+
+def test_is_stateless_returns_false_when_callee_is_reflective() -> None:
+    """A method flagged ``may_have_unresolved_reflection`` is treated
+    as stateful regardless of its body shape — reflection results
+    can have arbitrary side effects we can't analyze statically."""
+    cls, dec = _is_stateless_harness()
+    sig = "Lcom/trace/Helpers;->pureGetFlag()Ljava/lang/String;"
+    assert slicing.is_stateless(
+        sig, classes_by_smali=cls, decisions_by_method_sig=dec,
+    ) is True
+    # Same method, but flagged reflective via the side-set:
+    assert slicing.is_stateless(
+        sig,
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+        reflective_method_sigs=frozenset({sig}),
+    ) is False
+
+
+def test_descent_blocked_when_helper_is_reflective() -> None:
+    """End-to-end: the descent layer respects
+    ``reflective_method_sigs`` — descent is skipped when the callee
+    is in the reflective set, even if its body would otherwise pass
+    the statelessness check."""
+    classes, _ = smali_parser.parse_classes(_roots())
+    mds, _ = decisions.parse_decisions(_roots(), classes, include_branchless=True)
+    classes_by_smali = {c.class_desc: c for c in classes}
+    decisions_by_sig = {md.method_signature: md for md in mds}
+    md = decisions_by_sig["Lcom/trace/Helpers;->gateOneHopGetter()V"]
+    sliced = slicing.slice_predicate_origins(
+        md,
+        classes_by_smali=classes_by_smali,
+        decisions_by_method_sig=decisions_by_sig,
+        reflective_method_sigs=frozenset({
+            "Lcom/trace/Helpers;->pureGetFlag()Ljava/lang/String;",
+        }),
+    )
+    dp = _only_decision(sliced)
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin)  # descent skipped
+    assert origin.method.method_name == "pureGetFlag"
+
+
+# --- Cycle termination -----------------------------------------------------
+
+
+def test_is_stateless_terminates_on_mutual_recursion_cycle() -> None:
+    """``cycleA <-> cycleB`` mutual recursion. The visited-set cycle
+    breaker triggers; per the v2 defensive default ('cycle = stateful
+    without proof') both methods classify as stateful (False)."""
+    cls, dec = _is_stateless_harness()
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->cycleA()I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is False
+    assert slicing.is_stateless(
+        "Lcom/trace/Helpers;->cycleB()I",
+        classes_by_smali=cls,
+        decisions_by_method_sig=dec,
+    ) is False
+
+
+# --- ``_DescentBudget`` shape + closed-economy semantics -------------------
+
+
+def test_descent_budget_visited_set_prevents_redundant_redescent() -> None:
+    """The same callee invoked from two top-level decisions in a
+    closure should be descended into AT MOST ONCE per shared budget
+    instance. We simulate this by sharing a single ``_DescentBudget``
+    across two slice calls and asserting the second call surfaces
+    the v1 ``MethodCallOrigin`` (descent skipped because the helper
+    is already in ``budget.visited``)."""
+    classes, _ = smali_parser.parse_classes(_roots())
+    mds, _ = decisions.parse_decisions(_roots(), classes, include_branchless=True)
+    classes_by_smali = {c.class_desc: c for c in classes}
+    decisions_by_sig = {md.method_signature: md for md in mds}
+    shared_budget = slicing._DescentBudget.fresh()
+
+    md_one = decisions_by_sig["Lcom/trace/Helpers;->gateOneHopGetter()V"]
+    sliced_one = slicing.slice_predicate_origins(
+        md_one,
+        classes_by_smali=classes_by_smali,
+        decisions_by_method_sig=decisions_by_sig,
+        descent_budget=shared_budget,
+    )
+    dp_one = _only_decision(sliced_one)
+    assert isinstance(dp_one.predicate_origin, ConstOrigin)  # first descent succeeds
+    # Second slice of the same fixture method shares the budget —
+    # the visited set already contains pureGetFlag's cycle key, so
+    # the second descent should bail and surface the v1 terminal.
+    sliced_two = slicing.slice_predicate_origins(
+        md_one,
+        classes_by_smali=classes_by_smali,
+        decisions_by_method_sig=decisions_by_sig,
+        descent_budget=shared_budget,
+    )
+    dp_two = _only_decision(sliced_two)
+    assert isinstance(dp_two.predicate_origin, MethodCallOrigin)
+    assert dp_two.predicate_origin.method.method_name == "pureGetFlag"
+
+
+def test_descent_budget_fresh_clamps_max_depth_to_hard_cap() -> None:
+    """``_DescentBudget.fresh(max_depth=999)`` should clamp to the
+    :data:`HARD_CAP_DEPTH` constant — operator misconfig of the
+    11.6 ``trace.max_slice_depth`` knob can't blow the per-anchor
+    budget."""
+    budget = slicing._DescentBudget.fresh(max_depth=999)
+    assert budget.remaining_depth == slicing.HARD_CAP_DEPTH
+
+
+def test_descent_budget_fresh_clamps_negative_to_zero() -> None:
+    """Negative ``max_depth`` (defensive against operator typos in
+    the 11.6 config knob) clamps to zero — descent disabled."""
+    budget = slicing._DescentBudget.fresh(max_depth=-5)
+    assert budget.remaining_depth == 0
+
+
+def test_max_slice_depth_module_constant_is_two() -> None:
+    """11.4 ships with ``MAX_SLICE_DEPTH=2``; 11.6 promotes this to
+    a config knob. Pin the v1 default so promotion is a noticeable
+    change (this test will need updating when 11.6 lands, by design)."""
+    assert slicing.MAX_SLICE_DEPTH == 2
+    assert slicing.HARD_CAP_DEPTH == 4

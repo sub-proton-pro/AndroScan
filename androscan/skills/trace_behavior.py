@@ -206,8 +206,31 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
         )
 
     classes, _ = smali_parser.parse_classes(smali_roots)
-    method_decisions, _ = decisions_mod.parse_decisions(smali_roots, classes)
+    # Phase 11 sub-step 11.4 — pass ``include_branchless=True`` so the
+    # slicer's bounded inter-procedural descent can reach helper-method
+    # bodies that have no decisions of their own (pure getters,
+    # arithmetic-only computations, deny-list-friendly stdlib wrappers).
+    # The 10.x consumers below still ``continue`` on branchless methods
+    # in the per-closure loop (line ~225 below) so the pipeline output
+    # is byte-identical to v1 for inputs that don't benefit from
+    # descent.
+    method_decisions, _ = decisions_mod.parse_decisions(
+        smali_roots, classes, include_branchless=True,
+    )
     by_signature = {md.method_signature: md for md in method_decisions}
+    classes_by_smali = {c.class_desc: c for c in classes}
+    # Reflective-method set — used by ``is_stateless`` to refuse
+    # descent into methods the call-graph indexer flagged with
+    # ``may_have_unresolved_reflection``. Cached once per skill
+    # invocation; the ``frozenset`` is hashable + cheap to pass
+    # through to every per-decision slice call.
+    reflective_method_sigs = call_graph.list_reflective_method_sigs(cache_dir)
+    # Shared "closed economy" descent budget per the 11.4 spec:
+    # depth + visited set are both consumed cumulatively across every
+    # decision in the closure (so a hub-helper visited via decision A
+    # isn't redundantly re-descended via decision B). 11.5's
+    # field-write-site walking will draw from the same instance.
+    descent_budget = slicing._DescentBudget.fresh()
 
     aggregated_decisions: list[DecisionPoint] = []
     aggregated_plans: list[BypassPlan] = []
@@ -215,11 +238,22 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
     for sig in closure.methods:
         md = by_signature.get(sig)
         if md is None:
-            # Closure node has no branches (linear method) or no Smali
-            # body in the apktool tree (compiled-away helper). Both are
-            # legitimate and just contribute zero decisions.
+            # Closure node has no Smali body in the apktool tree
+            # (compiled-away helper). Legitimate and just contributes
+            # zero decisions.
             continue
-        sliced = slicing.slice_predicate_origins(md)
+        if not md.decision_points:
+            # Branchless method (now reachable via ``include_branchless=True``
+            # but contributes no decisions to the aggregation —
+            # behaviour matches v1 for the per-closure loop).
+            continue
+        sliced = slicing.slice_predicate_origins(
+            md,
+            classes_by_smali=classes_by_smali,
+            decisions_by_method_sig=by_signature,
+            reflective_method_sigs=reflective_method_sigs,
+            descent_budget=descent_budget,
+        )
         classified = branch_classifier.classify_branch_outcomes(sliced)
         for dp in classified.decision_points:
             aggregated_decisions.append(dp)

@@ -866,6 +866,35 @@ def dump_meta(decompile_cache_dir: Path) -> dict[str, str]:
     return out
 
 
+def list_reflective_method_sigs(decompile_cache_dir: Path) -> frozenset[str]:
+    """Return every method ``smali_id`` the indexer flagged as
+    ``may_have_unresolved_reflection`` (Phase 4 reflection-hit detection
+    in :func:`smali_parser.parse_invokes`).
+
+    Phase 11 sub-step 11.4 — the slicer's bounded inter-procedural
+    descent uses this set as the deny-list for :func:`is_stateless`:
+    any method flagged reflective is treated as stateful (reflection
+    results have arbitrary side effects we can't analyse statically),
+    so the slicer never descends past a `MethodCallOrigin` whose
+    callee is in this set.
+
+    Returns an empty frozenset on a missing / unreadable DB so the
+    caller can pass the result directly to :func:`slicing.slice_predicate_origins`'s
+    ``reflective_method_sigs`` kwarg without branching."""
+    db = call_graph_db_path(decompile_cache_dir)
+    if not db.is_file():
+        return frozenset()
+    try:
+        with _connect(db) as conn:
+            rows = conn.execute(
+                "SELECT smali_id FROM nodes WHERE may_have_unresolved_reflection = 1"
+            ).fetchall()
+            return frozenset(str(r["smali_id"]) for r in rows)
+    except sqlite3.Error as e:
+        logger.warning("call_graph: list_reflective_method_sigs failed: %s", e)
+        return frozenset()
+
+
 # ---------------------------------------------------------------------------
 # Read API used by graph_routes (and 4.2+ consumers).
 #

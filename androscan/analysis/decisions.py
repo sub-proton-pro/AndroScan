@@ -188,6 +188,8 @@ class DecisionsParseSummary:
 def parse_decisions(
     roots: Iterable[Path],
     classes: list[ClassDecl],
+    *,
+    include_branchless: bool = False,
 ) -> tuple[list[MethodDecisions], DecisionsParseSummary]:
     """Walk apktool's smali tree and emit decision points per method.
 
@@ -197,10 +199,24 @@ def parse_decisions(
     hierarchy — branches are intra-method.
 
     Result order: methods appear in source-file walk order; decisions
-    within a method are in source order. Empty methods (no branches)
-    yield no :class:`MethodDecisions` entry — callers that want a full
-    method enumeration should join against
-    :class:`androscan.analysis.smali_parser.ClassDecl.methods`.
+    within a method are in source order.
+
+    By default, methods with no branches (``decision_points`` would
+    be empty) yield no :class:`MethodDecisions` entry — keeps the
+    result list tight for the original 10.x consumers (the
+    ``trace_behavior`` skill's `_per_method_pipeline` short-circuits
+    on ``None`` lookups for branchless callees, so it doesn't need
+    them).
+
+    Phase 11 sub-step 11.4 — pass ``include_branchless=True`` to also
+    emit a :class:`MethodDecisions` for every branchless method
+    (with ``decision_points=()`` and the full ``instructions`` tuple).
+    The slicer's bounded inter-procedural descent (11.4) needs the
+    bodies of pure helper methods to descend through; without this
+    flag those bodies aren't reachable. The :attr:`summary.methods_with_decisions`
+    counter still reflects only methods with decisions (the field
+    name mirrors its meaning) — the *list length* of ``out`` is the
+    body-having method count when ``include_branchless=True``.
     """
     out: list[MethodDecisions] = []
     summary = DecisionsParseSummary()
@@ -227,9 +243,13 @@ def parse_decisions(
             continue
         class_desc = cls_match.group("desc")
 
-        for md in _walk_file_methods(text, class_desc, rel, summary):
+        for md in _walk_file_methods(
+            text, class_desc, rel, summary,
+            include_branchless=include_branchless,
+        ):
             out.append(md)
-            summary.methods_with_decisions += 1
+            if md.decision_points:
+                summary.methods_with_decisions += 1
             for dp in md.decision_points:
                 summary.decisions += 1
                 if dp.is_switch:
@@ -246,13 +266,15 @@ def _walk_file_methods(
     class_desc: str,
     rel_path: str,
     summary: DecisionsParseSummary,
+    *,
+    include_branchless: bool = False,
 ) -> Iterator[MethodDecisions]:
-    """Iterate ``(method_signature, MethodDecisions)`` for every method
-    body in *text* that contains at least one decision point.
-
-    A method body that contains no ``if-*`` / ``*-switch`` opcodes does
-    not yield — keeps the result list tight for downstream consumers.
-    """
+    """Iterate :class:`MethodDecisions` for every method body in
+    *text*. By default only branched methods are yielded (the v1
+    contract); ``include_branchless=True`` (Phase 11 sub-step 11.4)
+    yields one for every method, including those with no
+    ``if-*`` / ``*-switch`` opcodes (their ``decision_points`` is
+    empty but ``instructions`` is fully populated)."""
     lines = text.splitlines()
     cur_method_sig: Optional[str] = None
     method_state: Optional[_MethodState] = None
@@ -278,7 +300,7 @@ def _walk_file_methods(
 
         if _RE_END_METHOD.match(raw):
             assert method_state is not None
-            md = method_state.finish()
+            md = method_state.finish(include_branchless=include_branchless)
             if md is not None:
                 yield md
             cur_method_sig = None
@@ -614,9 +636,17 @@ class _MethodState:
                 return name
         return None
 
-    def finish(self) -> Optional[MethodDecisions]:
-        """Return a frozen :class:`MethodDecisions` for this method, or
-        ``None`` if no decision points were found.
+    def finish(self, *, include_branchless: bool = False) -> Optional[MethodDecisions]:
+        """Return a frozen :class:`MethodDecisions` for this method.
+
+        Returns ``None`` when no decision points were found AND
+        ``include_branchless=False`` (the v1 default — keeps the
+        result list tight for the original 10.x consumers).
+        Returns a :class:`MethodDecisions` with empty
+        ``decision_points`` and the full ``instructions`` tuple
+        when ``include_branchless=True`` (Phase 11 sub-step 11.4 —
+        the slicer's bounded inter-procedural descent needs the
+        bodies of pure branchless helpers).
 
         Pending switches that never had a data block (defensive — would
         only happen on truncated apktool output) are dropped from the
@@ -634,7 +664,7 @@ class _MethodState:
                 self._decisions[idx] = None  # type: ignore[call-overload]
             self._pending_switches.clear()
         decisions = tuple(d for d in self._decisions if d is not None)
-        if not decisions:
+        if not decisions and not include_branchless:
             return None
         return MethodDecisions(
             method_signature=self.method_signature,
