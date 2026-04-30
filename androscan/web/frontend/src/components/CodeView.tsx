@@ -17,9 +17,19 @@ import { IconClose, IconGear, IconSearch } from "./Icons";
 type Props = {
   source: string;
   /** Optional method name whose body should be visually emphasised
-   *  (gradient tint on the body lines + accent on the gutter). */
+   *  (gradient tint on the body lines + accent on the gutter).
+   *
+   *  Resolves to a body range via ``findMethodBodyRange``. When the
+   *  method is found and ``scrollToLine`` isn't explicitly set, the
+   *  viewer also auto-scrolls to the first line of that body — callers
+   *  that pass ``emphasizeMethod`` from a UI selection (Inspect tab's
+   *  Code Browser tree pick, Lab tab's call-graph node click, the
+   *  Lab → "Open in Inspect" cross-tab handoff) get scroll for free
+   *  without having to compute the line themselves. An explicit
+   *  ``scrollToLine`` always wins. */
   emphasizeMethod?: string | null;
-  /** When set, scrolls to the line on first render (1-indexed). */
+  /** When set, scrolls to the line on first render (1-indexed). Takes
+   *  precedence over the auto-scroll-to-emphasized-method behaviour. */
   scrollToLine?: number | null;
   /** Inclusive 1-indexed line range to keep persistently highlighted
    *  (e.g. the snippet range of a UI Mapping code candidate). The
@@ -52,7 +62,7 @@ export function CodeView({
 }: Props) {
   const [prefs, setPrefs] = useCodeViewPrefs();
 
-  const lines = useMemo(
+  const { rows: lines, firstMethodLine } = useMemo(
     () => splitIntoLines(source, emphasizeMethod ?? null),
     [source, emphasizeMethod],
   );
@@ -121,6 +131,27 @@ export function CodeView({
     const el = rowRefs.current[scrollToLine];
     if (el) el.scrollIntoView({ block: "center" });
   }, [scrollToLine, lines.length]);
+
+  // Auto-scroll to the first line of the emphasised method body when
+  // the caller didn't pin an explicit ``scrollToLine``. Without this,
+  // surfaces that pass ``emphasizeMethod`` from a UI selection (Inspect
+  // tab's Code Browser tree pick, the Lab → "Open in Inspect" cross-tab
+  // handoff, the Lab → Manual Hooks centre pane on call-graph node
+  // click) would tint the body but leave the viewport pinned at the top
+  // of the file — operators would have to manually scroll to find the
+  // emphasised method, especially in long decompiled classes packed
+  // with kotlin metadata above the actual code.
+  //
+  // Same dep shape as the scrollToLine effect so the scroll fires both
+  // on emphasis changes and once-after-source-loads (when ``lines.length``
+  // flips from 0 to N).
+  useEffect(() => {
+    if (scrollToLine) return;
+    if (firstMethodLine == null) return;
+    if (lines.length === 0) return;
+    const el = rowRefs.current[firstMethodLine];
+    if (el) el.scrollIntoView({ block: "center" });
+  }, [firstMethodLine, scrollToLine, lines.length]);
 
   // Active match → scroll into view whenever the index changes.
   useEffect(() => {
@@ -441,7 +472,7 @@ function GearMenu({
 function splitIntoLines(
   src: string,
   emphasizeMethod: string | null,
-): LineRow[] {
+): { rows: LineRow[]; firstMethodLine: number | null } {
   const tokens = tokenize(src);
   const range = emphasizeMethod
     ? findMethodBodyRange(src, emphasizeMethod)
@@ -452,9 +483,17 @@ function splitIntoLines(
   let pos = 0;
   let inMethod = false;
   let lineStart = 0;
+  // 1-indexed line number of the first row whose ``inMethod`` is true.
+  // Captured in ``flush`` so we don't have to re-scan rows after the
+  // tokenize loop. Stays ``null`` when ``emphasizeMethod`` is unset or
+  // the method couldn't be located in ``src``.
+  let firstMethodLine: number | null = null;
 
   const flush = () => {
     rows.push({ tokens: cur, inMethod, startOffset: lineStart });
+    if (inMethod && firstMethodLine === null) {
+      firstMethodLine = rows.length;
+    }
     cur = [];
     inMethod = false;
     lineStart = pos;
@@ -481,7 +520,7 @@ function splitIntoLines(
     }
   }
   if (cur.length > 0 || rows.length === 0) flush();
-  return rows;
+  return { rows, firstMethodLine };
 }
 
 function findMatches(
