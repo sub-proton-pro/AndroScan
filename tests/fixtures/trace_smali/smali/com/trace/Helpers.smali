@@ -30,9 +30,20 @@
 
 
 .method public constructor <init>()V
-    .registers 1
+    .registers 2
 
     invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+
+    # Phase 11.5 fixture — `mMultiWriteFlag` is written here in
+    # `<init>` (constructor-priority candidate) AND elsewhere in
+    # `setMultiWriteFlag` / `initMultiWriteFlag` (non-constructor
+    # candidates). The 11.5 Q1 (A) rule prefers this constructor
+    # write — `gateMultiWriteFieldRead`'s descent should resolve to
+    # `ConstOrigin "0x1"` (the value loaded into v0 immediately
+    # before this iput), NOT the const/4 0x0 from `initMultiWriteFlag`.
+    const/4 v0, 0x1
+
+    iput-boolean v0, p0, Lcom/trace/Helpers;->mMultiWriteFlag:Z
 
     return-void
 .end method
@@ -465,3 +476,257 @@
 .field public mDirty:Z
 
 .field public static sDirty:Z
+
+
+# ===========================================================================
+# Phase 11 sub-step 11.5 — field-write-site descent
+# ===========================================================================
+#
+# These methods exercise the field-write-site descent introduced in
+# 11.5. Pattern: the slicer terminates at a `FieldReadOrigin`, and
+# the field-write-site walker re-slices the source register at the
+# most-recent write site (constructor-priority per 11.5 planning
+# checkpoint Q1).
+
+
+# --- Field-cached predicate (instance field, init in <init>) --------------
+#
+# `gateInstanceFieldRead` reads `this.mPremiumFlag`; the field is
+# initialised in `<init>` via `iput-boolean v0, p0, ...; const/4 v0, 0x1`.
+# Field-write-site descent finds the constructor write, slices its
+# source register, and resolves to ConstOrigin "0x1".
+
+.field public mPremiumFlag:Z
+
+.method public gateInstanceFieldRead()V
+    .registers 2
+
+    iget-boolean v0, p0, Lcom/trace/Helpers;->mPremiumFlag:Z
+
+    if-eqz v0, :cond_take
+
+    return-void
+
+    :cond_take
+    return-void
+.end method
+
+.method public initInstanceFlag()V
+    .registers 2
+
+    const/4 v0, 0x1
+
+    iput-boolean v0, p0, Lcom/trace/Helpers;->mPremiumFlag:Z
+
+    return-void
+.end method
+
+
+# --- Static-field cached predicate (sget + <clinit> sput) -----------------
+#
+# `gateStaticFieldRead` reads `Helpers.sFeatureEnabled` (sget); the
+# field is initialised in `<clinit>` via `sput-boolean v0, ...;
+# const/4 v0, 0x1`. Field-write-site descent finds the static-init
+# write and resolves to ConstOrigin "0x1".
+
+.field public static sFeatureEnabled:Z
+
+.method static constructor <clinit>()V
+    .registers 1
+
+    const/4 v0, 0x1
+
+    sput-boolean v0, Lcom/trace/Helpers;->sFeatureEnabled:Z
+
+    return-void
+.end method
+
+.method public gateStaticFieldRead()V
+    .registers 2
+
+    sget-boolean v0, Lcom/trace/Helpers;->sFeatureEnabled:Z
+
+    if-eqz v0, :cond_take
+
+    return-void
+
+    :cond_take
+    return-void
+.end method
+
+
+# --- Multi-write field — constructor-priority wins (Q1 (A)) ---------------
+#
+# `mMultiWriteFlag` is written in BOTH `<init>` (via `setInitial`)
+# AND a setter (`setMultiWriteFlag`). 11.5's Q1 (A) rule prefers
+# the constructor write. The constructor writes a const/4 0x1 →
+# descent surfaces ConstOrigin "0x1" (NOT the setter's value, which
+# in our fixture is a different const/4 0x0).
+#
+# Note: smali_parser doesn't track <init> textual ordering across
+# *separate* methods, so we put both writes inside callable methods
+# but route the constructor's path explicitly through `setInitial`'s
+# iput AND a direct iput inside `<init>` so that the slicer's
+# constructor-priority rule has both an in-`<init>` write site and
+# a non-`<init>` write site to choose between. See `<init>` at top
+# of this file — it's been extended below.
+
+.field public mMultiWriteFlag:Z
+
+.method public initMultiWriteFlag()V
+    .registers 2
+
+    # Reachable from <init> in real code. The slicer doesn't need
+    # to *prove* this is called from <init>; the constructor-priority
+    # rule keys on the write site's enclosing method's name being
+    # `<init>` / `<clinit>`. So we put the canonical constructor
+    # write inline in <init> below; this method is a non-init
+    # alternative write site that should be ignored.
+    const/4 v0, 0x0
+
+    iput-boolean v0, p0, Lcom/trace/Helpers;->mMultiWriteFlag:Z
+
+    return-void
+.end method
+
+.method public setMultiWriteFlag(Z)V
+    .registers 2
+
+    iput-boolean p1, p0, Lcom/trace/Helpers;->mMultiWriteFlag:Z
+
+    return-void
+.end method
+
+.method public gateMultiWriteFieldRead()V
+    .registers 2
+
+    iget-boolean v0, p0, Lcom/trace/Helpers;->mMultiWriteFlag:Z
+
+    if-eqz v0, :cond_take
+
+    return-void
+
+    :cond_take
+    return-void
+.end method
+
+
+# --- Cross-class field read (descent skipped — same-class only) -----------
+#
+# `gateCrossClassFieldRead` reads `Lcom/trace/Slices;->sFlag:Z` —
+# a field on a sibling class. 11.5 Q2 (A) "strict same-class only"
+# means descent is skipped; v1 FieldReadOrigin terminal preserved.
+
+.method public gateCrossClassFieldRead()V
+    .registers 2
+
+    sget-boolean v0, Lcom/trace/Slices;->sFlag:Z
+
+    if-eqz v0, :cond_take
+
+    return-void
+
+    :cond_take
+    return-void
+.end method
+
+
+# --- Field with NO writes anywhere in the class (descent gracefully fails)
+#
+# `gateUnwrittenFieldRead` reads `mNeverWritten` — a field declared
+# but never written in this class file. Field-write-site descent
+# finds no candidate site and returns the original FieldReadOrigin.
+
+.field public mNeverWritten:Z
+
+.method public gateUnwrittenFieldRead()V
+    .registers 2
+
+    iget-boolean v0, p0, Lcom/trace/Helpers;->mNeverWritten:Z
+
+    if-eqz v0, :cond_take
+
+    return-void
+
+    :cond_take
+    return-void
+.end method
+
+
+# --- Field write that itself sources from a method call -------------------
+#
+# `gateFieldWriteFromMethodCall` reads `mFromMethod`; the field's
+# constructor write site is `iput-boolean vFromMethod, p0, ...`
+# where `vFromMethod` came from `move-result` of `pureGetFlag()` (no,
+# that returns String — let's use `pureGetA()` which returns I). So
+# the chain is: gate (iget) → field-write descent → write site (iput
+# vSrc) → re-slice vSrc → MethodCallOrigin(pureGetA) → method descent
+# → ConstOrigin "0x1". This pins the closed-economy budget's
+# composition (1 hop field + 1 hop method = 2 hops total, exactly
+# at the v1 default MAX_SLICE_DEPTH=2 cap).
+
+.field public mFromMethod:I
+
+.method public initFromMethodCall()V
+    .registers 2
+
+    invoke-virtual {p0}, Lcom/trace/Helpers;->pureGetA()I
+
+    move-result v0
+
+    iput v0, p0, Lcom/trace/Helpers;->mFromMethod:I
+
+    return-void
+.end method
+
+.method public gateFieldWriteFromMethodCall()V
+    .registers 2
+
+    iget v0, p0, Lcom/trace/Helpers;->mFromMethod:I
+
+    if-eqz v0, :cond_take
+
+    return-void
+
+    :cond_take
+    return-void
+.end method
+
+
+# --- Budget exhaustion — chain too deep for default budget ----------------
+#
+# Same shape as `gateFieldWriteFromMethodCall` but sourced through
+# `pureChainHopOne` which itself calls `pureChainHopTwo` calling
+# `pureChainHopThree` (3 hops of method descent). With v1
+# MAX_SLICE_DEPTH=2 + the 1 hop already consumed by the field-write
+# descent, the budget exhausts after the first method hop. The
+# inner _maybe_descend respects this and stops at
+# `MethodCallOrigin(pureChainHopTwo)`. Test asserts the depth-pill-
+# style "stopped at depth 2" outcome.
+
+.field public mFromDeepChain:I
+
+.method public initFromDeepChain()V
+    .registers 2
+
+    invoke-virtual {p0}, Lcom/trace/Helpers;->pureChainHopOne()I
+
+    move-result v0
+
+    iput v0, p0, Lcom/trace/Helpers;->mFromDeepChain:I
+
+    return-void
+.end method
+
+.method public gateFieldWriteFromDeepChain()V
+    .registers 2
+
+    iget v0, p0, Lcom/trace/Helpers;->mFromDeepChain:I
+
+    if-eqz v0, :cond_take
+
+    return-void
+
+    :cond_take
+    return-void
+.end method

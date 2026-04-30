@@ -1,6 +1,8 @@
 """Backward slicer for decision predicates — Phase 10 sub-step 10.2,
 extended in Phase 11 sub-step 11.4 to support **bounded
-inter-procedural descent** through stateless helper methods.
+inter-procedural descent** through stateless helper methods, and in
+Phase 11 sub-step 11.5 to support **same-class field-write-site
+walking**.
 
 Given a :class:`androscan.analysis.decisions.MethodDecisions` (one
 method's body of branches + raw instruction stream), trace each
@@ -70,10 +72,48 @@ Bounded by:
   looking for side effects (field/array writes, monitor, throw,
   reflection, calls to other stateful methods).
 
+Phase 11 sub-step 11.5 — same-class field-write-site walking
+------------------------------------------------------------
+
+When the slicer would otherwise terminate at a
+:class:`FieldReadOrigin` AND the field is on the same class as the
+reading method (cross-class field-flow stays out of scope per
+ISSUE-013) AND the descent budget permits, the slicer walks every
+``iput-*`` / ``sput-*`` write site for that field across the class's
+methods, picks the most-recent write per the **constructor-priority
+rule** (Q1 (A) of the 11.5 planning checkpoint — prefer the
+textually-last write in ``<init>`` / ``<clinit>`` over any
+non-constructor write; ties within a constructor broken by source
+order), then re-runs :func:`_slice_register` on the written register
+at that write site. The descended :class:`PredicateOrigin` *replaces*
+the original :class:`FieldReadOrigin` in the slicer's output (same
+UI density discipline as 11.4's method descent — operator sees the
+new terminal, depth pill surfaces the "via 1 field write" signal).
+
 Closed economy: the same :class:`_DescentBudget` is shared between
-method descent and 11.5's field-write-site walking (DEC-025) so an
-aggressive method descent doesn't exhaust budget for a subsequent
-field-write-site walk.
+method descent (11.4) and field-write-site walking (11.5) per
+DEC-025 — a method that descends 2 hops via callees can't *also*
+walk a field-write site, and vice versa. The composed inner slice
+is run through :func:`_maybe_descend` so a field-write source that
+itself resolves to a :class:`MethodCallOrigin` or another
+:class:`FieldReadOrigin` can be further descended (subject to the
+same shared budget).
+
+11.5 v1 approximations (to be revisited in v3 / Phase 12):
+
+* **Strict same-class match** — Q2 (A) of the planning checkpoint;
+  no superclass walking. A method on ``Child`` reading a field
+  declared on ``Parent`` won't trigger field-write descent.
+* **Receiver-agnostic** — Q3 (A) of the planning checkpoint;
+  ``iput vSrc, vObj, ...`` write sites are matched by
+  ``(class, field_name)`` only, ignoring the ``vObj`` receiver.
+  The textbook ``this.mField`` field-cached idiom is correct under
+  this rule (only-write-site scenario), but more aggressive aliasing
+  cases may pick a write to a different instance's field.
+* **Lazy walk per descent** — Q4 (A) of the planning checkpoint;
+  no eager indexing pass. Bounded by the closed-economy budget;
+  promote to indexed lookup in 11.7 only if telemetry shows
+  megaclass cost.
 
 Out of scope for v1 (still out for v2; deferred to v3 / Phase 12)
 -----------------------------------------------------------------
@@ -262,6 +302,19 @@ _RE_SGET = re.compile(
     r"^sget(?:-wide|-object|-boolean|-byte|-char|-short)?\s+"
     r"(?P<dest>[vp]\d+)\s*,\s*(?P<field>L[^;\s]+;->[A-Za-z_$][A-Za-z_$0-9]*:\S+)"
 )
+# iput vSrc, vObj, Lcom/Foo;->mField:Type (covers all iput-* variants).
+# Phase 11 sub-step 11.5 — used by ``_walk_field_write_sites`` to
+# locate field-write candidates. Note ``vSrc`` is the *source*
+# register (the value being written) — opposite role to iget's vDest.
+_RE_IPUT = re.compile(
+    r"^iput(?:-wide|-object|-boolean|-byte|-char|-short)?\s+"
+    r"(?P<src>[vp]\d+)\s*,\s*[vp]\d+\s*,\s*(?P<field>L[^;\s]+;->[A-Za-z_$][A-Za-z_$0-9]*:\S+)"
+)
+# sput vSrc, Lcom/Foo;->mField:Type (covers all sput-* variants).
+_RE_SPUT = re.compile(
+    r"^sput(?:-wide|-object|-boolean|-byte|-char|-short)?\s+"
+    r"(?P<src>[vp]\d+)\s*,\s*(?P<field>L[^;\s]+;->[A-Za-z_$][A-Za-z_$0-9]*:\S+)"
+)
 
 # invoke-{kind}{,/range} {regs}, owner;->name(params)return
 _RE_INVOKE = re.compile(
@@ -382,6 +435,11 @@ def slice_predicate_origins(
         classes_by_smali is not None and decisions_by_method_sig is not None
     )
     budget = descent_budget if descent_budget is not None else _DescentBudget.fresh()
+    # Phase 11 sub-step 11.5 — derive the reading method's class for
+    # the same-class field-write gating. ``method_signature`` is
+    # always the smali form ``Lcom/Foo;->bar(I)V``; the class part
+    # before ``->`` is the gate input.
+    current_class_smali = _class_from_method_sig(method_decisions.method_signature)
     for dp in method_decisions.decision_points:
         origin = _slice_one(dp, instructions, max_walk=max_walk)
         if descent_enabled and origin is not None:
@@ -392,6 +450,7 @@ def slice_predicate_origins(
                 classes_by_smali=classes_by_smali,  # type: ignore[arg-type]
                 decisions_by_method_sig=decisions_by_method_sig,  # type: ignore[arg-type]
                 reflective_method_sigs=reflective_method_sigs,
+                current_class_smali=current_class_smali,
             )
         enriched.append(dataclasses.replace(dp, predicate_origin=origin))
     return dataclasses.replace(method_decisions, decision_points=tuple(enriched))
@@ -879,27 +938,75 @@ def _maybe_descend(
     classes_by_smali: dict[str, ClassDecl],
     decisions_by_method_sig: dict[str, MethodDecisions],
     reflective_method_sigs: frozenset[str],
+    current_class_smali: str = "",
 ) -> PredicateOrigin:
-    """If ``origin`` is a :class:`MethodCallOrigin` AND the descent
-    budget permits AND the callee is stateless AND we have its body,
-    descend one hop and re-slice.
+    """Dispatch to the appropriate descent path based on ``origin``'s
+    variant.
+
+    * :class:`MethodCallOrigin` → 11.4's :func:`_descend_into_callee`
+      (bounded inter-procedural slicer descent through stateless
+      helper methods).
+    * :class:`FieldReadOrigin` → 11.5's :func:`_walk_field_write_sites`
+      (same-class field-write-site walking with constructor-priority).
+    * Any other variant (Const / Param / Composite) is already a
+      terminal — descent is a no-op.
 
     The descended :class:`PredicateOrigin` *replaces* ``origin``
     (operator sees the new terminal). When any precondition fails,
     ``origin`` is returned unchanged — the v1 terminal remains the
     operator's view.
 
-    Recursive: the re-slice may itself produce a
-    :class:`MethodCallOrigin` (deeper helper chain), in which case
-    we recurse with the budget decremented. The recursion bottoms
-    out either when the budget hits zero (terminal stays as
-    :class:`MethodCallOrigin` — operator sees "stopped at depth N"),
-    when the callee resolves to a non-method-call origin (the new
-    terminal), or when the callee is non-stateless / external / not
-    in our corpus (descent skipped, original kept).
+    Recursive: the descent's inner re-slice may itself produce a
+    :class:`MethodCallOrigin` or :class:`FieldReadOrigin`, in which
+    case the inner descent fires (subject to the shared budget).
+    The recursion bottoms out when the budget hits zero, when the
+    inner result is a terminal variant, or when any precondition
+    fails (deny-list / cycle / external / cross-class / no write
+    site).
+
+    ``current_class_smali`` is the class smali descriptor of the
+    *reading* method — used by the field-write-site descent to gate
+    same-class-only candidates per the 11.5 planning checkpoint
+    Q2 (A). Defaults to ``""`` so callers from tests / ad-hoc paths
+    that don't care about field-write descent can omit it; the
+    11.5 field-write path skips when the gate is empty.
     """
-    if not isinstance(origin, MethodCallOrigin):
-        return origin
+    if isinstance(origin, MethodCallOrigin):
+        return _maybe_descend_method_call(
+            origin,
+            budget=budget,
+            max_walk=max_walk,
+            classes_by_smali=classes_by_smali,
+            decisions_by_method_sig=decisions_by_method_sig,
+            reflective_method_sigs=reflective_method_sigs,
+            current_class_smali=current_class_smali,
+        )
+    if isinstance(origin, FieldReadOrigin):
+        return _maybe_descend_field_read(
+            origin,
+            budget=budget,
+            max_walk=max_walk,
+            classes_by_smali=classes_by_smali,
+            decisions_by_method_sig=decisions_by_method_sig,
+            reflective_method_sigs=reflective_method_sigs,
+            current_class_smali=current_class_smali,
+        )
+    return origin
+
+
+def _maybe_descend_method_call(
+    origin: MethodCallOrigin,
+    *,
+    budget: _DescentBudget,
+    max_walk: int,
+    classes_by_smali: dict[str, ClassDecl],
+    decisions_by_method_sig: dict[str, MethodDecisions],
+    reflective_method_sigs: frozenset[str],
+    current_class_smali: str,
+) -> PredicateOrigin:
+    """Phase 11 sub-step 11.4 — bounded inter-procedural descent
+    through a stateless helper-method callee. See :func:`_maybe_descend`
+    for the dispatch contract."""
     if budget.remaining_depth <= 0:
         return origin
     callee_sig = origin.method.smali_signature
@@ -935,6 +1042,7 @@ def _maybe_descend(
         classes_by_smali=classes_by_smali,
         decisions_by_method_sig=decisions_by_method_sig,
         reflective_method_sigs=reflective_method_sigs,
+        current_class_smali=current_class_smali,
     )
     if descended is None:
         return origin
@@ -949,6 +1057,7 @@ def _descend_into_callee(
     classes_by_smali: dict[str, ClassDecl],
     decisions_by_method_sig: dict[str, MethodDecisions],
     reflective_method_sigs: frozenset[str],
+    current_class_smali: str,
 ) -> Optional[PredicateOrigin]:
     """Re-run :func:`_slice_register` on the callee's ``return-*``
     instruction's source register. The callee's body is sourced from
@@ -959,6 +1068,13 @@ def _descend_into_callee(
     the callee's body isn't available, has no return-with-register,
     or the inner slice itself fails. Caller decides whether to fall
     back to the original on ``None``.
+
+    ``current_class_smali`` here is the *outer caller's* class — but
+    the inner ``_maybe_descend`` call below uses the *callee's* class
+    so that any 11.5 field-write descent fired from inside the
+    descended slice is gated against the callee's class (the inner
+    slice runs over the callee's body, so its same-class check
+    must be against the callee).
     """
     callee_sig = origin.method.smali_signature
     cycle_key = _parse_signature_for_cycle_key(callee_sig)
@@ -1004,7 +1120,12 @@ def _descend_into_callee(
         if inner is None:
             return None
         # Recursive descent — the inner slice may itself produce a
-        # MethodCallOrigin. _maybe_descend handles the budget check.
+        # MethodCallOrigin OR FieldReadOrigin. _maybe_descend handles
+        # both via dispatch + budget check. The inner descent's
+        # same-class gate is against the *callee's* class (we're
+        # slicing the callee's body, so any field read inside is
+        # relative to the callee's class).
+        callee_class_desc = cycle_key[0]
         return _maybe_descend(
             inner,
             budget=budget,
@@ -1012,6 +1133,7 @@ def _descend_into_callee(
             classes_by_smali=classes_by_smali,
             decisions_by_method_sig=decisions_by_method_sig,
             reflective_method_sigs=reflective_method_sigs,
+            current_class_smali=callee_class_desc,
         )
     finally:
         # Restore depth on the way out so a *sibling* decision in the
@@ -1019,3 +1141,234 @@ def _descend_into_callee(
         # The visited entry stays — we never want to descend into
         # the same callee twice in one top-level slice operation.
         budget.remaining_depth += 1
+
+
+# ===========================================================================
+# Phase 11 sub-step 11.5 — same-class field-write-site walking
+# ===========================================================================
+#
+# When the v1 slicer terminates at a :class:`FieldReadOrigin` AND the
+# field is on the same class as the reading method AND the budget
+# permits, walk the class's ``iput-*`` / ``sput-*`` instructions for
+# the matching field, pick the most-recent write per the
+# constructor-priority rule (Q1 (A) of the 11.5 planning checkpoint),
+# re-slice the source register at that write site.
+#
+# The descended PredicateOrigin replaces the original FieldReadOrigin
+# (operator sees the new terminal, depth pill surfaces the "via 1
+# field write" signal in 11.6's UI).
+
+
+def _maybe_descend_field_read(
+    origin: FieldReadOrigin,
+    *,
+    budget: _DescentBudget,
+    max_walk: int,
+    classes_by_smali: dict[str, ClassDecl],
+    decisions_by_method_sig: dict[str, MethodDecisions],
+    reflective_method_sigs: frozenset[str],
+    current_class_smali: str,
+) -> PredicateOrigin:
+    """Phase 11 sub-step 11.5 — same-class field-write-site walking.
+    See :func:`_maybe_descend` for the dispatch contract.
+
+    Gates (any failure → return ``origin`` unchanged, v1 terminal
+    preserved):
+
+    * Budget exhaustion (``budget.remaining_depth <= 0``).
+    * Empty ``current_class_smali`` (test / ad-hoc caller didn't
+      provide it; can't gate same-class).
+    * Cross-class field — Q2 (A) strict same-class match policy.
+    * Cycle — field already in budget.visited (prevents redundant
+      re-walking of the same field across multiple decisions).
+    * No eligible write sites found (declared field never written
+      anywhere in the class).
+    * Inner re-slice itself fails.
+    """
+    if budget.remaining_depth <= 0:
+        return origin
+    if not current_class_smali:
+        return origin
+    field_class_smali = _java_class_to_smali(origin.field.class_name)
+    # Strict same-class match per planning-checkpoint Q2 (A) — no
+    # superclass walking in v1; v3 / Phase 12 may extend with
+    # ClassDecl.super_desc traversal.
+    if field_class_smali != current_class_smali:
+        return origin
+    # Cycle key for fields uses the full smali signature (class +
+    # name + type). Lives in the same ``budget.visited`` set as
+    # method-descent cycle keys — the third tuple slot ("descriptor"
+    # for methods) holds the type descriptor for fields, so the two
+    # never collide (methods have parens-wrapped descriptors;
+    # fields have bare type tokens).
+    field_cycle_key = (
+        field_class_smali,
+        origin.field.field_name,
+        origin.field.type_descriptor,
+    )
+    if field_cycle_key in budget.visited:
+        return origin
+    descended = _walk_field_write_sites(
+        origin,
+        budget=budget,
+        max_walk=max_walk,
+        classes_by_smali=classes_by_smali,
+        decisions_by_method_sig=decisions_by_method_sig,
+        reflective_method_sigs=reflective_method_sigs,
+        current_class_smali=current_class_smali,
+        field_cycle_key=field_cycle_key,
+    )
+    if descended is None:
+        return origin
+    return descended
+
+
+def _walk_field_write_sites(
+    origin: FieldReadOrigin,
+    *,
+    budget: _DescentBudget,
+    max_walk: int,
+    classes_by_smali: dict[str, ClassDecl],
+    decisions_by_method_sig: dict[str, MethodDecisions],
+    reflective_method_sigs: frozenset[str],
+    current_class_smali: str,
+    field_cycle_key: tuple[str, str, str],
+) -> Optional[PredicateOrigin]:
+    """Find the most-recent write to ``origin.field`` in ``current_class_smali``
+    per the constructor-priority rule, then re-slice the written
+    register at that write site.
+
+    **Constructor-priority rule** (Q1 (A) of the 11.5 planning
+    checkpoint):
+
+    1. Look at every ``iput-*`` / ``sput-*`` write to the matching
+       field across every method on the class.
+    2. If at least one write lives in ``<init>`` or ``<clinit>``,
+       prefer the textually-last such write within those constructors
+       (constructor source order).
+    3. Else (no constructor writes), prefer the textually-last write
+       across all non-constructor methods.
+
+    Returns ``None`` when no eligible write site exists OR when the
+    inner re-slice fails. Caller falls back to the original
+    :class:`FieldReadOrigin`.
+
+    Note on Q3 (A) receiver-agnostic matching: ``iput-*`` write sites
+    are matched by ``(field_class_smali, field_name)`` only — the
+    receiver register (``vObj`` in ``iput vSrc, vObj, ...``) is
+    ignored. The textbook ``this.mField`` field-cached idiom is
+    correct under this rule (only-write-site scenario), but more
+    aggressive aliasing cases may pick a write to a different
+    instance's field on the same class.
+
+    Note on Q4 (A) lazy-walk: this walk runs on every field-read
+    descent. For typical app classes (~50 methods × ~30 instructions)
+    the cost is trivial; megaclasses may benefit from eager indexing
+    in 11.7 if telemetry shows demand. The closed-economy
+    :class:`_DescentBudget` caps total descents at the v1 default
+    of 2 per top-level slice, so the worst-case is bounded.
+    """
+    cls = classes_by_smali.get(current_class_smali)
+    if cls is None:
+        # Defensive — should never happen since we already gated
+        # on field_class_smali == current_class_smali above and the
+        # outer slice's class must be in the index by definition.
+        return None
+    field_target_smali = origin.field.smali_signature
+
+    # Collect every (method_sig, instruction_index, source_register,
+    # is_constructor) tuple for matching writes across the class.
+    constructor_sites: list[tuple[str, int, str]] = []
+    other_sites: list[tuple[str, int, str]] = []
+    write_regex = _RE_SPUT if origin.is_static else _RE_IPUT
+    for method_decl in cls.methods:
+        method_sig = method_decl.signature
+        md = decisions_by_method_sig.get(method_sig)
+        if md is None:
+            # Method body unavailable (e.g. abstract / native /
+            # parser hadn't been called with include_branchless).
+            # Skip — can't walk what isn't there.
+            continue
+        for idx, line in enumerate(md.instructions):
+            m = write_regex.match(line)
+            if not m:
+                continue
+            if m.group("field") != field_target_smali:
+                continue
+            site = (method_sig, idx, m.group("src"))
+            if method_decl.is_constructor:
+                constructor_sites.append(site)
+            else:
+                other_sites.append(site)
+
+    # Constructor-priority + source order. Within a constructor we
+    # take the textually-last (latest) write — matches the operator
+    # intuition that the *last* assignment in `<init>` is what the
+    # field's value will be after construction completes. Across
+    # multiple constructors (rare; usually just `<init>` and `<clinit>`
+    # both on the same class), the same "last" rule applies — and
+    # since both are constructor-priority candidates, the choice
+    # between them is by source order in the methods tuple (which
+    # mirrors smali file order).
+    if constructor_sites:
+        chosen = constructor_sites[-1]
+    elif other_sites:
+        chosen = other_sites[-1]
+    else:
+        # No write site found — descent gracefully fails; caller
+        # preserves v1 FieldReadOrigin terminal.
+        return None
+
+    write_method_sig, write_index, write_src_reg = chosen
+    write_md = decisions_by_method_sig[write_method_sig]
+    write_class_smali = _class_from_method_sig(write_method_sig)
+
+    # Mark the field visited + decrement depth BEFORE recursing so
+    # the inner re-slice's own descent attempts see the updated
+    # budget (closed economy).
+    budget.visited.add(field_cycle_key)
+    budget.remaining_depth -= 1
+    try:
+        inner = _slice_register(
+            write_src_reg,
+            write_index,
+            write_md.instructions,
+            max_walk=max_walk,
+        )
+        if inner is None:
+            return None
+        # The inner slice runs over the WRITER method's body, so
+        # any further descent's same-class check is against the
+        # writer's class (which == current_class_smali by our
+        # gating, but spelt out explicitly for clarity).
+        return _maybe_descend(
+            inner,
+            budget=budget,
+            max_walk=max_walk,
+            classes_by_smali=classes_by_smali,
+            decisions_by_method_sig=decisions_by_method_sig,
+            reflective_method_sigs=reflective_method_sigs,
+            current_class_smali=write_class_smali,
+        )
+    finally:
+        budget.remaining_depth += 1
+
+
+def _class_from_method_sig(method_sig: str) -> str:
+    """Extract the class smali descriptor from a full method
+    signature: ``Lcom/Foo;->bar(I)V`` → ``Lcom/Foo;``.
+
+    Returns ``""`` on a malformed signature so callers can defensively
+    skip the same-class gate without crashing.
+    """
+    arrow = method_sig.find("->")
+    if arrow < 0:
+        return ""
+    return method_sig[:arrow]
+
+
+def _java_class_to_smali(java_name: str) -> str:
+    """Local mirror of :func:`androscan.analysis.trace_types._java_class_to_smali`
+    so the slicer doesn't have to import a private helper from
+    trace_types. ``com.example.Foo`` → ``Lcom/example/Foo;``."""
+    return f"L{java_name.replace('.', '/')};"

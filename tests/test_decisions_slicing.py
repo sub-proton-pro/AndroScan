@@ -682,3 +682,136 @@ def test_max_slice_depth_module_constant_is_two() -> None:
     change (this test will need updating when 11.6 lands, by design)."""
     assert slicing.MAX_SLICE_DEPTH == 2
     assert slicing.HARD_CAP_DEPTH == 4
+
+
+# ===========================================================================
+# Phase 11 sub-step 11.5 — same-class field-write-site walking
+# ===========================================================================
+#
+# These tests exercise the ``_maybe_descend_field_read`` /
+# ``_walk_field_write_sites`` paths on the new fixture methods in
+# ``Helpers.smali``'s 11.5 section.
+
+
+def test_field_write_descent_resolves_through_init_iput() -> None:
+    """``gateInstanceFieldRead`` reads ``this.mPremiumFlag``; the
+    field is initialised in ``<init>`` via
+    ``const/4 v0, 0x1; iput-boolean v0, p0, ...``. Field-write-site
+    descent finds the constructor write, slices the source register
+    (v0), and resolves to ``ConstOrigin "0x1"``."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateInstanceFieldRead()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, ConstOrigin), f"expected ConstOrigin, got {type(origin).__name__}"
+    assert origin.value == "0x1"
+
+
+def test_field_write_descent_resolves_through_clinit_sput() -> None:
+    """``gateStaticFieldRead`` reads ``Helpers.sFeatureEnabled``;
+    the field is initialised in ``<clinit>`` via
+    ``const/4 v0, 0x1; sput-boolean v0, ...``. Field-write-site
+    descent finds the static-init write and resolves to
+    ``ConstOrigin "0x1"``."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateStaticFieldRead()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, ConstOrigin)
+    assert origin.value == "0x1"
+
+
+def test_field_write_descent_constructor_priority_wins_over_setter() -> None:
+    """``gateMultiWriteFieldRead`` reads ``mMultiWriteFlag`` which is
+    written in BOTH ``<init>`` (const/4 0x1) AND a setter
+    ``setMultiWriteFlag`` (a different value via param) AND a helper
+    ``initMultiWriteFlag`` (const/4 0x0). Per Q1 (A) the constructor
+    write wins → ``ConstOrigin "0x1"`` (NOT 0x0 from the helper)."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateMultiWriteFieldRead()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, ConstOrigin)
+    assert origin.value == "0x1", (
+        f"constructor-priority rule should pick the <init> write (0x1), "
+        f"not initMultiWriteFlag's 0x0; got {origin.value}"
+    )
+
+
+def test_field_write_descent_blocked_on_cross_class_field() -> None:
+    """``gateCrossClassFieldRead`` reads ``Lcom/trace/Slices;->sFlag:Z``
+    — a field on a sibling class. Q2 (A) strict same-class match
+    blocks the descent; v1 ``FieldReadOrigin`` terminal preserved."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateCrossClassFieldRead()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, FieldReadOrigin)
+    assert origin.field.class_name == "com.trace.Slices"
+    assert origin.field.field_name == "sFlag"
+
+
+def test_field_write_descent_falls_back_when_no_write_site_exists() -> None:
+    """``gateUnwrittenFieldRead`` reads ``mNeverWritten`` which is
+    declared but never written anywhere in the class. Field-write
+    descent finds no candidate site; v1 ``FieldReadOrigin`` terminal
+    preserved (graceful failure, not crash)."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateUnwrittenFieldRead()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, FieldReadOrigin)
+    assert origin.field.field_name == "mNeverWritten"
+
+
+def test_closed_economy_budget_field_then_method_descent_chains() -> None:
+    """``gateFieldWriteFromMethodCall``: the field's constructor
+    write is sourced from ``move-result`` of ``pureGetA()``. So the
+    descent chain is: gate (iget) → 11.5 field-write descent (1 hop;
+    budget=2→1) → write site re-slices to MethodCallOrigin(pureGetA)
+    → 11.4 method descent (1 hop; budget=1→0) → re-slice into
+    pureGetA's body which itself calls pureGetB → would need budget=
+    -1 to descend further, so the inner _maybe_descend stops at
+    MethodCallOrigin(pureGetB). This pins the closed-economy
+    semantics: 1 hop field + 1 hop method exhausts the v1 default
+    MAX_SLICE_DEPTH=2 budget."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateFieldWriteFromMethodCall()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin), (
+        f"expected MethodCallOrigin terminal at depth-2 cap, got {type(origin).__name__}"
+    )
+    # The chain went: gate → field-write descent (depth 2→1) → invoke
+    # pureGetA → method descent (depth 1→0) → re-slice pureGetA's body
+    # which itself invokes pureGetB → would need depth 0→-1 to
+    # descend, so we stop. The terminal is the deepest method we
+    # reached: pureGetB (the method whose return v0 was the last
+    # MethodCallOrigin we sliced before the budget hit zero).
+    assert origin.method.method_name == "pureGetB"
+
+
+def test_closed_economy_budget_exhaustion_mid_chain() -> None:
+    """``gateFieldWriteFromDeepChain``: the field's constructor write
+    sources from ``pureChainHopOne`` which itself chains 3 method
+    hops (One → Two → Three → const). With v1 default budget = 2,
+    the 1 hop field-write descent + 1 hop method descent exhausts
+    it after reaching ``pureChainHopTwo`` — operator sees the
+    "stopped at depth 2" terminal."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateFieldWriteFromDeepChain()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.method.method_name == "pureChainHopTwo", (
+        f"expected pureChainHopTwo at depth-2 cap, got {origin.method.method_name}"
+    )
+
+
+def test_field_write_descent_v1_path_when_descent_kwargs_omitted() -> None:
+    """Public API contract: when ``classes_by_smali`` and
+    ``decisions_by_method_sig`` are both omitted, the slicer behaves
+    exactly like v1 — every ``FieldReadOrigin`` terminal is surfaced
+    unchanged (no field-write descent without the descent index)."""
+    classes, _ = smali_parser.parse_classes(_roots())
+    mds, _ = decisions.parse_decisions(_roots(), classes, include_branchless=True)
+    by_sig = {md.method_signature: md for md in mds}
+    md = by_sig["Lcom/trace/Helpers;->gateInstanceFieldRead()V"]
+    sliced = slicing.slice_predicate_origins(md)  # no descent kwargs
+    dp = _only_decision(sliced)
+    origin = dp.predicate_origin
+    assert isinstance(origin, FieldReadOrigin)
+    assert origin.field.field_name == "mPremiumFlag"
