@@ -47,6 +47,34 @@ export type TraceAnchorRow = {
   created_at: number;
 };
 
+/** Phase 11 sub-step 11.3 — one row in ``GET /anchored-methods``'s
+ *  response. Each row represents a ``(class_smali, method_name)``
+ *  pair that has been touched by at least one cached anchor's
+ *  decision closure; the ``(hops, created_at)`` carry the most-recent
+ *  trace's metadata for the operator's tooltip. */
+export type AnchoredMethod = {
+  /** Smali class descriptor, e.g. ``Lcom/example/Foo;``. Joined
+   *  against the call-graph ``GraphClass.class_name`` (Java form)
+   *  client-side via the same ``hitKey`` helper the Frida hits
+   *  overlay uses — see ``CallGraphView``. */
+  class_smali: string;
+  method_name: string;
+  hops: number;
+  created_at: number;
+};
+
+export type AnchoredMethodsResponse = {
+  app_id: string;
+  sha: string;
+  methods: AnchoredMethod[];
+  total: number;
+  /** Single-line summary of per-row payload-decode failures
+   *  (typically ``null``). When non-null, the overlay still
+   *  renders the methods we *could* read; the field exists so the
+   *  consumer can show an operator-readable banner. */
+  error: string | null;
+};
+
 // ---------------------------------------------------------------------------
 // Typed mirrors of the Python data model (androscan/analysis/trace_types.py).
 // Field names match ``dataclasses.asdict`` output verbatim — the wire format
@@ -189,6 +217,19 @@ export function listTraceAnchors(
   appId: string,
 ): Promise<ApiResult<{ app_id: string; anchors: TraceAnchorRow[] }>> {
   return _request(`/api/trace/${encodeURIComponent(appId)}/anchors`);
+}
+
+/** Phase 11 sub-step 11.3 — fetch the anchored-methods set the
+ *  call-graph overlay layer in Manual Hooks mode renders ⚓ glyphs
+ *  for. 404 when no ``trace.sqlite`` exists yet (operator hasn't
+ *  built any traces); the consumer treats both 404 and 200+empty
+ *  as "no overlay, no glyphs". */
+export function listAnchoredMethods(
+  appId: string,
+): Promise<ApiResult<AnchoredMethodsResponse>> {
+  return _request<AnchoredMethodsResponse>(
+    `/api/trace/${encodeURIComponent(appId)}/anchored-methods`,
+  );
 }
 
 export function fetchTraceAnchor(

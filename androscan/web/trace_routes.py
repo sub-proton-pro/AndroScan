@@ -7,22 +7,39 @@ look-up, and skill invocation for the build path.
 
 Endpoints (prefix ``/api/trace``):
 
-* ``GET    /{app_id}/status``   — cache state + decompile / call-graph
-                                  readiness fan-out (mirrors the
-                                  graph_routes status surface so the
-                                  Settings tab can render both with the
-                                  same component)
-* ``GET    /{app_id}/anchors``  — list cached anchors
-                                  (``[{entry_smali_id, hops, created_at}, ...]``)
-* ``GET    /{app_id}/anchor``   — pure cache read for one anchor
-                                  (``?entry=<smali_id>&hops=<n>``);
-                                  404 when not cached
-* ``POST   /{app_id}/anchor``   — invoke ``trace_behavior`` skill,
-                                  build/refresh the anchor, persist,
-                                  return the populated payload;
-                                  ``?force=true`` bypasses the cache
-                                  and re-traces from scratch
-* ``DELETE /{app_id}/anchor``   — drop one cached row
+* ``GET    /{app_id}/status``            — cache state + decompile /
+                                           call-graph readiness fan-out
+                                           (mirrors the graph_routes
+                                           status surface so the
+                                           Settings tab can render both
+                                           with the same component)
+* ``GET    /{app_id}/anchors``           — list cached anchors
+                                           (``[{entry_smali_id, hops,
+                                           created_at}, ...]``)
+* ``GET    /{app_id}/anchor``            — pure cache read for one
+                                           anchor
+                                           (``?entry=<smali_id>&hops=<n>``);
+                                           404 when not cached
+* ``POST   /{app_id}/anchor``            — invoke ``trace_behavior``
+                                           skill, build/refresh the
+                                           anchor, persist, return the
+                                           populated payload;
+                                           ``?force=true`` bypasses the
+                                           cache and re-traces from
+                                           scratch
+* ``DELETE /{app_id}/anchor``            — drop one cached row
+* ``GET    /{app_id}/anchored-methods``  — Phase 11 sub-step 11.3
+                                           overlay feed: dedupe every
+                                           ``(class_smali, method_name)``
+                                           pair touched by any cached
+                                           anchor's ``decisions`` list
+                                           with the most-recent
+                                           ``(hops, created_at)`` per
+                                           method; consumed by
+                                           ``CallGraphView``'s
+                                           ``BehaviorAnchor``-aware
+                                           overlay layer in Manual
+                                           Hooks mode
 
 Wire shape contract (locked in 10.6, depended on by 10.7's
 ``BehaviorAnchorCard`` / ``DecisionTimeline`` / ``BypassPlanCard``):
@@ -56,6 +73,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -305,5 +323,179 @@ def build_trace_router(
                 detail=f"No cached anchor for entry={e!r} hops={hops}.",
             )
         return Response(status_code=204)
+
+    # ----------------------------------------------------------------------
+    # GET /{app_id}/anchored-methods — Phase 11 sub-step 11.3 overlay feed
+    #
+    # Walks every cached anchor, decodes the ``BehaviorAnchor`` payload,
+    # enumerates ``decisions[*].method``, dedupes on
+    # ``(class_smali, method_name)`` keeping the most-recent
+    # ``(hops, created_at)`` per method (most-recent = larger
+    # ``created_at``; ties broken by larger ``hops`` since a deeper
+    # trace is more thorough). Cheap because the cached-anchor count
+    # is bounded (typically ≤ 50 per app) and the per-row JSON unpack
+    # is the same encoder/decoder used by every other cache read.
+    #
+    # Why a dedicated endpoint (vs. inferring from ``/anchors`` + N
+    # follow-up ``/anchor`` calls): the consumer is the call-graph
+    # overlay in Manual Hooks mode, which needs the full set in one
+    # round-trip to render the ⚓ glyphs in a single Cytoscape
+    # restyle pass. N+1 fetches against the per-anchor endpoint
+    # would either flicker the overlay (each response triggers a
+    # restyle) or require a coordinator on the frontend that
+    # re-implements server-side dedupe.
+    #
+    # Schema invariance: the per-row payload unpack uses
+    # ``trace_cache.anchor_from_json``, which already handles both
+    # v1 and v2 ``BehaviorAnchor`` payload shapes via additive
+    # field defaults — so this endpoint stays correct under 11.6's
+    # ``SCHEMA_VERSION`` bump (``"1"`` → ``"2"``) without code
+    # changes here.
+
+    @router.get("/{app_id}/anchored-methods")
+    def trace_list_anchored_methods(app_id: str) -> dict[str, Any]:
+        """List every ``(class_smali, method_name)`` pair touched by
+        any cached anchor's decision closure, with the most-recent
+        ``(hops, created_at)`` per method.
+
+        Response shape::
+
+            {
+                "app_id": "<id>",
+                "sha":    "<decompile_sha>",
+                "methods": [
+                    {
+                        "class_smali": "Lcom/example/Foo;",
+                        "method_name": "bar",
+                        "hops":        3,
+                        "created_at":  1714500000.0,
+                    },
+                    ...
+                ],
+                "total":  N,
+                "error":  null | "<one-line decode-failure summary>",
+            }
+
+        Status codes:
+
+        * **404** when no ``trace.sqlite`` exists yet (per the 11.3
+          contract — operators see "no traces have ever been built"
+          as a different empty state than "all built traces have
+          been deleted").
+        * **200 + empty methods** when ``trace.sqlite`` exists but
+          the ``anchors`` table is empty.
+        * **200 + ``error`` field set** when at least one cached
+          anchor's payload couldn't be decoded — partial results
+          still returned (decoded rows are kept) so the operator's
+          overlay still renders the methods we *can* read.
+        """
+        # ``_cache_dir_for`` raises 409 when decompile is not ready
+        # (same precondition every other route in this module uses).
+        # Unknown ``app_id`` → 404 via ``app_dir_resolver``.
+        app_dir: Path = app_dir_resolver(app_id)
+        ds = decompile_status(app_dir)
+        if ds.get("status") != "ready" or not ds.get("sha"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Decompile cache is not ready. "
+                    "POST /api/decompile/{app_id} first."
+                ),
+            )
+        sha = str(ds["sha"])
+        cache_dir = decompile_cache_root(app_dir, sha)
+
+        # The "unbuilt trace cache" 404 case — distinguishes "operator
+        # has never built a trace for this app" (no SQLite file) from
+        # "operator has built and then deleted everything" (SQLite
+        # file exists, anchors table empty → 200 + empty list).
+        # Frontend's overlay code can treat both as "no glyphs" but
+        # the operator-facing empty state in Trace mode uses this
+        # distinction to nudge "click Build to start".
+        db_path = trace_cache.trace_cache_db_path(cache_dir)
+        if not db_path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No trace cache built yet for app {app_id!r}. "
+                    "POST /api/trace/{app_id}/anchor first."
+                ),
+            )
+
+        rows = trace_cache.list_anchors(cache_dir)
+        # Per-method aggregator. Key = (class_smali, method_name);
+        # value = the row dict we'll emit. We update on every visit
+        # iff the new row's (created_at, hops) sorts *strictly later*
+        # — keeps the most-recent + most-thorough trace's metadata
+        # for the operator's tooltip.
+        agg: dict[tuple[str, str], dict[str, Any]] = {}
+        decode_errors: list[str] = []
+
+        for row in rows:
+            entry = row.get("entry_smali_id")
+            hops = row.get("hops")
+            created_at = row.get("created_at")
+            if not isinstance(entry, str) or not isinstance(hops, int):
+                continue  # Defensive — list_anchors rows are well-typed.
+            try:
+                anchor = trace_cache.read_anchor(cache_dir, entry, int(hops))
+            except (sqlite3.DatabaseError, ValueError) as exc:  # pragma: no cover - read_anchor swallows
+                decode_errors.append(f"{entry}#{hops}: {exc}")
+                continue
+            if anchor is None:
+                # Either gone-since-list-anchors or payload decode
+                # failed inside ``read_anchor`` (which fail-soft
+                # logs + returns None). Surface the latter as a
+                # decode error so the operator sees "X anchors
+                # couldn't be decoded" rather than silent partial
+                # results.
+                decode_errors.append(f"{entry}#{hops}: payload unreadable")
+                continue
+            for decision in anchor.decisions:
+                method = decision.method
+                # ``MethodRef.class_name`` is the Java form
+                # (``com.example.Foo``); the call-graph store keys on
+                # the Smali descriptor (``Lcom/example/Foo;``), and
+                # the frontend's ``hitKey`` joins on that — so we
+                # convert here so the overlay's join is direct.
+                class_smali = f"L{method.class_name.replace('.', '/')};"
+                key = (class_smali, method.method_name)
+                prior = agg.get(key)
+                # Most-recent wins: larger created_at first; if equal,
+                # larger hops (more thorough trace) wins. Initial
+                # insert always wins regardless of values.
+                if prior is None or (
+                    created_at,
+                    hops,
+                ) > (
+                    prior["created_at"],
+                    prior["hops"],
+                ):
+                    agg[key] = {
+                        "class_smali": class_smali,
+                        "method_name": method.method_name,
+                        "hops": int(hops),
+                        "created_at": float(created_at) if created_at is not None else 0.0,
+                    }
+
+        methods = sorted(
+            agg.values(),
+            key=lambda m: (m["class_smali"], m["method_name"]),
+        )
+        # Single-line error summary keeps the response shape stable
+        # — the frontend just renders the field as-is in a small
+        # operator-readable banner if non-null.
+        error = (
+            f"{len(decode_errors)} anchor(s) failed to decode: "
+            + "; ".join(decode_errors[:3])
+            + ("..." if len(decode_errors) > 3 else "")
+        ) if decode_errors else None
+        return {
+            "app_id": app_id,
+            "sha": sha,
+            "methods": methods,
+            "total": len(methods),
+            "error": error,
+        }
 
     return router

@@ -10,6 +10,7 @@ import { ChatDock } from "../components/ChatDock";
 import {
   CallGraphView,
   hitKey,
+  type AnchoredMethodMeta,
   type SelectedNode,
 } from "../components/CallGraphView";
 import { CodeView } from "../components/CodeView";
@@ -31,7 +32,7 @@ import {
 import type { ChatAttachment } from "../types";
 import { useWorkbench, type LabMode } from "../context/WorkbenchContext";
 import { LabTraceMode } from "./LabTraceMode";
-import type { BehaviorAnchor } from "../api/trace";
+import { listAnchoredMethods, type AnchoredMethod, type BehaviorAnchor } from "../api/trace";
 
 /**
  * Lab tab (formerly "Hook Lab"; renamed in Phase 10 sub-step 10.6).
@@ -393,6 +394,64 @@ function ManualHooksMode({
     return out;
   }, [activeSession, chatHooks]);
 
+  // -------------------------------------------------------------------------
+  // BehaviorAnchor → Cytoscape overlay map (Phase 11 sub-step 11.3).
+  //
+  // Fetched once per (appId, mount) — ``ManualHooksMode`` is unmounted
+  // when ``labMode !== "manual-hooks"`` (LabTab uses conditional
+  // rendering at line 165), so any trace build / delete in Trace mode
+  // is naturally visible the next time the operator switches back: the
+  // mode-switch re-mounts this component and fires the effect fresh.
+  //
+  // The fetch returns 404 on "no traces ever built" and 200+empty on
+  // "built then cleared" — the consumer treats both as "no overlay,
+  // no glyphs", so we collapse them to ``null`` (treat-as-overlay-off)
+  // and a single non-null ``Map`` (overlay active) respectively.
+  // The non-200/non-404 case (transient backend hiccup) also collapses
+  // to ``null`` rather than surfacing a banner; the call-graph view
+  // is the operator's primary surface here, not the trace cache.
+  // -------------------------------------------------------------------------
+  const [anchoredMethodRows, setAnchoredMethodRows] = useState<readonly AnchoredMethod[] | null>(null);
+  useEffect(() => {
+    setAnchoredMethodRows(null);
+    if (!appId) return;
+    let cancelled = false;
+    void (async () => {
+      const r = await listAnchoredMethods(appId);
+      if (cancelled) return;
+      if (r.ok) {
+        setAnchoredMethodRows(r.data.methods);
+      } else if (r.status === 404) {
+        // 404 = unbuilt trace cache; treat as overlay off.
+        setAnchoredMethodRows(null);
+      } else {
+        // Transient error; leave overlay off rather than flicker.
+        setAnchoredMethodRows(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [appId]);
+
+  const anchoredMethods = useMemo<ReadonlyMap<string, AnchoredMethodMeta> | null>(() => {
+    if (anchoredMethodRows == null) return null;
+    const out = new Map<string, AnchoredMethodMeta>();
+    for (const m of anchoredMethodRows) {
+      // ``class_smali`` is ``Lcom/example/Foo;``; the call-graph
+      // ``GraphClass.class_name`` is ``com.example.Foo``. Convert
+      // here so the consumer-side ``hitKey`` join matches.
+      const javaClass = m.class_smali.startsWith("L") && m.class_smali.endsWith(";")
+        ? m.class_smali.slice(1, -1).replace(/\//g, ".")
+        : m.class_smali;
+      out.set(hitKey(javaClass, m.method_name), {
+        hops: m.hops,
+        created_at: m.created_at,
+      });
+    }
+    return out;
+  }, [anchoredMethodRows]);
+
   return (
     <PanelGroup direction="horizontal" autoSaveId="lab-manual-h" className="tab-panels">
       <Panel defaultSize={32} minSize={20} className="panel">
@@ -401,6 +460,7 @@ function ManualHooksMode({
           onSelectNode={setSelected}
           appPackage={defaultPackage}
           hitsByMethod={hitsByMethod}
+          anchoredMethods={anchoredMethods}
         />
       </Panel>
       <PanelResizeHandle className="resize-h" />

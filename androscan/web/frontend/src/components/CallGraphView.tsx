@@ -109,6 +109,44 @@ type Props = {
    *  reference across renders without us mutating it; we recompute
    *  Cytoscape elements on identity change like every other input. */
   hitsByMethod?: ReadonlyMap<string, number> | null;
+  /** Phase 11 sub-step 11.3 — ``BehaviorAnchor``-aware overlay layer.
+   *
+   *  Map keyed on ``hitKey(className, methodName)`` (the same canonical
+   *  join the Frida hits overlay above uses, so producer + consumer
+   *  share one key shape). Values carry the most-recent ``hops`` +
+   *  ``created_at`` per method so the tooltip can render
+   *  ``trace cached: <hops> hops · <created_at relative time>``.
+   *
+   *  When non-null and a method node's ``(class.class_name,
+   *  method_name)`` is in the map, the node gets the
+   *  ``has-trace-anchor`` Cytoscape class (small purple corner badge)
+   *  + the trace-cached tooltip line. The Cytoscape stylesheet rule
+   *  is layered AFTER the ``.hit`` / ``.has-hits`` rules so the
+   *  bold-cyan Frida overlay still wins where both apply (Frida hits
+   *  beat trace anchors visually because they're live data —
+   *  DEC-023 / 4.8 sets the same precedence rule for reflection vs.
+   *  focus-root vs. hit). The trace-anchor stylesheet rule is
+   *  carefully scoped to NON-conflicting properties (only adds a
+   *  ``background-image`` corner badge) so even with the cascade
+   *  ordering there's no property collision.
+   *
+   *  NOTE on spec-vs-reality: the 11.3 row in TASKS.md types this
+   *  prop as ``ReadonlySet<string>`` (membership-only), but the
+   *  tooltip the same row mandates needs per-method ``hops`` +
+   *  ``created_at``. We use a Map so the tooltip text actually works;
+   *  the spec's "Set" framing is shorthand for "key-only for
+   *  membership tests". */
+  anchoredMethods?: ReadonlyMap<string, AnchoredMethodMeta> | null;
+};
+
+/** Per-method metadata carried by ``Props.anchoredMethods`` values.
+ *  Mirrors the backend's per-row response shape (sans the redundant
+ *  class+method fields the Map key already encodes). */
+export type AnchoredMethodMeta = {
+  hops: number;
+  /** Unix epoch seconds (the same scale ``trace_cache.write_anchor``
+   *  stamps via ``time.time()``). */
+  created_at: number;
 };
 
 // Stable, dollar-aware join used by both the overlay-builder side
@@ -118,6 +156,33 @@ type Props = {
 // explicit avoids silent miss-mapping when the key crosses tiers.
 export function hitKey(className: string, methodName: string): string {
   return `${className}::${methodName}`;
+}
+
+// Phase 11 sub-step 11.3 — compact relative-age formatter for the
+// trace-anchor tooltip. Inputs are unix-epoch-seconds (same scale
+// the backend stamps via ``time.time()``). Output examples:
+// ``"just now"`` / ``"42s ago"`` / ``"5m ago"`` / ``"3h ago"`` /
+// ``"2d ago"`` / ``"3w ago"``.
+//
+// NOTE: the 11.3 spec text in TASKS.md refers to "the existing
+// ``formatRelativeTime`` helper", but no such helper exists in the
+// codebase today — every other consumer renders cached timestamps
+// via ``toLocaleString()``. We add this small local helper so the
+// overlay tooltip stays compact (a tooltip badge has no room for a
+// full ISO datetime); inline-commented so the divergence from the
+// spec is auditable.
+export function formatRelativeAge(epochSeconds: number, now: number = Date.now() / 1000): string {
+  const ageS = Math.max(0, now - epochSeconds);
+  if (ageS < 5) return "just now";
+  if (ageS < 60) return `${Math.round(ageS)}s ago`;
+  const ageM = ageS / 60;
+  if (ageM < 60) return `${Math.round(ageM)}m ago`;
+  const ageH = ageM / 60;
+  if (ageH < 24) return `${Math.round(ageH)}h ago`;
+  const ageD = ageH / 24;
+  if (ageD < 14) return `${Math.round(ageD)}d ago`;
+  const ageW = ageD / 7;
+  return `${Math.round(ageW)}w ago`;
 }
 
 export type SelectedNode = {
@@ -147,6 +212,7 @@ export function CallGraphView({
   onSelectNode,
   appPackage = null,
   hitsByMethod,
+  anchoredMethods,
 }: Props) {
   const { setPendingCodeNav, setPendingTraceEntry, setLabMode, setTab } =
     useWorkbench();
@@ -441,6 +507,7 @@ export function CallGraphView({
       showExternal,
       focusNodeId,
       hitsByMethod: hitsByMethod ?? null,
+      anchoredMethods: anchoredMethods ?? null,
     });
     destroyAllTippies(tippiesRef.current);
     cy.batch(() => {
@@ -454,7 +521,7 @@ export function CallGraphView({
         : ({ name: "dagre", rankDir: "LR", animate: false, fit: true, padding: 24 } as LayoutOptions);
     cy.layout(layout).run();
     attachTippies(cy, built.tooltipFor, tippiesRef.current);
-  }, [graph, neighbors, viewMode, filter, showExternal, focusNodeId, hitsByMethod]);
+  }, [graph, neighbors, viewMode, filter, showExternal, focusNodeId, hitsByMethod, anchoredMethods]);
 
   // -------- Cytoscape event wiring -----------------------------------------
   useEffect(() => {
@@ -1405,6 +1472,11 @@ function buildElementsForView(args: {
    *  node renders as ``unhit`` so the operator sees that the session
    *  is wired but nothing has fired. */
   hitsByMethod: ReadonlyMap<string, number> | null;
+  /** Phase 11 sub-step 11.3 — anchored-methods overlay. ``null`` =
+   *  no overlay, render no badges. Non-null Map (possibly empty) =
+   *  overlay active, every key matching a node gets the corner
+   *  badge + tooltip line. */
+  anchoredMethods: ReadonlyMap<string, AnchoredMethodMeta> | null;
 }): BuildResult {
   if (args.viewMode === "package") {
     return buildPackageOverviewElements(
@@ -1412,6 +1484,7 @@ function buildElementsForView(args: {
       args.filter,
       args.showExternal,
       args.hitsByMethod,
+      args.anchoredMethods,
     );
   }
   return buildFocusElements(
@@ -1419,6 +1492,7 @@ function buildElementsForView(args: {
     args.filter,
     args.focusNodeId,
     args.hitsByMethod,
+    args.anchoredMethods,
   );
 }
 
@@ -1427,6 +1501,16 @@ function buildPackageOverviewElements(
   filter: string,
   showExternal: boolean,
   hitsByMethod: ReadonlyMap<string, number> | null,
+  // Phase 11 sub-step 11.3 — accepted for signature symmetry with
+  // ``buildFocusElements`` but unused in v1: the package-overview
+  // aggregates per-package and doesn't render per-method nodes,
+  // so the per-method ⚓ overlay has no meaningful surface here.
+  // The operator workflow for trace anchors is "drill into focus
+  // mode and spot the glyphs on individual method nodes". A
+  // per-package roll-up ("this package contains N anchored
+  // methods") is a future polish if telemetry shows demand.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _anchoredMethods: ReadonlyMap<string, AnchoredMethodMeta> | null,
 ): BuildResult {
   const tooltipFor = new Map<string, string>();
   if (!graph) return { elements: [], tooltipFor };
@@ -1574,11 +1658,13 @@ function buildFocusElements(
   filter: string,
   focusNodeId: number | null,
   hitsByMethod: ReadonlyMap<string, number> | null,
+  anchoredMethods: ReadonlyMap<string, AnchoredMethodMeta> | null,
 ): BuildResult {
   const tooltipFor = new Map<string, string>();
   if (!neighbors) return { elements: [], tooltipFor };
   const classMap = buildClassMap(neighbors.classes);
   const overlayActive = hitsByMethod != null;
+  const anchorOverlayActive = anchoredMethods != null;
 
   const allNodes = new Map<number, GraphNode>();
   allNodes.set(neighbors.node.id, neighbors.node);
@@ -1600,6 +1686,14 @@ function buildFocusElements(
     return hitsByMethod.get(hitKey(klass.class_name, n.method_name)) ?? 0;
   };
 
+  const lookupAnchor = (
+    n: GraphNode,
+    klass: GraphClass | undefined,
+  ): AnchoredMethodMeta | null => {
+    if (!anchorOverlayActive || !klass) return null;
+    return anchoredMethods.get(hitKey(klass.class_name, n.method_name)) ?? null;
+  };
+
   const nodeDefs: NodeDefinition[] = [];
   const visibleIds = new Set<number>();
   for (const n of allNodes.values()) {
@@ -1609,12 +1703,14 @@ function buildFocusElements(
     visibleIds.add(n.id);
     const isRoot = n.id === focusNodeId;
     const hits = lookupHits(n, cls);
+    const anchorMeta = lookupAnchor(n, cls);
     const cssClasses = [
       "methodnode",
       isRoot ? "focusroot" : "",
       n.is_external ? "external" : "",
       n.may_have_unresolved_reflection ? "reflective" : "",
       overlayActive ? (hits > 0 ? "hit" : "unhit") : "",
+      anchorMeta ? "has-trace-anchor" : "",
     ]
       .filter(Boolean)
       .join(" ");
@@ -1630,7 +1726,7 @@ function buildFocusElements(
       },
       classes: cssClasses,
     });
-    tooltipFor.set(`n:${n.id}`, renderNodeTooltipHtml(n, cls, hits));
+    tooltipFor.set(`n:${n.id}`, renderNodeTooltipHtml(n, cls, hits, anchorMeta));
   }
 
   const edgeDefs: EdgeDefinition[] = [];
@@ -1687,6 +1783,7 @@ function renderNodeTooltipHtml(
   n: GraphNode,
   klass: GraphClass | undefined,
   hits: number,
+  anchor: AnchoredMethodMeta | null = null,
 ): string {
   const sig = formatMethodSignature(n, klass);
   const flags: string[] = [];
@@ -1705,9 +1802,18 @@ function renderNodeTooltipHtml(
     hits > 0
       ? `<br/><b style='color:${HIT_CYAN}'>frida: ${hits} hit${hits === 1 ? "" : "s"}</b>`
       : "";
+  // Phase 11 sub-step 11.3 — trace-anchor tooltip line. The ⚓ glyph
+  // is colored via the ``.cy-trace-anchored-glyph`` CSS class so the
+  // operator gets the same purple-on-purple visual identity the
+  // node's corner badge uses.
+  const anchorLine = anchor
+    ? `<br/><span class='cy-trace-anchored-glyph'>⚓</span> trace cached: ${anchor.hops} hop${
+        anchor.hops === 1 ? "" : "s"
+      } · ${escapeHtml(formatRelativeAge(anchor.created_at))}`
+    : "";
   return `<b>${escapeHtml(sig)}</b><br/>${flagLine}returns ${escapeHtml(
     n.return_type,
-  )}${reflLine}${hitLine}`;
+  )}${reflLine}${anchorLine}${hitLine}`;
 }
 
 function escapeHtml(s: string): string {
@@ -2330,6 +2436,37 @@ function ContextMenuBox(props: {
  *  shared with the tooltip HTML so the overlay reads as one visual unit. */
 const HIT_CYAN = "#56d4dd";
 
+// Phase 11 sub-step 11.3 — colour token for the BehaviorAnchor overlay.
+// Shared between the Cytoscape corner-badge SVG (encoded inline below)
+// and the tooltip's ``.cy-trace-anchored-glyph`` CSS rule (in App.css)
+// so the overlay reads as one visual unit. Mirrors the HIT_CYAN
+// pattern above. Chosen to be visually distinct from HIT_CYAN
+// (cyan-blue), the focus-root accent (#58a6ff blue), and the
+// reflective outline (#f0883e orange) so all four overlay families
+// are distinguishable when they overlap on the same node.
+const TRACE_PURPLE = "#9d6dff";
+
+// Tiny SVG of a filled purple circle, encoded as a data URL for use
+// as a Cytoscape ``background-image``. We use a circle (not the
+// literal ⚓ character) at the node level because rendering a
+// unicode emoji via SVG ``<text>`` is OS-dependent — the emoji
+// font often substitutes its own colour palette and ignores the
+// SVG's ``fill`` attribute. The literal ⚓ character lives in the
+// HTML tooltip (where ``.cy-trace-anchored-glyph`` gives us full
+// CSS control over the colour), and the Cytoscape badge gets the
+// reliably-coloured circle. The combined visual reads as
+// "purple corner badge" + "purple ⚓ in the tooltip" — same
+// semantic, two surfaces.
+const TRACE_ANCHOR_BADGE_DATA_URL =
+  // 8x8 viewBox, single circle filled with TRACE_PURPLE.
+  // ``encodeURIComponent`` turns the leading ``#`` into ``%23`` so
+  // the colour literal survives the data-URL parse, and keeps the
+  // colour referenced from the single ``TRACE_PURPLE`` constant
+  // (so a future palette change touches one line).
+  "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'>" +
+  `<circle cx='4' cy='4' r='3.5' fill='${encodeURIComponent(TRACE_PURPLE)}'/>` +
+  "</svg>";
+
 const GRAPH_STYLE: cytoscape.StylesheetStyle[] = [
   {
     selector: "node.pkgnode",
@@ -2477,6 +2614,29 @@ const GRAPH_STYLE: cytoscape.StylesheetStyle[] = [
     selector: "node.pkgnode.no-hits",
     style: {
       opacity: 0.5,
+    } as cytoscape.Css.Node,
+  },
+  // -------- BehaviorAnchor overlay (Phase 11 sub-step 11.3) ---------------
+  // Layered AFTER the Frida ``.hit`` / ``.has-hits`` rules per spec so
+  // the bold-cyan Frida overlay still wins where both apply (Frida
+  // hits beat trace anchors visually because they're live data).
+  // CAREFULLY scoped to ``background-image`` properties only — no
+  // ``border-color`` / ``background-color`` / ``shadow-*`` so even
+  // with Cytoscape's later-rule-wins cascade ordering there's no
+  // collision with ``.hit``. The corner badge ends up rendered as
+  // an extra layer over whatever node colour ``.hit`` / ``.unhit``
+  // / plain styling assigned.
+  {
+    selector: "node.methodnode.has-trace-anchor",
+    style: {
+      "background-image": TRACE_ANCHOR_BADGE_DATA_URL,
+      "background-image-opacity": 1,
+      "background-fit": "none",
+      "background-clip": "none",
+      "background-position-x": "100%",
+      "background-position-y": "0%",
+      "background-width": 8,
+      "background-height": 8,
     } as cytoscape.Css.Node,
   },
 ];

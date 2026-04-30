@@ -327,3 +327,160 @@ def test_unknown_app_id_returns_404_on_status(tmp_path: Path) -> None:
     client = _client(tmp_path)
     r = client.get("/api/trace/ghost-app/status")
     assert r.status_code == 404, r.text
+
+
+# ---------------------------------------------------------------------------
+# 8) GET /anchored-methods — Phase 11 sub-step 11.3 overlay feed
+
+
+def test_anchored_methods_404_on_unbuilt_cache(tmp_path: Path) -> None:
+    """Decompile is ready + call graph is built, but no traces have
+    ever been built (``trace.sqlite`` doesn't exist) → 404 per the
+    11.3 contract. Distinguishes "operator has never built a trace"
+    from "operator has built and then deleted everything"; the
+    overlay code can map both to "no glyphs" but the operator-facing
+    empty state in Trace mode uses this distinction."""
+    client = _client(tmp_path)
+    r = client.get(f"/api/trace/{APP_ID}/anchored-methods")
+    assert r.status_code == 404, r.text
+    assert "trace cache" in r.json()["detail"].lower()
+
+
+def test_anchored_methods_unknown_app_returns_404(tmp_path: Path) -> None:
+    """Unknown ``app_id`` → 404 via the shared ``app_dir_resolver``.
+    Same contract as every other route in this module."""
+    client = _client(tmp_path)
+    r = client.get("/api/trace/ghost-app/anchored-methods")
+    assert r.status_code == 404, r.text
+
+
+def test_anchored_methods_decompile_not_ready_returns_409(tmp_path: Path) -> None:
+    """App dir exists but decompile cache is missing → 409 with the
+    standard ``decompile not ready`` message. Mirrors every other
+    route in this module that gates on ``_cache_dir_for``."""
+    client = _client_no_decompile(tmp_path)
+    r = client.get(f"/api/trace/{APP_ID}/anchored-methods")
+    assert r.status_code == 409, r.text
+
+
+def test_anchored_methods_happy_path_after_build(tmp_path: Path) -> None:
+    """After one POST builds an anchor, GET returns its method set
+    (at least the entry method ``Plans.gateBoolPredicate`` and a
+    ``class_smali`` in the expected smali-descriptor form)."""
+    client = _client(tmp_path)
+    posted = client.post(
+        f"/api/trace/{APP_ID}/anchor",
+        params={"entry": ENTRY_BOOL, "hops": 1},
+    )
+    assert posted.status_code == 200, posted.text
+    r = client.get(f"/api/trace/{APP_ID}/anchored-methods")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["app_id"] == APP_ID
+    assert body["sha"] == SHA
+    assert body["error"] is None
+    assert body["total"] >= 1
+    assert body["total"] == len(body["methods"])
+    # The entry method must appear in the deduped set.
+    keys = {(m["class_smali"], m["method_name"]) for m in body["methods"]}
+    assert ("Lcom/trace/Plans;", "gateBoolPredicate") in keys
+    # Every row carries the (hops, created_at) tuple the overlay tooltip
+    # renders. ``hops`` matches the build's hops; ``created_at`` is a
+    # finite positive number.
+    for m in body["methods"]:
+        assert m["hops"] == 1
+        assert isinstance(m["created_at"], (int, float)) and m["created_at"] > 0
+        assert m["class_smali"].startswith("L") and m["class_smali"].endswith(";")
+
+
+def test_anchored_methods_empty_after_clear(tmp_path: Path) -> None:
+    """After build + delete, the trace.sqlite file still exists (init_db
+    is sticky) so the route returns 200 + empty methods list — *not*
+    404. This is the "built-but-empty cache" state from the 11.3
+    contract; distinguishes from the "never built" 404."""
+    client = _client(tmp_path)
+    client.post(f"/api/trace/{APP_ID}/anchor", params={"entry": ENTRY_BOOL, "hops": 1})
+    deleted = client.delete(
+        f"/api/trace/{APP_ID}/anchor",
+        params={"entry": ENTRY_BOOL, "hops": 1},
+    )
+    assert deleted.status_code == 204, deleted.text
+    r = client.get(f"/api/trace/{APP_ID}/anchored-methods")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["methods"] == []
+    assert body["total"] == 0
+    assert body["error"] is None
+
+
+def test_anchored_methods_dedupes_across_anchors(tmp_path: Path) -> None:
+    """Two separate cached anchors that share methods (same class +
+    method seen via two different decision paths) → each
+    ``(class_smali, method_name)`` appears exactly once in the
+    response. The deduped row carries the most-recent ``hops`` /
+    ``created_at`` (most-recent wins on ``created_at``; ties broken
+    by larger ``hops``)."""
+    client = _client(tmp_path)
+    # Build two anchors at different hops over the same fixture so they
+    # share at least one method (both anchors include the Plans entry
+    # methods in their decision closure).
+    r1 = client.post(f"/api/trace/{APP_ID}/anchor", params={"entry": ENTRY_BOOL, "hops": 1})
+    assert r1.status_code == 200, r1.text
+    r2 = client.post(f"/api/trace/{APP_ID}/anchor", params={"entry": ENTRY_INT, "hops": 1})
+    assert r2.status_code == 200, r2.text
+    r = client.get(f"/api/trace/{APP_ID}/anchored-methods")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    keys = [(m["class_smali"], m["method_name"]) for m in body["methods"]]
+    # Dedupe contract — every key appears at most once.
+    assert len(keys) == len(set(keys)), f"duplicates in {keys}"
+    # Both entry methods made it into the set.
+    assert ("Lcom/trace/Plans;", "gateBoolPredicate") in keys
+    assert ("Lcom/trace/Plans;", "gateIntPredicate") in keys
+
+
+def test_anchored_methods_surfaces_error_on_payload_decode_failure(
+    tmp_path: Path,
+) -> None:
+    """When a row's ``payload_json`` is corrupted, the route doesn't
+    crash — it surfaces an ``error`` field summarising the failure
+    while still returning whatever methods *could* be decoded from
+    the surviving rows. Operator UX: the overlay still works for
+    intact rows, and the error banner nudges the operator to
+    reset/rebuild the corrupted entry."""
+    import sqlite3 as _sqlite3
+
+    client = _client(tmp_path)
+    # Build one good anchor first so we have a row to corrupt.
+    client.post(f"/api/trace/{APP_ID}/anchor", params={"entry": ENTRY_BOOL, "hops": 1})
+    cache_dir = dc.cache_root_for(tmp_path / "apps" / APP_ID, SHA)
+    db_path = trace_cache.trace_cache_db_path(cache_dir)
+    # Replace the row's payload_json with non-JSON garbage. The
+    # ``read_anchor`` helper fail-soft returns ``None`` on JSON-parse
+    # failure (logged via ``trace_cache.logger.warning``) — the route
+    # turns that into an ``error`` field summary.
+    with _sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE anchors SET payload_json = ? WHERE entry_smali_id = ? AND hops = ?",
+            ("not valid json {", ENTRY_BOOL, 1),
+        )
+        conn.commit()
+    r = client.get(f"/api/trace/{APP_ID}/anchored-methods")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["error"] is not None
+    assert "payload" in body["error"].lower() or "decode" in body["error"].lower()
+    # The corrupted row contributed zero methods; surviving rows (if
+    # any) would still appear. With a single-row corruption, the set
+    # is empty.
+    assert body["methods"] == []
+    assert body["total"] == 0
+
+
+def test_anchored_methods_route_registered(tmp_path: Path) -> None:
+    """Smoke check that the new endpoint is registered alongside the
+    existing five — guards against a refactor accidentally dropping
+    it from ``build_trace_router``."""
+    client = _client(tmp_path)
+    paths = {r.path for r in client.app.routes}  # type: ignore[attr-defined]
+    assert "/api/trace/{app_id}/anchored-methods" in paths

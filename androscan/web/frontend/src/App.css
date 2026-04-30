@@ -3376,6 +3376,25 @@ code { color: var(--accent); }
   cursor: not-allowed;
 }
 
+/* Phase 11 sub-step 11.3 — `BehaviorAnchor`-aware overlay tooltip glyph.
+   The Cytoscape node-level corner badge (small purple filled circle)
+   is rendered via the inline SVG `background-image` on the
+   `node.methodnode.has-trace-anchor` selector — see CallGraphView.tsx's
+   `TRACE_ANCHOR_BADGE_DATA_URL` + `GRAPH_STYLE`.
+
+   This rule colours the literal ⚓ character that appears in the
+   tooltip HTML emitted by `renderNodeTooltipHtml`, so the tooltip's
+   ⚓ matches the corner-badge purple visually. The hex literal here
+   intentionally mirrors `TRACE_PURPLE` in CallGraphView.tsx — kept
+   in lockstep by code review since the two surfaces (Cytoscape
+   stylesheet, plain HTML tooltip) live in different rendering
+   layers and there's no shared module they could both pull from. */
+.cy-trace-anchored-glyph {
+  color: #9d6dff;
+  font-weight: 600;
+  margin-right: 0.15rem;
+}
+
 .callgraph-btn.primary {
   background: var(--accent-soft);
   border-color: var(--accent);
