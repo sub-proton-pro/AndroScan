@@ -3907,16 +3907,151 @@ code { color: var(--accent); }
   gap: 0.1rem;
 }
 
+/* Two-line stack per event: ``.trace-row-meta`` is the always-
+ * visible header (chevron + ts + kind + phase + label + abbreviated
+ * summary); ``.trace-row-payload`` is the optional pretty-printed
+ * JSON that the chevron toggles. The wrapper is a flex column so
+ * the JSON block sits flush below the meta line and gets the full
+ * row width without fighting the meta line's own grid sub-layout. */
 .trace-row {
-  display: grid;
-  grid-template-columns: 6.5rem 3.4rem 4rem auto 1fr;
-  gap: 0.4rem;
-  align-items: baseline;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
   padding: 0.15rem 0.3rem;
   font-size: 0.74rem;
   border-bottom: 1px dotted rgba(48, 54, 61, 0.6);
+}
+
+/* Meta header row — same column shape as the old ``.trace-row``
+ * grid had, plus a leading chevron column. The grid keeps the
+ * ts/kind/phase columns aligned across rows so operators can scan
+ * vertically without timestamps drifting; the trailing summary
+ * (``1fr``) absorbs the remaining width. */
+.trace-row-meta {
+  display: grid;
+  grid-template-columns: 1.2rem 6.5rem 3.4rem 4rem auto 1fr;
+  gap: 0.4rem;
+  align-items: baseline;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* Chevron toggle. ``logcat-toggle-btn`` would have given us the
+ * stock 1.4rem button, but trace rows are dense (font-size 0.74rem)
+ * and a 1.4rem button per row would make the list visually heavy.
+ * Custom rule keeps it borderless + tightly sized to the triangle
+ * glyph, with a subtle hover so operators can find it. */
+.trace-payload-toggle {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0;
+  font-size: 0.7rem;
+  line-height: 1;
+  width: 1.1rem;
+  text-align: center;
+  user-select: none;
+}
+.trace-payload-toggle:hover {
+  color: var(--accent);
+}
+.trace-payload-toggle:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Pretty-printed JSON block. ``<pre>`` with monospace + tighter
+ * line-height than the row meta (operator scans many lines of JSON
+ * vertically; default 1.4 leaves visible gaps between brace lines).
+ * ``white-space: pre`` (not ``pre-wrap``) because JSON is line-oriented
+ * by design — wrapping a long string value mid-token would be
+ * actively confusing; horizontal scroll is the intended UX. The
+ * 2.4rem left padding aligns the JSON's leading ``{`` with the row's
+ * ``ts`` column so the visual indent matches ``timestamp │ json`` in
+ * a column-by-column read. */
+.trace-row-payload {
+  margin: 0;
+  padding: 0.4rem 0.5rem 0.5rem 2.4rem;
+  font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  background: rgba(13, 17, 23, 0.5);
+  border-radius: 3px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* JSON syntax highlighting — single class per token kind so the
+ * theme (or a future user preference) can adjust one rule at a
+ * time. Keeping the kinds tight (key / string / number / bool /
+ * null / punct / ws) keeps the tokeniser ~50 LOC instead of 500. */
+.json-tok-key {
+  color: var(--accent);
+  font-weight: 600;
+}
+.json-tok-string {
+  /* GitHub-style string green; calmer than ``--ok`` which is
+   * reserved for status pills. */
+  color: #98c379;
+}
+.json-tok-number {
+  color: #d19a66;
+}
+.json-tok-bool {
+  color: #c678dd;
+  font-weight: 600;
+}
+.json-tok-null {
+  color: var(--muted);
+  font-style: italic;
+}
+.json-tok-punct {
+  color: var(--muted);
+}
+/* ``.json-tok-ws`` intentionally has no rule — whitespace tokens
+ * render as-is and don't need styling. The class is still emitted
+ * for symmetry, useful if a future debug mode wants to highlight
+ * whitespace. */
+
+/* "Show older events" button — anchored at the bottom of the list
+ * (under the oldest visible row). Full-width, minimal chrome so it
+ * reads as a list-extension affordance rather than a primary action.
+ * Operators only click this when they're already at the bottom of
+ * the rendered window, so it doesn't need to compete for attention
+ * with the toolbar buttons up top. */
+.trace-show-older {
+  display: block;
+  width: 100%;
+  appearance: none;
+  background: rgba(88, 166, 255, 0.06);
+  color: var(--accent);
+  border: 1px dashed rgba(88, 166, 255, 0.35);
+  border-radius: 3px;
+  padding: 0.45rem 0.6rem;
+  margin: 0.5rem 0 0.2rem;
+  font-size: 0.72rem;
+  font-family: inherit;
+  text-align: center;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+}
+.trace-show-older:hover {
+  background: rgba(88, 166, 255, 0.12);
+  border-color: var(--accent);
+}
+
+/* "Newest ↑" toolbar button. Disabled state matches ``ghost-mini``'s
+ * default disabled look (opacity-dimmed, not-allowed cursor). The
+ * arrow glyph in the label is intentional — visually reinforces
+ * the "scroll back to the top" action and matches conventions from
+ * chat clients ("scroll to bottom" arrow) inverted for the newest-
+ * at-top layout. */
+.trace-jump-newest:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .trace-row:last-child {
