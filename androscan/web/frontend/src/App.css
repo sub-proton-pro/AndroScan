@@ -3363,6 +3363,19 @@ code { color: var(--accent); }
   cursor: not-allowed;
 }
 
+/* Phase 11 sub-step 11.2 — disabled-state namespace for right-click
+   context-menu items (currently used by the "Trace this method" entry
+   on external nodes — external callees have no source available so
+   the trace skill can't slice predicates). The visual treatment
+   matches `.callgraph-btn:disabled` above (opacity + cursor); this
+   rule exists as a discrete semantic hook so future menu items that
+   are not `.callgraph-btn` instances pick up the same affordance and
+   so the disabled-state semantics are greppable as a concept. */
+.cy-context-menu-item-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .callgraph-btn.primary {
   background: var(--accent-soft);
   border-color: var(--accent);

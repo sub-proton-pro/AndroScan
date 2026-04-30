@@ -148,7 +148,8 @@ export function CallGraphView({
   appPackage = null,
   hitsByMethod,
 }: Props) {
-  const { setPendingCodeNav, setTab } = useWorkbench();
+  const { setPendingCodeNav, setPendingTraceEntry, setLabMode, setTab } =
+    useWorkbench();
 
   // Status / data state -----------------------------------------------------
   const [statusResp, setStatusResp] = useState<GraphStatusResponse | null>(
@@ -566,6 +567,32 @@ export function CallGraphView({
     [appId, setPendingCodeNav, setTab],
   );
 
+  // Phase 11 sub-step 11.2 — "Trace this method" cross-tab handoff.
+  // Reuses the 10.8 ``pendingTraceEntry`` plumbing established for the
+  // Inspect → Trace handoff. ``node.smali_id`` is the pre-computed
+  // canonical full signature (per ``call_graph.nodes.smali_id``) so
+  // the consumer in ``LabTraceMode.tsx`` will recognise it as
+  // complete via ``looksLikeCompleteSmaliSignature`` and auto-fire
+  // the trace. External nodes are handled defensively here AND in
+  // the menu UI (the menu button is rendered ``disabled`` with a
+  // tooltip on external nodes — same surface as the spec's intent
+  // for the "Open in Inspect" entry, even though the existing entry
+  // bails silently rather than visibly disabling).
+  const traceMethod = useCallback(
+    (node: GraphNode, klass: GraphClass | undefined) => {
+      if (!appId || node.is_external) return;
+      const cls = klass?.class_name ?? `class#${node.class_id}`;
+      setPendingTraceEntry({
+        appId,
+        entryPrefix: node.smali_id,
+        sourceLabel: `Graph → ${cls}.${node.method_name}`,
+      });
+      setLabMode("trace");
+      setTab("lab");
+    },
+    [appId, setPendingTraceEntry, setLabMode, setTab],
+  );
+
   // -------- Search dropdown wiring -----------------------------------------
   // Recompute hits on every filter or graph change. ``searchGraph`` is
   // pure and bounded (capped at ``SEARCH_HIT_LIMIT`` per section), so
@@ -892,6 +919,9 @@ export function CallGraphView({
             onFocus={focusOnContextNode}
             onOpenInInspect={() =>
               openInInspect(ctxMenu.node, ctxMenu.klass)
+            }
+            onTraceMethod={() =>
+              traceMethod(ctxMenu.node, ctxMenu.klass)
             }
           />
         )}
@@ -2192,10 +2222,15 @@ function ContextMenuBox(props: {
   onClose: () => void;
   onFocus: (hops: number) => void;
   onOpenInInspect: () => void;
+  onTraceMethod: () => void;
 }) {
-  const { menu, onClose, onFocus, onOpenInInspect } = props;
+  const { menu, onClose, onFocus, onOpenInInspect, onTraceMethod } = props;
   const [hops, setHops] = useState(DEFAULT_HOPS);
   const cls = menu.klass?.class_name ?? "?";
+  // External nodes have no source available — the trace skill needs
+  // the smali body to slice predicates, so disable the menu item with
+  // an operator-readable tooltip explaining why.
+  const isExternal = menu.node.is_external;
   return (
     <>
       <div onClick={onClose} style={ctxBackdropStyle} />
@@ -2245,6 +2280,20 @@ function ContextMenuBox(props: {
           }}
         >
           Open in Inspect
+        </button>
+        <button
+          type="button"
+          className={`callgraph-btn${isExternal ? " cy-context-menu-item-disabled" : ""}`}
+          disabled={isExternal}
+          onClick={() => {
+            onTraceMethod();
+            onClose();
+          }}
+          title={isExternal
+            ? "External callee — no source available to trace"
+            : "Open in Trace mode and run the trace_behavior skill on this method"}
+        >
+          Trace this method
         </button>
       </div>
     </>
