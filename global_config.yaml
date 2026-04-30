@@ -6,7 +6,14 @@ ollama:
   timeout_sec: 150
   model: "qwen3.5:35b"
   temperature: 0.2
-  num_predict: 8192
+  # Phase 11 sub-step 11.6 / DEC-025 — bumped from 8192 to absorb the
+  # v2 inter-procedural slicer's ~1.5x response payload growth.
+  num_predict: 12288
+  # Phase 11 sub-step 11.6 / DEC-025 — Ollama's default context window
+  # is 8192 tokens; v2's ~2x input prompt growth (deeper PredicateOrigin
+  # chains in the per-anchor closure) can squeeze it. 16384 preserves
+  # headroom; live-reloadable.
+  num_ctx: 16384
 
 paths:
   run_folder_root: "apps"
@@ -55,7 +62,13 @@ frida:
 # expand the gate pool but cost LLM tokens + per-method static analysis.
 # max_hops_hard_cap: absolute ceiling on closure depth — even an explicit
 # hops arg is clamped to this value. Bounds the worst-case per-anchor cost.
+# max_slice_depth: Phase 11 sub-step 11.6 / DEC-025 — bounded inter-
+# procedural slicer descent depth. Per-decision; the v2 slicer descends
+# past method-call / field-read terminals up to this many hops. Hard
+# cap of 4 enforced in slicing._DescentBudget.fresh() regardless of
+# the YAML value. Live-reloadable.
 trace:
   bypass_risk_max: "medium"
   max_hops_default: 3
   max_hops_hard_cap: 6
+  max_slice_depth: 2

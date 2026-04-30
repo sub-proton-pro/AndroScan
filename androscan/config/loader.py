@@ -58,6 +58,10 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     "ollama_model":                ("ollama",   "model",             "ANDROSCAN_OLLAMA_MODEL"),
     "ollama_temperature":          ("ollama",   "temperature",        None),
     "ollama_num_predict":          ("ollama",   "num_predict",        None),
+    # Phase 11 sub-step 11.6 / DEC-025 — Ollama context window.
+    # Bumped above the Ollama default (8192) to absorb the v2
+    # inter-procedural slicer's ~2× input prompt growth.
+    "ollama_num_ctx":              ("ollama",   "num_ctx",           "ANDROSCAN_OLLAMA_NUM_CTX"),
     "llm_provider":                ("llm",      "provider",          "ANDROSCAN_LLM_PROVIDER"),
     "cloud_model":                 ("llm",      "cloud_model",       "ANDROSCAN_CLOUD_MODEL"),
     "cloud_api_key":               ("llm",      "cloud_api_key",      None),
@@ -80,6 +84,10 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     "trace_bypass_risk_max":       ("trace",    "bypass_risk_max",        "ANDROSCAN_TRACE_BYPASS_RISK_MAX"),
     "trace_max_hops_default":      ("trace",    "max_hops_default",       "ANDROSCAN_TRACE_MAX_HOPS_DEFAULT"),
     "trace_max_hops_hard_cap":     ("trace",    "max_hops_hard_cap",      "ANDROSCAN_TRACE_MAX_HOPS_HARD_CAP"),
+    # Phase 11 sub-step 11.6 / DEC-025 — bounded inter-procedural
+    # slicer descent depth knob. Hard cap of 4 enforced in
+    # ``slicing._DescentBudget.fresh()`` regardless of YAML value.
+    "trace_max_slice_depth":       ("trace",    "max_slice_depth",        "ANDROSCAN_TRACE_MAX_SLICE_DEPTH"),
 }
 
 
@@ -92,6 +100,7 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
     "ollama_model",
     "ollama_temperature",
     "ollama_num_predict",
+    "ollama_num_ctx",
     "llm_provider",
     "cloud_model",
     "cloud_api_key",
@@ -119,6 +128,11 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # under the old cap; the next call uses the new value).
     "trace_max_hops_default",
     "trace_max_hops_hard_cap",
+    # Phase 11 sub-step 11.6 — trace.max_slice_depth is read per-call
+    # by the trace_behavior skill at the start of each closure walk
+    # (passed into ``_DescentBudget.fresh(max_depth=...)``); no
+    # in-flight state to bounce.
+    "trace_max_slice_depth",
 })
 
 
@@ -132,6 +146,7 @@ class Config:
     ollama_model: str
     ollama_temperature: float
     ollama_num_predict: int
+    ollama_num_ctx: int  # Phase 11 sub-step 11.6 / DEC-025
     llm_provider: str  # "ollama" or cloud provider name from CLOUD_PROVIDERS
     cloud_model: str
     cloud_api_key: str
@@ -154,6 +169,7 @@ class Config:
     trace_bypass_risk_max: str   # "low" | "medium" | "high" — Phase 10 / DEC-024
     trace_max_hops_default: int  # default closure depth for trace_behavior — Phase 10 / DEC-024
     trace_max_hops_hard_cap: int # absolute closure depth ceiling — Phase 10 / DEC-024
+    trace_max_slice_depth: int   # bounded inter-procedural slicer depth — Phase 11 / DEC-025
 
     @classmethod
     def default(cls) -> "Config":
@@ -163,6 +179,7 @@ class Config:
             ollama_model="qwen3.5:35b",
             ollama_temperature=0.2,
             ollama_num_predict=constants.OLLAMA_NUM_PREDICT_DEFAULT,
+            ollama_num_ctx=constants.OLLAMA_NUM_CTX_DEFAULT,
             llm_provider="ollama",
             cloud_model="",
             cloud_api_key="",
@@ -185,6 +202,7 @@ class Config:
             trace_bypass_risk_max="medium",
             trace_max_hops_default=3,
             trace_max_hops_hard_cap=6,
+            trace_max_slice_depth=constants.TRACE_MAX_SLICE_DEPTH_DEFAULT,
         )
 
     @property
@@ -269,6 +287,7 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["ollama_model"] = ollama.get("model") or "qwen3.5:35b"
     out["ollama_temperature"] = _safe_float(ollama.get("temperature"), 0.2, "ollama.temperature")
     out["ollama_num_predict"] = _safe_int(ollama.get("num_predict"), constants.OLLAMA_NUM_PREDICT_DEFAULT, "ollama.num_predict")
+    out["ollama_num_ctx"] = _safe_int(ollama.get("num_ctx"), constants.OLLAMA_NUM_CTX_DEFAULT, "ollama.num_ctx")
     out["llm_provider"] = (llm.get("provider") or "ollama").strip().lower()
     out["cloud_model"] = (llm.get("cloud_model") or "").strip()
     out["cloud_api_key"] = (llm.get("cloud_api_key") or "").strip()
@@ -302,6 +321,11 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["trace_bypass_risk_max"] = (trace.get("bypass_risk_max") or "medium").strip() or "medium"
     out["trace_max_hops_default"] = _safe_int(trace.get("max_hops_default"), 3, "trace.max_hops_default")
     out["trace_max_hops_hard_cap"] = _safe_int(trace.get("max_hops_hard_cap"), 6, "trace.max_hops_hard_cap")
+    out["trace_max_slice_depth"] = _safe_int(
+        trace.get("max_slice_depth"),
+        constants.TRACE_MAX_SLICE_DEPTH_DEFAULT,
+        "trace.max_slice_depth",
+    )
     return out
 
 
@@ -397,6 +421,24 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 f"Warning: ANDROSCAN_TRACE_MAX_HOPS_HARD_CAP={os.environ['ANDROSCAN_TRACE_MAX_HOPS_HARD_CAP']!r} invalid; using default.",
                 file=sys.stderr,
             )
+    # Phase 11 sub-step 11.6 — trace.max_slice_depth env override.
+    if os.environ.get("ANDROSCAN_TRACE_MAX_SLICE_DEPTH"):
+        try:
+            merged["trace_max_slice_depth"] = max(0, int(os.environ["ANDROSCAN_TRACE_MAX_SLICE_DEPTH"].strip()))
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_TRACE_MAX_SLICE_DEPTH={os.environ['ANDROSCAN_TRACE_MAX_SLICE_DEPTH']!r} invalid; using default.",
+                file=sys.stderr,
+            )
+    # Phase 11 sub-step 11.6 — ollama.num_ctx env override.
+    if os.environ.get("ANDROSCAN_OLLAMA_NUM_CTX"):
+        try:
+            merged["ollama_num_ctx"] = max(1, int(os.environ["ANDROSCAN_OLLAMA_NUM_CTX"].strip()))
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_OLLAMA_NUM_CTX={os.environ['ANDROSCAN_OLLAMA_NUM_CTX']!r} invalid; using default.",
+                file=sys.stderr,
+            )
     if os.environ.get("ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"):
         try:
             merged["web_screencap_interval_ms"] = max(50, int(os.environ["ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"].strip()))
@@ -412,6 +454,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         ollama_model=merged["ollama_model"],
         ollama_temperature=merged["ollama_temperature"],
         ollama_num_predict=max(1, merged["ollama_num_predict"]),
+        ollama_num_ctx=max(1, merged["ollama_num_ctx"]),
         llm_provider=merged["llm_provider"],
         cloud_model=merged["cloud_model"],
         cloud_api_key=merged["cloud_api_key"],
@@ -434,6 +477,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         trace_bypass_risk_max=str(merged.get("trace_bypass_risk_max") or "medium").strip().lower() or "medium",
         trace_max_hops_default=max(1, int(merged.get("trace_max_hops_default", 3))),
         trace_max_hops_hard_cap=max(1, int(merged.get("trace_max_hops_hard_cap", 6))),
+        trace_max_slice_depth=max(0, int(merged.get("trace_max_slice_depth", constants.TRACE_MAX_SLICE_DEPTH_DEFAULT))),
     )
 
 
@@ -530,6 +574,7 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
         ollama_model=str(flat["ollama_model"] or "qwen3.5:35b"),
         ollama_temperature=float(flat["ollama_temperature"]),
         ollama_num_predict=max(1, int(flat["ollama_num_predict"])),
+        ollama_num_ctx=max(1, int(flat["ollama_num_ctx"])),
         llm_provider=str(flat.get("llm_provider") or "ollama").strip().lower() or "ollama",
         cloud_model=str(flat.get("cloud_model") or "").strip(),
         cloud_api_key=str(flat.get("cloud_api_key") or "").strip(),
@@ -552,6 +597,7 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
         trace_bypass_risk_max=str(flat["trace_bypass_risk_max"] or "medium").strip().lower() or "medium",
         trace_max_hops_default=max(1, int(flat["trace_max_hops_default"])),
         trace_max_hops_hard_cap=max(1, int(flat["trace_max_hops_hard_cap"])),
+        trace_max_slice_depth=max(0, int(flat["trace_max_slice_depth"])),
     )
 
 
@@ -564,7 +610,7 @@ def coerce_yaml_value(field: str, raw: Any) -> Any:
     if field not in CONFIG_FIELD_MAP:
         raise ValueError(f"Unknown Config field: {field!r}")
     int_fields = {
-        "ollama_timeout_sec", "ollama_num_predict",
+        "ollama_timeout_sec", "ollama_num_predict", "ollama_num_ctx",
         "max_turns", "max_hypotheses_per_report",
         "section_rule_length",
         "web_port", "web_screencap_interval_ms",
@@ -572,6 +618,7 @@ def coerce_yaml_value(field: str, raw: Any) -> Any:
         "frida_trace_ring_buffer_size",
         "trace_max_hops_default",
         "trace_max_hops_hard_cap",
+        "trace_max_slice_depth",
     }
     float_fields = {"ollama_temperature", "cloud_temperature"}
     bool_fields = {"per_component_analysis"}

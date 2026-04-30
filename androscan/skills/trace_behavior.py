@@ -229,8 +229,15 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
     # depth + visited set are both consumed cumulatively across every
     # decision in the closure (so a hub-helper visited via decision A
     # isn't redundantly re-descended via decision B). 11.5's
-    # field-write-site walking will draw from the same instance.
-    descent_budget = slicing._DescentBudget.fresh()
+    # field-write-site walking draws from the same instance. 11.6 —
+    # depth driven by ``Config.trace_max_slice_depth`` (clamped to
+    # ``slicing.HARD_CAP_DEPTH = 4`` defensively inside ``fresh``);
+    # ``getattr`` fallback preserves the v1 fixture-callers passing
+    # a stripped ``Config``.
+    max_slice_depth = int(
+        getattr(config, "trace_max_slice_depth", slicing.MAX_SLICE_DEPTH)
+    )
+    descent_budget = slicing._DescentBudget.fresh(max_depth=max_slice_depth)
 
     aggregated_decisions: list[DecisionPoint] = []
     aggregated_plans: list[BypassPlan] = []

@@ -243,9 +243,27 @@ class _DescentBudget:
     ``dataclasses.replace`` per recursive call). Tests build fresh
     instances per ``slice_predicate_origins`` call so the budget
     never leaks across boundaries.
+
+    Phase 11 sub-step 11.6 — ``current_descent_depth`` is a
+    recursion-stack counter (mirrors ``remaining_depth`` but in the
+    opposite direction): incremented in :func:`_descend_into_callee`
+    and :func:`_walk_field_write_sites` BEFORE the recursive
+    re-slice, decremented in their respective ``finally`` blocks.
+    Read by :func:`_maybe_descend_method_call` /
+    :func:`_maybe_descend_field_read` when they're about to return a
+    cap-stop / cycle-blocked / external-callee terminal — the
+    returned :class:`MethodCallOrigin` / :class:`FieldReadOrigin`
+    is tagged with ``descent_depth = current_descent_depth`` so
+    the frontend can render the "via N helpers" depth pill. The
+    success path (``return descended``) does **not** re-tag the
+    inner result — the inner result was tagged at its own
+    deepest recursion frame and that's the depth operators care
+    about. Default ``0`` so v1-style budgets (fresh ones at the
+    top of every slice call) report no descent.
     """
     remaining_depth: int
     visited: set[tuple[str, str, str]]
+    current_descent_depth: int = 0
 
     @classmethod
     def fresh(cls, max_depth: int = MAX_SLICE_DEPTH) -> "_DescentBudget":
@@ -253,7 +271,11 @@ class _DescentBudget:
         to :data:`HARD_CAP_DEPTH`). Default factory used by the
         public :func:`slice_predicate_origins` entry point when the
         caller doesn't supply its own."""
-        return cls(remaining_depth=min(max(max_depth, 0), HARD_CAP_DEPTH), visited=set())
+        return cls(
+            remaining_depth=min(max(max_depth, 0), HARD_CAP_DEPTH),
+            visited=set(),
+            current_descent_depth=0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +952,44 @@ def _parse_signature_for_cycle_key(method_sig: str) -> tuple[str, str, str]:
     return (class_part, rest[:paren], rest[paren:])
 
 
+def _tag_descent_depth(
+    origin: PredicateOrigin, budget: _DescentBudget
+) -> PredicateOrigin:
+    """Phase 11 sub-step 11.6 — tag a :class:`MethodCallOrigin` /
+    :class:`FieldReadOrigin` cap-stop terminal with the current
+    descent-stack depth, so the frontend's depth pill can render
+    "via N helper method(s)" / "via N field write(s)".
+
+    Q1 (A) literal-spec rule: only ``MethodCallOrigin`` and
+    ``FieldReadOrigin`` carry the ``descent_depth`` field — Const /
+    Param / Composite stay terminal in v2 with no depth tag (the
+    success path that resolves all the way to a v1-terminal variant
+    drops the depth signal). Tag is a no-op when:
+
+    * ``current_descent_depth == 0`` (top-level entry; no descent
+      happened) — keeps the v1 wire shape verbatim for callers that
+      exercise the v1 path.
+    * ``origin`` is already tagged with the same depth (idempotency —
+      this can happen on the success-path unwind where each frame
+      sees the inner result already carries its terminal depth).
+    * ``origin`` is not a ``MethodCallOrigin`` / ``FieldReadOrigin``
+      (Const / Param / Composite — defensive; the dispatcher only
+      calls us with the two tagged variants today).
+    """
+    depth = budget.current_descent_depth
+    if depth <= 0:
+        return origin
+    if isinstance(origin, MethodCallOrigin):
+        if origin.descent_depth == depth:
+            return origin
+        return dataclasses.replace(origin, descent_depth=depth)
+    if isinstance(origin, FieldReadOrigin):
+        if origin.descent_depth == depth:
+            return origin
+        return dataclasses.replace(origin, descent_depth=depth)
+    return origin
+
+
 def _maybe_descend(
     origin: PredicateOrigin,
     *,
@@ -1006,9 +1066,18 @@ def _maybe_descend_method_call(
 ) -> PredicateOrigin:
     """Phase 11 sub-step 11.4 — bounded inter-procedural descent
     through a stateless helper-method callee. See :func:`_maybe_descend`
-    for the dispatch contract."""
+    for the dispatch contract.
+
+    Phase 11 sub-step 11.6 — when an early-exit path returns the
+    received ``origin`` unchanged AND the caller is itself inside an
+    active descent recursion (``budget.current_descent_depth > 0``),
+    the returned origin is tagged with that depth so the frontend's
+    depth pill can render "via N helper method(s)". Top-level entry
+    (depth 0) leaves the field at its default ``0`` — operator sees
+    a v1-style terminal with no pill.
+    """
     if budget.remaining_depth <= 0:
-        return origin
+        return _tag_descent_depth(origin, budget)
     callee_sig = origin.method.smali_signature
     cycle_key = _parse_signature_for_cycle_key(callee_sig)
     if cycle_key in budget.visited:
@@ -1016,12 +1085,12 @@ def _maybe_descend_method_call(
         # slice — don't redo work. Surface the v1 terminal so the
         # operator at least sees the call (vs. a misleading "no
         # origin").
-        return origin
+        return _tag_descent_depth(origin, budget)
     # External callee → not in the in-app classes index → can't
     # descend (no Smali body for stdlib / framework classes).
     callee_class_desc = cycle_key[0]
     if callee_class_desc not in classes_by_smali:
-        return origin
+        return _tag_descent_depth(origin, budget)
     # Statelessness gate. Use a fresh visited set for the
     # is_stateless walk so it doesn't pollute the descent's own
     # visited set (the two passes have different semantics: descent
@@ -1034,7 +1103,7 @@ def _maybe_descend_method_call(
         decisions_by_method_sig=decisions_by_method_sig,
         reflective_method_sigs=reflective_method_sigs,
     ):
-        return origin
+        return _tag_descent_depth(origin, budget)
     descended = _descend_into_callee(
         origin,
         budget=budget,
@@ -1045,7 +1114,7 @@ def _maybe_descend_method_call(
         current_class_smali=current_class_smali,
     )
     if descended is None:
-        return origin
+        return _tag_descent_depth(origin, budget)
     return descended
 
 
@@ -1107,9 +1176,12 @@ def _descend_into_callee(
     # Mark this callee visited + decrement depth BEFORE recursing so
     # the inner re-slice's own descent attempts see the updated
     # budget (closed economy — same instance shared across the
-    # entire slice operation).
+    # entire slice operation). 11.6 — also bump the
+    # ``current_descent_depth`` counter so any cap-stop terminal
+    # downstream can self-report its depth-from-top.
     budget.visited.add(cycle_key)
     budget.remaining_depth -= 1
+    budget.current_descent_depth += 1
     try:
         inner = _slice_register(
             return_reg,
@@ -1141,6 +1213,7 @@ def _descend_into_callee(
         # The visited entry stays — we never want to descend into
         # the same callee twice in one top-level slice operation.
         budget.remaining_depth += 1
+        budget.current_descent_depth -= 1
 
 
 # ===========================================================================
@@ -1186,15 +1259,15 @@ def _maybe_descend_field_read(
     * Inner re-slice itself fails.
     """
     if budget.remaining_depth <= 0:
-        return origin
+        return _tag_descent_depth(origin, budget)
     if not current_class_smali:
-        return origin
+        return _tag_descent_depth(origin, budget)
     field_class_smali = _java_class_to_smali(origin.field.class_name)
     # Strict same-class match per planning-checkpoint Q2 (A) — no
     # superclass walking in v1; v3 / Phase 12 may extend with
     # ClassDecl.super_desc traversal.
     if field_class_smali != current_class_smali:
-        return origin
+        return _tag_descent_depth(origin, budget)
     # Cycle key for fields uses the full smali signature (class +
     # name + type). Lives in the same ``budget.visited`` set as
     # method-descent cycle keys — the third tuple slot ("descriptor"
@@ -1207,7 +1280,7 @@ def _maybe_descend_field_read(
         origin.field.type_descriptor,
     )
     if field_cycle_key in budget.visited:
-        return origin
+        return _tag_descent_depth(origin, budget)
     descended = _walk_field_write_sites(
         origin,
         budget=budget,
@@ -1219,7 +1292,7 @@ def _maybe_descend_field_read(
         field_cycle_key=field_cycle_key,
     )
     if descended is None:
-        return origin
+        return _tag_descent_depth(origin, budget)
     return descended
 
 
@@ -1325,9 +1398,13 @@ def _walk_field_write_sites(
 
     # Mark the field visited + decrement depth BEFORE recursing so
     # the inner re-slice's own descent attempts see the updated
-    # budget (closed economy).
+    # budget (closed economy). 11.6 — also bump
+    # ``current_descent_depth`` (mirrors the method-descent path
+    # above) so any cap-stop terminal downstream of this field-walk
+    # can self-report its depth-from-top.
     budget.visited.add(field_cycle_key)
     budget.remaining_depth -= 1
+    budget.current_descent_depth += 1
     try:
         inner = _slice_register(
             write_src_reg,
@@ -1352,6 +1429,7 @@ def _walk_field_write_sites(
         )
     finally:
         budget.remaining_depth += 1
+        budget.current_descent_depth -= 1
 
 
 def _class_from_method_sig(method_sig: str) -> str:

@@ -8,10 +8,26 @@ MAX_TURNS_DEFAULT = 5
 MAX_HYPOTHESES_PER_REPORT_DEFAULT = 10
 PER_COMPONENT_ANALYSIS_DEFAULT = False
 
-# Ollama retry: timeout tiers (sec), num_predict tiers (tokens)
+# Ollama retry: timeout tiers (sec), num_predict tiers (tokens), num_ctx default.
+# Phase 11 sub-step 11.6 / DEC-025 — ``OLLAMA_NUM_PREDICT_DEFAULT`` bumped
+# from 8192 → 12288 to absorb the v2 inter-procedural slicer's ~1.5×
+# response payload growth (deeper PredicateOrigin chains → richer per-
+# decision rationale prose). ``OLLAMA_NUM_CTX_DEFAULT`` is new in 11.6:
+# Ollama's default context window is 8192 tokens, which the v2 slicer's
+# ~2× input prompt growth (deeper chains in the per-anchor closure)
+# can squeeze; bumping to 16384 preserves headroom. Both knobs are
+# also surfaced in ``Config.ollama_num_predict`` / ``ollama_num_ctx``
+# so operators can override per-deployment via global_config.yaml.
 OLLAMA_TIMEOUT_TIERS = [150, 300, 600, 900]
-OLLAMA_NUM_PREDICT_DEFAULT = 8192  # 2 * 4096
-OLLAMA_NUM_PREDICT_TIERS = [8192, 16384]
+OLLAMA_NUM_PREDICT_DEFAULT = 12288  # 11.6 — was 8192 (DEC-025)
+OLLAMA_NUM_PREDICT_TIERS = [12288, 16384]
+OLLAMA_NUM_CTX_DEFAULT = 16384  # 11.6 — Ollama default is 8192 (DEC-025)
+
+# Phase 11 sub-step 11.6 / DEC-025 — ``trace.max_slice_depth`` config
+# knob default. Mirrors ``slicing.MAX_SLICE_DEPTH``; the slicer's
+# ``HARD_CAP_DEPTH = 4`` constant is the ceiling regardless of what
+# operators set in YAML.
+TRACE_MAX_SLICE_DEPTH_DEFAULT = 2
 
 # Issue severity (exploitability + impact); 1-5 from LLM. CVSS 3 scoring in a later phase.
 ISSUE_SEVERITY_LABELS = {

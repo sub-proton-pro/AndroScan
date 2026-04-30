@@ -364,7 +364,7 @@ Use the following format for new entries:
 ---
 
 ### ISSUE-013: Behavior Trace v1 backward slicing is intra-procedural only
-- status: Open (intentional v1 trade-off — **v2 planned: Phase 11 sub-steps 11.4 → 11.6 per DEC-025; planning checkpoint 11.0 ratified 2026-04-30**)
+- status: **Resolved (Phase 11 v2)** — landed 2026-04-30 across sub-steps 11.4 (bounded inter-procedural method descent) + 11.5 (same-class field-write-site walking) + 11.6 (cache schema bump + LLM-budget bumps + frontend depth-pill UI + ISSUE-013 close-out). Production verification on dogfood-app traces pending (the spec's >50% false-negative reduction criterion needs real-app data); the corpus-wide v1-vs-v2 regression floor is locked in via `tests/test_decisions_slicing.py::test_v1_vs_v2_corpus_measurement_v2_resolves_strictly_more_terminals`. Re-open if real-app measurement shows the false-negative rate is still > 50% of the v1 baseline despite v2 descent.
 - impact: Medium
 - area: analysis / Behavior Trace / decision-point predicate origin
 - introduced / observed: 2026-04-29 (Phase 10 v1 complete — sub-step 10.2 specifics)

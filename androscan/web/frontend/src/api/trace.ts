@@ -96,10 +96,24 @@ export type FieldRef = {
 /**
  * Discriminated union for predicate origin (10.2's slicer output). The
  * ``kind`` discriminator is JSON-stable per the Python encoder.
+ *
+ * Phase 11 sub-step 11.6 / DEC-025 — ``descent_depth`` is a new
+ * optional field on the two non-terminal-in-v1 variants
+ * (``method_call`` / ``field_read``). ``0`` (the default; equivalent
+ * to omitted) means the slicer terminated at this origin without
+ * descending — either the v1 path, or v2 with descent disabled / not
+ * triggered (deny-list / cycle / external callee / cross-class
+ * field). ``>= 1`` means the v2 inter-procedural slicer descended
+ * N hops before hitting a cap-stop terminal at this origin. The
+ * frontend's depth pill on ``PredicateOriginView`` renders
+ * ``"via N helper method(s)"`` / ``"via N field write(s)"`` next
+ * to the origin tag when the field is present and ``> 0``.
+ * ``Const`` / ``Param`` / ``Composite`` variants stay v1-shaped
+ * (no depth field) per Q1 (A) of the 11.6 planning checkpoint.
  */
 export type PredicateOrigin =
-  | { kind: "method_call"; method: MethodRef; invoke_kind: string }
-  | { kind: "field_read"; field: FieldRef; is_static: boolean }
+  | { kind: "method_call"; method: MethodRef; invoke_kind: string; descent_depth?: number }
+  | { kind: "field_read"; field: FieldRef; is_static: boolean; descent_depth?: number }
   | { kind: "const"; value: string; smali_op: string }
   | { kind: "param"; register: string }
   | { kind: "composite"; reason: string };

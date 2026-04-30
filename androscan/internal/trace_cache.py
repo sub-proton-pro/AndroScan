@@ -93,7 +93,20 @@ from androscan.analysis.trace_types import (
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
+# Schema version history:
+#   "1" — Phase 10 v1 (DEC-024). Intra-procedural slicer; PredicateOrigin
+#         variants ``MethodCallOrigin`` / ``FieldReadOrigin`` had no
+#         ``descent_depth`` field on the wire.
+#   "2" — Phase 11 v2 sub-step 11.6 (DEC-025). v2 inter-procedural
+#         slicer landed in 11.4 (method descent) + 11.5 (field-write
+#         walking); ``MethodCallOrigin.descent_depth`` and
+#         ``FieldReadOrigin.descent_depth`` (default ``0``) added to
+#         the wire shape. v1-cached anchors silently re-build on
+#         first 11.x open via the existing route layer's
+#         "missing → build" fallback path; ``get_status()`` returns
+#         ``status="failed"`` with ``error="schema_version mismatch"``
+#         on a v1 read so the route can drop + re-run the trace.
 INDEX_FILENAME = "trace.sqlite"
 
 

@@ -5292,6 +5292,32 @@ code { color: var(--accent); }
   color: var(--ok);
 }
 
+/* Phase 11 sub-step 11.6 / DEC-025 — depth pill on PredicateOriginView
+ * for ``method_call`` / ``field_read`` terminals the v2 inter-
+ * procedural slicer descended past one or more helpers / field-write
+ * sites to reach. Same pill shape as ``.trace-decision-action-hint``
+ * (subdued accent on neutral tint) so it visually clusters with the
+ * existing origin tag without competing for attention. ``title``
+ * attribute provides operator-facing tooltip explaining what the
+ * depth signal means.
+ */
+.trace-predicate-origin-depth-pill {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  background: rgba(157, 109, 255, 0.12);
+  border: 1px solid rgba(157, 109, 255, 0.45);
+  color: rgba(157, 109, 255, 0.95);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: help;
+  user-select: none;
+}
+
 /* ----- BypassPlanCard ----- */
 
 .trace-bypass-plan-list {

@@ -334,10 +334,28 @@ class MethodCallOrigin:
     ``static`` / ``direct`` / ``super`` / ``interface`` /
     ``polymorphic`` / ``custom``) so 10.4's bypass planner can select
     the right hook template without re-parsing the call site.
+
+    ``descent_depth`` (Phase 11 sub-step 11.6 / DEC-025) records how
+    many helper-method hops the v2 inter-procedural slicer walked
+    through before terminating at this call site. ``0`` (the default)
+    means the slicer terminated at this call without descending —
+    either the v1 path or the v2 path with descent disabled / not
+    triggered. ``>= 1`` means the slicer descended N hops and either
+    the budget capped, the chain hit a non-stateless / external /
+    cycled callee, or the inner re-slice itself failed — in any
+    case, this terminal sits N hops deeper than the operator's
+    immediate decision-point method. The frontend's depth pill on
+    :class:`PredicateOriginView` reads this to render
+    ``"via N helper method(s)"`` next to the origin tag. The cache
+    schema bump in 11.6 (``SCHEMA_VERSION`` ``"1"`` → ``"2"``) is
+    what lets v1-cached anchors silently re-build under the v2
+    slicer; the field defaults to ``0`` so v1 wire payloads still
+    parse if any out-of-process consumer hand-builds the dataclass.
     """
     method: MethodRef
     invoke_kind: str
     kind: str = "method_call"
+    descent_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -348,10 +366,22 @@ class FieldReadOrigin:
     ``is_static`` distinguishes the two so 10.4 picks the right
     ``Java.use(class).fieldName.value = ...`` shape (instance fields
     need ``this`` capture; static fields don't).
+
+    ``descent_depth`` (Phase 11 sub-step 11.6 / DEC-025) records how
+    many same-class field-write-site walks the v2 slicer performed
+    before terminating at this field read. ``0`` (the default) means
+    the slicer terminated at this read without walking — either the
+    v1 path, or v2 with the field's read on a different class than
+    the gate method, or the budget already exhausted. ``>= 1`` means
+    the slicer walked N field-write sites and either the budget
+    capped or the inner re-slice itself failed. See the matching
+    note on :class:`MethodCallOrigin` for the full rendering /
+    schema-bump rationale.
     """
     field: FieldRef
     is_static: bool
     kind: str = "field_read"
+    descent_depth: int = 0
 
 
 @dataclass(frozen=True)

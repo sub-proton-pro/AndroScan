@@ -33,9 +33,12 @@ from androscan.analysis.bypass_planner import (
 from androscan.analysis.trace_types import (
     BranchOutcome,
     BranchVerdict,
+    Branch,
     BypassPlan,
     DecisionKind,
     DecisionPoint,
+    FieldReadOrigin,
+    FieldRef,
     MethodCallOrigin,
     MethodRef,
 )
@@ -371,3 +374,287 @@ class TestConfigKnob:
         assert section == "trace"
         assert key == "bypass_risk_max"
         assert env == "ANDROSCAN_TRACE_BYPASS_RISK_MAX"
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 sub-step 11.6 / DEC-025 — bypass-planner behaviour against v2
+# PredicateOrigin terminals (those carrying ``descent_depth >= 1`` from
+# the bounded inter-procedural slicer added in 11.4 + 11.5). The planner
+# itself doesn't change in 11.6 — these tests confirm that:
+#
+#   * Plan A correctly targets the *deeper* method when the v2 slicer
+#     descends through stateless helpers and surfaces a ``MethodCallOrigin``
+#     at depth N (the depth-cap case from 11.4's ``gateThreeHopChainCapped``
+#     fixture).
+#   * Plan A correctly targets the *original* method when descent is
+#     blocked (deny-list / stateful callee / cycle / external) — the v2
+#     terminal is identity-equal to the v1 terminal modulo
+#     ``descent_depth=0``.
+#   * The new ``descent_depth`` field is metadata-only — it doesn't
+#     change template selection, risk, or any other planner output.
+#   * v1 callers (no descent kwargs to the slicer) and v2 callers
+#     (with descent kwargs) produce byte-identical plans on inputs
+#     where descent has nothing to do (external callee not in the
+#     in-app classes index) — proves v2 is purely additive.
+
+
+# ---- Synthetic-DecisionPoint helpers (no fixture dependency) --------------
+
+
+def _synth_method_ref(
+    class_name: str = "com.example.Foo",
+    method_name: str = "isLicensed",
+    return_descriptor: str = "Z",
+) -> MethodRef:
+    return MethodRef(
+        class_name=class_name,
+        method_name=method_name,
+        param_descriptors=(),
+        return_descriptor=return_descriptor,
+    )
+
+
+def _synth_field_ref(
+    class_name: str = "com.example.Foo",
+    field_name: str = "mLicensed",
+    type_descriptor: str = "Z",
+) -> FieldRef:
+    return FieldRef(
+        class_name=class_name,
+        field_name=field_name,
+        type_descriptor=type_descriptor,
+    )
+
+
+def _synth_clean_outcome() -> BranchOutcome:
+    """``confidence=1.0`` outcome with one ``allow`` + one ``deny``
+    verdict — the planner-acceptable shape that triggers Plan A + B."""
+    return BranchOutcome(
+        verdicts=(
+            BranchVerdict(branch_label="true", verdict="deny", score=-1.0, reasons=()),
+            BranchVerdict(branch_label="false", verdict="allow", score=1.0, reasons=()),
+        ),
+        confidence=1.0,
+        reasons=(),
+    )
+
+
+def _synth_dp_for_method_call(
+    origin: MethodCallOrigin,
+    *,
+    gate_class: str = "com.example.Gate",
+    gate_method: str = "checkLicense",
+) -> DecisionPoint:
+    """Build a synthetic ``if-eqz``-style decision (one register) whose
+    enclosing gate method is void — fires Plan A (against the
+    predicate's source method) + Plan B (against the void gate)."""
+    return DecisionPoint(
+        method=MethodRef(
+            class_name=gate_class,
+            method_name=gate_method,
+            param_descriptors=(),
+            return_descriptor="V",
+        ),
+        instruction_index=4,
+        source_line=42,
+        kind=DecisionKind.IF_EQZ,
+        predicate_registers=("v0",),
+        branches=(
+            Branch(label="true", target_label=":cond_take"),
+            Branch(label="false", target_label=None),
+        ),
+        predicate_origin=origin,
+        branch_outcome=_synth_clean_outcome(),
+    )
+
+
+def _synth_dp_for_field_read(origin: FieldReadOrigin) -> DecisionPoint:
+    """Same shape as ``_synth_dp_for_method_call`` but with a
+    ``FieldReadOrigin`` — Plan A skipped (Plan A is method-only), Plan B
+    fires (void gate)."""
+    return DecisionPoint(
+        method=MethodRef(
+            class_name="com.example.Gate",
+            method_name="checkFlag",
+            param_descriptors=(),
+            return_descriptor="V",
+        ),
+        instruction_index=2,
+        source_line=99,
+        kind=DecisionKind.IF_EQZ,
+        predicate_registers=("v0",),
+        branches=(
+            Branch(label="true", target_label=":cond_take"),
+            Branch(label="false", target_label=None),
+        ),
+        predicate_origin=origin,
+        branch_outcome=_synth_clean_outcome(),
+    )
+
+
+# ---- Pipeline-driven harness for v2 descent -------------------------------
+
+
+def _pipeline_v2() -> dict[str, decisions.MethodDecisions]:
+    """Variant of ``_pipeline()`` that passes the descent kwargs through
+    ``slice_predicate_origins`` so the slicer's bounded inter-procedural
+    descent fires. Mirrors what the production ``trace_behavior`` skill
+    does."""
+    roots = [FIXTURES / "smali", FIXTURES / "smali_classes2"]
+    classes, _ = smali_parser.parse_classes(roots)
+    mds, _ = decisions.parse_decisions(roots, classes, include_branchless=True)
+    classes_by_smali = {c.class_desc: c for c in classes}
+    decisions_by_sig = {md.method_signature: md for md in mds}
+    out: dict[str, decisions.MethodDecisions] = {}
+    budget = slicing._DescentBudget.fresh()
+    for md in mds:
+        if not md.decision_points:
+            continue
+        sliced = slicing.slice_predicate_origins(
+            md,
+            classes_by_smali=classes_by_smali,
+            decisions_by_method_sig=decisions_by_sig,
+            descent_budget=budget,
+        )
+        classified = branch_classifier.classify_branch_outcomes(sliced)
+        out[md.method_signature] = classified
+    return out
+
+
+class TestPlannerWithV2Descent:
+    """Phase 11 sub-step 11.6 — planner against v2 PredicateOrigin
+    terminals (``descent_depth`` field-aware)."""
+
+    # --- Synthetic-origin tests (no fixture, isolates planner logic) ------
+
+    def test_method_call_origin_with_descent_depth_targets_deeper_method(self) -> None:
+        """Plan A's target should be the predicate origin's ``method``
+        regardless of how the slicer arrived at it. When the v2 slicer
+        descends 2 hops and surfaces ``MethodCallOrigin(deeperMethod,
+        descent_depth=2)``, Plan A correctly targets ``deeperMethod`` —
+        operator hooks the actual computation site, not some intermediate
+        helper. (Plan A is "force the predicate's source method to
+        return X", and the v2 slicer's job is to find the *truest*
+        source — depth-2 deep, in this case.)"""
+        deeper = _synth_method_ref(
+            class_name="com.app.Helpers",
+            method_name="pureDeepHelper",
+            return_descriptor="Z",
+        )
+        origin = MethodCallOrigin(method=deeper, invoke_kind="virtual", descent_depth=2)
+        dp = _synth_dp_for_method_call(origin)
+        plans = plan_bypasses(dp)
+        plan_a = _plan_by_template(plans, "force_return_value")
+        assert plan_a.target_method is not None
+        assert plan_a.target_method.smali_signature == deeper.smali_signature
+        assert plan_a.params["method_name"] == "pureDeepHelper"
+        assert plan_a.params["class_name"] == "com.app.Helpers"
+
+    def test_field_read_origin_with_descent_depth_still_skips_plan_a(self) -> None:
+        """The v2 slicer's same-class field-write walk produces a
+        ``FieldReadOrigin`` with ``descent_depth >= 1`` when it walks
+        through the field's write site(s). Plan A (method-only) still
+        skips — even though descent fired, the terminal variant is
+        ``field_read``, not ``method_call``. Plan B (void gate) still
+        fires."""
+        field = _synth_field_ref(
+            class_name="com.app.Cache",
+            field_name="mAccessGranted",
+            type_descriptor="Z",
+        )
+        origin = FieldReadOrigin(field=field, is_static=False, descent_depth=1)
+        dp = _synth_dp_for_field_read(origin)
+        plans = plan_bypasses(dp)
+        template_ids = [p.template_id for p in plans]
+        assert "force_return_value" not in template_ids
+        assert "force_method_skip" in template_ids
+
+    def test_descent_depth_metadata_does_not_affect_plan_output(self) -> None:
+        """Same target method, two ``descent_depth`` values (0 vs 2):
+        plans must be byte-identical (template_id, risk, params,
+        target_method). Planner is descent-agnostic — the depth signal
+        is operator-facing UI metadata only, not selection input."""
+        target = _synth_method_ref(method_name="getRootStatus")
+        origin_v1_shape = MethodCallOrigin(method=target, invoke_kind="virtual", descent_depth=0)
+        origin_v2_shape = MethodCallOrigin(method=target, invoke_kind="virtual", descent_depth=2)
+        plans_v1 = plan_bypasses(_synth_dp_for_method_call(origin_v1_shape))
+        plans_v2 = plan_bypasses(_synth_dp_for_method_call(origin_v2_shape))
+        # Order + count + every field except the depth-on-origin must
+        # match. The plans tuple is what the UI / Trace SQLite cache
+        # consume, and it must not flip on metadata.
+        assert len(plans_v1) == len(plans_v2)
+        for a, b in zip(plans_v1, plans_v2):
+            assert a.template_id == b.template_id
+            assert a.params == b.params
+            assert a.risk == b.risk
+            assert a.target_method == b.target_method
+            assert a.source_decision_method == b.source_decision_method
+
+    # --- Pipeline-driven tests (slicer + planner end-to-end) --------------
+
+    def test_pipeline_v2_three_hop_chain_carries_descent_depth_2(self) -> None:
+        """``gateThreeHopChainCapped`` calls a chain of three pure
+        helpers (``pureChainHopOne → pureChainHopTwo → pureChainHopThree
+        → const 0x1``). With ``MAX_SLICE_DEPTH=2`` the descent fires
+        twice and caps at the third hop; the cap-stop terminal is
+        ``pureChainHopThree`` (the call that ``pureChainHopTwo`` makes
+        — the slicer enters its ``_maybe_descend_method_call`` with
+        ``budget.remaining_depth == 0`` and tags it with
+        ``descent_depth=2``). (No Plan A here because both branches
+        return void → no clean DENY/ALLOW split → planner emits zero
+        plans; this test pins the slicer-side wire shape that feeds
+        the planner.)"""
+        sliced = _pipeline_v2()["Lcom/trace/Helpers;->gateThreeHopChainCapped()V"]
+        dp = sliced.decision_points[0]
+        origin = dp.predicate_origin
+        assert isinstance(origin, MethodCallOrigin)
+        assert origin.method.method_name == "pureChainHopThree"
+        assert origin.descent_depth == 2
+
+    def test_pipeline_v2_stateful_callee_blocks_descent_no_depth_tag(self) -> None:
+        """``gateStatefulFieldWriteCallee`` calls
+        ``statefulIputCallee()`` whose body contains an ``iput-boolean``
+        side effect. ``is_stateless`` returns False — descent doesn't
+        fire — the v1 terminal is preserved with ``descent_depth=0``
+        (no spurious depth-1 tag). This is the "v2 stays honest when
+        descent is blocked" guarantee."""
+        sliced = _pipeline_v2()["Lcom/trace/Helpers;->gateStatefulFieldWriteCallee()V"]
+        dp = sliced.decision_points[0]
+        origin = dp.predicate_origin
+        assert isinstance(origin, MethodCallOrigin)
+        assert origin.method.method_name == "statefulIputCallee"
+        assert origin.descent_depth == 0
+
+    def test_pipeline_v1_vs_v2_plans_unchanged_for_external_callee(self) -> None:
+        """``gateBoolPredicate`` calls ``Lcom/trace/Plans;->isPremium()Z``
+        — but ``isPremium``'s body isn't in the fixture's
+        ``classes_by_smali`` index, so v2 descent can't fire (external
+        callee → ``return _tag_descent_depth(origin, budget)`` at the
+        top-level ``current_descent_depth=0`` → no depth tag). v1
+        plans (no descent kwargs) and v2 plans (with descent kwargs)
+        must be byte-identical: same template_ids, same risks, same
+        params, same target methods. Confirms v2 is additive — when
+        descent has nothing to do, the planner sees the same shape
+        it did under v1.
+
+        Also cross-checks that the v2 origin carries
+        ``descent_depth=0`` (not ``None``, not missing) — wire shape
+        must always be present even when no descent fired so the
+        frontend's depth pill renders consistently (i.e. doesn't
+        render at all for these cases).
+        """
+        v1_plans = _plans_for("Lcom/trace/Plans;->gateBoolPredicate()V")
+        v2_md = _pipeline_v2()["Lcom/trace/Plans;->gateBoolPredicate()V"]
+        v2_dp = v2_md.decision_points[0]
+        # Wire-shape check on v2 origin.
+        assert isinstance(v2_dp.predicate_origin, MethodCallOrigin)
+        assert v2_dp.predicate_origin.descent_depth == 0
+        # Plan parity check.
+        v2_plans = plan_bypasses(v2_dp, v2_md.instructions, dict(v2_md.label_index))
+        assert len(v1_plans) == len(v2_plans)
+        for a, b in zip(v1_plans, v2_plans):
+            assert a.template_id == b.template_id
+            assert a.params == b.params
+            assert a.risk == b.risk
+            assert a.target_method == b.target_method
+            assert a.source_decision_method == b.source_decision_method

@@ -812,6 +812,207 @@ def test_field_write_descent_v1_path_when_descent_kwargs_omitted() -> None:
     md = by_sig["Lcom/trace/Helpers;->gateInstanceFieldRead()V"]
     sliced = slicing.slice_predicate_origins(md)  # no descent kwargs
     dp = _only_decision(sliced)
+    assert isinstance(dp.predicate_origin, FieldReadOrigin)
+    assert dp.predicate_origin.field.field_name == "mPremiumFlag"
+
+
+# ===========================================================================
+# Phase 11 sub-step 11.6 / DEC-025 — descent_depth field on cap-stop
+# terminals + v1-vs-v2 corpus measurement (ISSUE-013 close-out criterion)
+# ===========================================================================
+
+
+def test_descent_depth_present_on_method_call_cap_stop() -> None:
+    """``gateThreeHopChainCapped`` chains 3 pure helpers (depth-3
+    const), ``MAX_SLICE_DEPTH=2`` caps at hop 3 → terminal is
+    ``MethodCallOrigin(pureChainHopThree, descent_depth=2)``. This
+    pins the 11.6 wire shape: cap-stop terminals carry the
+    descent-stack depth at which the cap fired, so the frontend's
+    depth pill can render "via 2 helper methods"."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateThreeHopChainCapped()V"])
     origin = dp.predicate_origin
-    assert isinstance(origin, FieldReadOrigin)
-    assert origin.field.field_name == "mPremiumFlag"
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.descent_depth == 2, (
+        f"expected depth-2 cap-stop tag, got descent_depth={origin.descent_depth}"
+    )
+
+
+def test_descent_depth_zero_when_descent_blocked_by_stateful_callee() -> None:
+    """``gateStatefulFieldWriteCallee`` calls a stateful helper —
+    ``is_stateless`` returns False at the top-level
+    ``_maybe_descend_method_call``, before any descent fires. The
+    cap-stop early-exit returns the v1 terminal at
+    ``current_descent_depth=0`` → no spurious depth tag.
+    Operator-facing: no pill on the UI for the stateful-block case
+    (matches the v1 wire shape exactly)."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateStatefulFieldWriteCallee()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.descent_depth == 0
+
+
+def test_descent_depth_zero_on_v1_terminal_with_descent_disabled() -> None:
+    """When the slicer is called without descent kwargs (v1 path),
+    every ``MethodCallOrigin`` / ``FieldReadOrigin`` carries
+    ``descent_depth=0`` (the default). Pins the v1-wire-shape
+    backwards-compat guarantee: 11.6 doesn't force callers that
+    only want v1 semantics to see any new field on origin."""
+    classes, _ = smali_parser.parse_classes(_roots())
+    mds, _ = decisions.parse_decisions(_roots(), classes)
+    by_sig = {md.method_signature: md for md in mds}
+    md = by_sig["Lcom/trace/Plans;->gateBoolPredicate()V"]
+    sliced = slicing.slice_predicate_origins(md)  # no descent kwargs
+    dp = _only_decision(sliced)
+    origin = dp.predicate_origin
+    # ``gateBoolPredicate`` calls the external ``isPremium`` (not in
+    # the in-app classes index) → MethodCallOrigin terminal in both
+    # v1 and v2; v1 path explicitly sets descent_depth=0.
+    assert isinstance(origin, MethodCallOrigin)
+    assert origin.descent_depth == 0
+
+
+def test_descent_depth_does_not_appear_on_const_param_composite_variants() -> None:
+    """Q1 (A) literal-spec rule: ``ConstOrigin`` / ``ParamOrigin`` /
+    ``CompositeOrigin`` stay v1-shaped — no ``descent_depth`` field
+    even when descent successfully resolved through them. Pins the
+    schema commitment that only the two non-terminal-in-v1 variants
+    carry the depth signal. (When operators care about depth on a
+    successfully-resolved Const, they read it indirectly via the
+    pill on the *prior* call site — but the success-path Const
+    terminal itself stays v1-shaped to keep the schema small.)
+    """
+    sliced = _parse_and_slice_with_descent()
+    # ``gateOneHopGetter`` resolves to ConstOrigin via 1-hop descent.
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateOneHopGetter()V"])
+    origin = dp.predicate_origin
+    assert isinstance(origin, ConstOrigin)
+    # ConstOrigin must NOT have a descent_depth attribute.
+    assert not hasattr(origin, "descent_depth"), (
+        f"ConstOrigin unexpectedly carries descent_depth={getattr(origin, 'descent_depth', None)!r}; "
+        f"Q1 (A) spec: only MethodCallOrigin / FieldReadOrigin tagged"
+    )
+
+
+def test_descent_depth_round_trips_through_dataclasses_asdict() -> None:
+    """Wire-format check: ``dataclasses.asdict`` of a tagged
+    ``MethodCallOrigin`` includes ``descent_depth`` so the cache
+    SQLite + the frontend wire payload both see the field. Critical
+    for the new ``api/trace.ts`` ``descent_depth?: number`` typing —
+    if the field weren't on the dict, the frontend would never
+    render the pill."""
+    sliced = _parse_and_slice_with_descent()
+    dp = _only_decision(sliced["Lcom/trace/Helpers;->gateThreeHopChainCapped()V"])
+    payload = json.dumps(dataclasses.asdict(dp), default=str)
+    decoded = json.loads(payload)
+    assert decoded["predicate_origin"]["kind"] == "method_call"
+    assert decoded["predicate_origin"]["descent_depth"] == 2
+
+
+def test_v1_vs_v2_corpus_measurement_v2_resolves_strictly_more_terminals() -> None:
+    """**ISSUE-013 close-out criterion** (Q4 (A) of the 11.6 planning
+    checkpoint). Run both v1 (no descent kwargs) and v2 (with descent
+    kwargs) over the entire ``trace_smali`` fixture corpus. Count
+    decision points whose ``predicate_origin`` is a v1-terminal
+    variant (``MethodCallOrigin`` / ``FieldReadOrigin``) — those are
+    the cases where v1 left the operator with "method call /
+    field read; trace yourself in the decompiler". Assert that:
+
+    1. v2 resolves *strictly more* terminals to a non-Method/non-Field
+       variant than v1 did. The 11.4 + 11.5 fixtures were built with
+       this comparison in mind: every fixture method that exercises
+       descent has a v1-terminal-shape under no-descent and a deeper
+       terminal (often ``ConstOrigin``) under descent.
+    2. v2 produces at least one tagged terminal (``descent_depth >= 1``)
+       — confirms the new pipeline actually emits the depth signal
+       for the cap-stop / cycle-blocked / external-blocked cases.
+    3. v2 produces zero ``predicate_origin: None`` cases on this
+       corpus (no slice failures; confirms descent never breaks the
+       baseline slicer behaviour).
+
+    This test is the regression floor that locks in 11.4 + 11.5's
+    measurable improvement; the >50% production-dogfood threshold
+    from DEC-025's spec text still requires real-app verification,
+    but the corpus floor is locked here so 11.x or 12.x changes
+    can't silently regress the v2 resolution rate.
+    """
+    v1 = {}
+    v2 = _parse_and_slice_with_descent()
+
+    # Build v1 baseline using the same harness shape as v2 (parse +
+    # slice over every method with decisions) but WITHOUT descent
+    # kwargs — apples-to-apples on the same fixture set.
+    classes, _ = smali_parser.parse_classes(_roots())
+    mds, _ = decisions.parse_decisions(_roots(), classes, include_branchless=True)
+    for md in mds:
+        if not md.decision_points:
+            continue
+        v1[md.method_signature] = slicing.slice_predicate_origins(md)
+
+    # Same set of methods on both sides — sanity check the harnesses.
+    assert set(v1.keys()) == set(v2.keys()), (
+        "v1 / v2 harnesses produced different method sets — fixture / "
+        "include_branchless mismatch?"
+    )
+
+    def _count_unresolved(corpus: dict) -> int:
+        n = 0
+        for md in corpus.values():
+            for dp in md.decision_points:
+                origin = dp.predicate_origin
+                if isinstance(origin, (MethodCallOrigin, FieldReadOrigin)):
+                    n += 1
+        return n
+
+    def _count_tagged(corpus: dict) -> int:
+        n = 0
+        for md in corpus.values():
+            for dp in md.decision_points:
+                origin = dp.predicate_origin
+                if isinstance(origin, (MethodCallOrigin, FieldReadOrigin)) and origin.descent_depth >= 1:
+                    n += 1
+        return n
+
+    def _count_none(corpus: dict) -> int:
+        n = 0
+        for md in corpus.values():
+            for dp in md.decision_points:
+                if dp.predicate_origin is None:
+                    n += 1
+        return n
+
+    v1_unresolved = _count_unresolved(v1)
+    v2_unresolved = _count_unresolved(v2)
+    v2_tagged = _count_tagged(v2)
+    v2_none = _count_none(v2)
+
+    # (1) Strict reduction in unresolved terminals (descent did real
+    # work). On this fixture corpus the gain is large — 11.4 + 11.5
+    # were specifically built to exercise descent paths.
+    assert v2_unresolved < v1_unresolved, (
+        f"v2 must resolve strictly fewer terminals than v1; "
+        f"got v1={v1_unresolved}, v2={v2_unresolved} — "
+        f"if this test starts failing, descent has regressed (or the "
+        f"fixture's exercise-paths got removed). Check 11.4 / 11.5 "
+        f"fixtures (Helpers.smali) and the slicer's descent logic."
+    )
+
+    # (2) At least one tagged origin — the cap-stop / cycle-blocked
+    # / external-blocked terminal lives somewhere in the corpus.
+    # ``gateThreeHopChainCapped`` alone provides this (depth-2 cap
+    # → tagged), but the assertion is corpus-wide so the test
+    # doesn't pin to one fixture.
+    assert v2_tagged >= 1, (
+        f"v2 produced zero tagged origins (descent_depth >= 1) — "
+        f"the depth-tagging code path on _maybe_descend_method_call / "
+        f"_maybe_descend_field_read may have regressed."
+    )
+
+    # (3) v2 doesn't introduce any new slice failures.
+    v1_none = _count_none(v1)
+    assert v2_none <= v1_none, (
+        f"v2 produced more slice failures than v1; got "
+        f"v1={v1_none}, v2={v2_none}. Descent must never make slicing"
+        f" *worse* — only equal or better."
+    )

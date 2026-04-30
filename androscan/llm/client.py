@@ -192,13 +192,24 @@ def stream_complete(
     model_name = model or getattr(config, "ollama_model", "qwen3.5:35b") or "qwen3.5:35b"
     temperature = getattr(config, "ollama_temperature", 0.2)
     num_predict = getattr(config, "ollama_num_predict", 8192)
+    # Phase 11 sub-step 11.6 / DEC-025 — forward num_ctx to Ollama
+    # alongside num_predict / temperature. Ollama's default context
+    # window is 8192; v2's deeper inter-procedural slicer chains can
+    # squeeze that, so the operator-tunable Config knob is bumped to
+    # 16384 by default. ``getattr`` fallback preserves callers using
+    # a ``MagicMock`` config in tests.
+    num_ctx = getattr(config, "ollama_num_ctx", 16384)
     timeout = OLLAMA_TIMEOUT_TIERS[-1]
 
     payload: dict[str, Any] = {
         "model": model_name,
         "messages": messages,
         "stream": True,
-        "options": {"temperature": temperature, "num_predict": num_predict},
+        "options": {
+            "temperature": temperature,
+            "num_predict": num_predict,
+            "num_ctx": num_ctx,
+        },
     }
     if response_format:
         payload["format"] = response_format
@@ -243,6 +254,9 @@ def _complete_ollama(
     url = f"{base_url}/api/chat"
     model_name = model or getattr(config, "ollama_model", "qwen3.5:35b") or "qwen3.5:35b"
     temperature = getattr(config, "ollama_temperature", 0.2)
+    # Phase 11 sub-step 11.6 / DEC-025 — see ``_stream_ollama`` for
+    # the rationale on the num_ctx forward.
+    num_ctx = getattr(config, "ollama_num_ctx", 16384)
 
     timeout_idx = 0
     num_predict_idx = 0
@@ -258,6 +272,7 @@ def _complete_ollama(
             "options": {
                 "temperature": temperature,
                 "num_predict": current_num_predict,
+                "num_ctx": num_ctx,
             },
         }
         if response_format:

@@ -11,11 +11,16 @@
  *     with a higher hop count *may* surface additional decisions
  *     (subject to the hard cap).
  *   * ``TraceIncompleteBanner`` — at least one decision in the closure
- *     has ``predicate_origin === null`` (the slicer hit ``max_walk``
- *     or the predicate came from a path the v1 intra-procedural
- *     slicer doesn't follow — see DEC-024). Distinct from
- *     ``truncated``: the closure walk may have completed but still
- *     produced under-determined gates.
+ *     has ``predicate_origin === null`` (the slicer hit ``max_walk``,
+ *     the slicer's bounded inter-procedural descent budget exhausted,
+ *     or the predicate came from a path the slicer doesn't follow —
+ *     see DEC-024 + DEC-025). Distinct from ``truncated``: the
+ *     closure walk may have completed but still produced under-
+ *     determined gates. Phase 11 sub-step 11.6 — the v2 slicer's
+ *     bounded inter-procedural descent (sub-steps 11.4 + 11.5)
+ *     reduces the incidence of this banner; the copy now reflects
+ *     v2's improved coverage and points operators at the depth pill
+ *     on resolved cards as the visible signal that descent did fire.
  *
  * Both render as a single yellow/orange notice line; the LabTraceMode
  * shell stacks them above the timeline if the anchor's flag is set.
@@ -50,9 +55,14 @@ export function TraceIncompleteBanner() {
   return (
     <div className="trace-banner trace-banner-incomplete" role="status">
       <strong>Some predicate origins unresolved.</strong>{" "}
-      The intra-procedural slicer couldn't trace at least one gate's
-      predicate to a concrete source (method call, field read, constant,
-      parameter, or composite). Treat the affected branch outcomes as
+      The slicer couldn't trace at least one gate's predicate to a
+      concrete source (method call, field read, constant, parameter,
+      or composite) — its bounded inter-procedural descent (helper-
+      method walk + same-class field-write walk) hit a depth cap, a
+      stateful / external / reflective callee, or a path the slicer
+      doesn't follow. Cards that <em>did</em> resolve via descent show
+      a "via N helper method(s)" / "via N field write(s)" pill next
+      to the origin tag. Treat the affected branch outcomes as
       heuristic; the LLM-refined verdict (if any) is your strongest
       signal.
     </div>
