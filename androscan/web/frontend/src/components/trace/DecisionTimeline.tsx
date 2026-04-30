@@ -26,11 +26,19 @@
 
 import { useState } from "react";
 import type { DecisionPoint } from "../../api/trace";
+import { useWorkbench } from "../../context/WorkbenchContext";
 import { BranchOutcomeBadge } from "./BranchOutcomeBadge";
 import { PredicateOriginView } from "./PredicateOriginView";
 
 const LLM_RECLASSIFIED_CONFIDENCE = 0.75;
 const LOW_CONFIDENCE_THRESHOLD = 0.6;
+// Phase 11 sub-step 11.1: gate the operator-action hint + the soft
+// "candidate gate" framing on a confident, non-neutral classifier
+// verdict. Threshold 0.85 mirrors the upper band of the heuristic
+// classifier's confidence distribution per `trace_behavior.py` —
+// well above the 0.75 LLM-reclassified stamp so we don't flag every
+// LLM-touched gate as "candidate".
+const HIGH_CONFIDENCE_THRESHOLD = 0.85;
 
 type Props = {
   decisions: DecisionPoint[];
@@ -61,16 +69,27 @@ export function DecisionTimeline({
     );
   }
   return (
-    <ol className="trace-decision-timeline">
-      {decisions.map((d, i) => (
-        <DecisionCard
-          key={`${d.method.class_name}.${d.method.method_name}#${d.instruction_index}#${i}`}
-          decision={d}
-          lowConfidence={lowConfidenceIndices.has(d.instruction_index)}
-          appId={appId}
-        />
-      ))}
-    </ol>
+    <>
+      {/* Phase 11 sub-step 11.1: inline disclosure block clarifying the
+          ordering contract. Operators reading the timeline in v1
+          frequently mistook the visual ordering for runtime execution
+          order; the static-traversal-order framing matches the actual
+          BFS traversal performed by the slicer. */}
+      <p className="trace-decision-timeline-disclosure">
+        Listed in static traversal order (BFS over the call graph, then
+        source order within each method) — not runtime execution order.
+      </p>
+      <ol className="trace-decision-timeline">
+        {decisions.map((d, i) => (
+          <DecisionCard
+            key={`${d.method.class_name}.${d.method.method_name}#${d.instruction_index}#${i}`}
+            decision={d}
+            lowConfidence={lowConfidenceIndices.has(d.instruction_index)}
+            appId={appId}
+          />
+        ))}
+      </ol>
+    </>
   );
 }
 
@@ -89,6 +108,7 @@ type CardProps = {
 
 function DecisionCard({ decision, lowConfidence, appId }: CardProps) {
   const [expanded, setExpanded] = useState(false);
+  const { setPendingHookPrefill, setLabMode } = useWorkbench();
 
   const outcome = decision.branch_outcome;
   const llmRefined = !!outcome &&
@@ -100,6 +120,51 @@ function DecisionCard({ decision, lowConfidence, appId }: CardProps) {
   // dims the card but the per-branch badges render normally.
   const currentlyLowConfidence = !!outcome &&
     outcome.confidence < LOW_CONFIDENCE_THRESHOLD;
+
+  // Phase 11 sub-step 11.1: a "candidate gate" is a confident,
+  // operator-actionable verdict — confidence ≥ 0.85 AND at least one
+  // branch decided allow/deny (not just neutral). Neutral-only
+  // outcomes get no hint because there's nothing to "flip" — the
+  // operator should investigate the predicate, not stage a bypass.
+  const isCandidateGate = !!outcome &&
+    outcome.confidence >= HIGH_CONFIDENCE_THRESHOLD &&
+    outcome.verdicts.some((v) => v.verdict === "deny" || v.verdict === "allow");
+
+  // "Verify with runtime trace" handler — same `pendingHookPrefill`
+  // plumbing 10.7 established for `BypassPlanCard.onStage`. Stages
+  // the universal `entry_exit_log` template against the decision's
+  // enclosing method so the operator can confirm the gate actually
+  // executes at runtime (and inspect the receiver / args / return
+  // value via the hook's emitted events).
+  //
+  // NOTE: the 11.1 spec text in TASKS.md uses `label` as shorthand for
+  // the template's parameter; the actual `entry_exit_log` template
+  // declares its parameter as `event_label` (per
+  // `androscan/adapters/frida_hooks/entry_exit_log.py`). We use the
+  // real param name so the prefilled HookBuilder form is valid on
+  // arrival — otherwise the operator would land on a form with a
+  // missing-required-field error.
+  const onVerify = () => {
+    if (!appId) return;
+    // Sanitise label for grep-friendliness: Java constructors stringify
+    // as `<init>` / `<clinit>` and the angle brackets are awkward in
+    // the trace pane's filter UX.
+    const safeMethodName = decision.method.method_name.replace(/[<>]/g, "");
+    const eventLabel = `${safeMethodName}_verify`;
+    const sourceLabel =
+      `Trace verify: ${decision.method.class_name}.${decision.method.method_name}`;
+    setPendingHookPrefill({
+      appId,
+      templateId: "entry_exit_log",
+      params: {
+        class_name: decision.method.class_name,
+        method_name: decision.method.method_name,
+        event_label: eventLabel,
+      },
+      sourceLabel,
+    });
+    setLabMode("manual-hooks");
+  };
 
   return (
     <li
@@ -154,14 +219,34 @@ function DecisionCard({ decision, lowConfidence, appId }: CardProps) {
         )}
       </header>
 
-      <button
-        type="button"
-        className="trace-decision-expand"
-        onClick={() => setExpanded((e) => !e)}
-        aria-expanded={expanded}
-      >
-        {expanded ? "Hide details" : "Show predicate origin"}
-      </button>
+      {isCandidateGate && (
+        <p className="trace-decision-action-hint">
+          This is a candidate gate — review the bypass plans below or
+          stage <code>force_return_value</code> to flip the verdict.
+        </p>
+      )}
+
+      <div className="trace-decision-actions">
+        <button
+          type="button"
+          className="trace-decision-expand"
+          onClick={() => setExpanded((e) => !e)}
+          aria-expanded={expanded}
+        >
+          {expanded ? "Hide details" : "Show predicate origin"}
+        </button>
+        <button
+          type="button"
+          className="trace-decision-verify-btn"
+          onClick={onVerify}
+          disabled={!appId}
+          title={appId
+            ? "Pre-fill Manual Hooks with entry_exit_log on this method and switch to Manual Hooks mode"
+            : "No app selected"}
+        >
+          Verify with runtime trace
+        </button>
+      </div>
 
       {expanded && (
         <div className="trace-decision-body">

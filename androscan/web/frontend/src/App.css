@@ -5058,6 +5058,75 @@ code { color: var(--accent); }
   border-top: 1px dashed var(--border);
 }
 
+/* Phase 11 sub-step 11.1 — operator-UX clarity polish on the
+   Decision timeline. Three namespaces:
+   - `.trace-decision-timeline-disclosure` — inline disclosure block
+     above the <ol>, accent-blue tinted, clarifies the static-traversal
+     ordering contract (operators in v1 mistook visual order for
+     runtime execution order).
+   - `.trace-decision-action-hint` — one-line operator-action hint
+     above each high-confidence card body, soft-green filled.
+   - `.trace-decision-verify-btn` — "Verify with runtime trace" button
+     in the actions row, accent-blue outlined to mirror the
+     `.trace-bypass-plan-stage` affordance density. */
+.trace-decision-timeline-disclosure {
+  font-size: 0.75rem;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-left: 2px solid var(--accent);
+  padding: 0.4rem 0.6rem;
+  margin: 0 0 0.6rem 0;
+  line-height: 1.4;
+  border-radius: 0 3px 3px 0;
+}
+
+.trace-decision-action-hint {
+  font-size: 0.78rem;
+  color: var(--text);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+  border-left-width: 3px;
+  padding: 0.35rem 0.55rem;
+  margin: 0;
+  line-height: 1.4;
+  border-radius: 3px;
+}
+
+.trace-decision-action-hint code {
+  font-size: 0.72rem;
+  padding: 0.05rem 0.25rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+}
+
+.trace-decision-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.trace-decision-verify-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  border-radius: 3px;
+  padding: 0.15rem 0.5rem;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.78rem;
+}
+
+.trace-decision-verify-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+}
+
+.trace-decision-verify-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .trace-decision-details {
   display: grid;
   grid-template-columns: max-content 1fr;
