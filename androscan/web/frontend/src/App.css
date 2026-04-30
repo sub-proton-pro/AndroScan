@@ -4830,6 +4830,20 @@ code { color: var(--accent); }
   color: var(--text);
 }
 
+/* Flex wrapper that lets the chevron-toggle button (``.logcat-toggle-btn``)
+ * sit immediately to the left of the section heading. Used by the
+ * collapsible Decision timeline header in LabTraceMode. */
+.trace-section-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0 0 0.5rem 0;
+}
+
+.trace-section-head h3 {
+  margin: 0;
+}
+
 /* ----- BehaviorAnchorCard ----- */
 
 .trace-anchor-card {

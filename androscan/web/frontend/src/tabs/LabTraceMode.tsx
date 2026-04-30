@@ -44,6 +44,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { IconChevronDown, IconChevronUp } from "../components/Icons";
 import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { DecisionTimeline } from "../components/trace/DecisionTimeline";
@@ -502,6 +503,13 @@ type ResultProps = {
 };
 
 function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultProps) {
+  // Decision timeline collapse state. Lives at the parent level (rather
+  // than inside ``DecisionTimeline``) so the toggle can sit next to the
+  // section header — matches the chevron-before-title pattern the
+  // HookBuilder / AdbShell / Chat sections use, and keeps the section
+  // chrome (count, future actions) co-located with the toggle.
+  const [decisionsCollapsed, setDecisionsCollapsed] = useState(false);
+
   if (state.kind === "idle") {
     return (
       <p className="trace-empty muted small">
@@ -553,12 +561,37 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
       <BehaviorAnchorCard anchor={anchor} source={from} />
 
       <section className="trace-section">
-        <h3>Decision timeline ({anchor.decisions.length})</h3>
-        <DecisionTimeline
-          decisions={anchor.decisions}
-          lowConfidenceIndices={lowConfidenceSet}
-          appId={appId}
-        />
+        <header className="trace-section-head">
+          <button
+            type="button"
+            className="logcat-toggle-btn"
+            onClick={() => setDecisionsCollapsed((c) => !c)}
+            aria-expanded={!decisionsCollapsed}
+            aria-controls="trace-decision-timeline-body"
+            aria-label={
+              decisionsCollapsed
+                ? "Expand decision timeline"
+                : "Collapse decision timeline"
+            }
+            title={
+              decisionsCollapsed
+                ? "Expand decision timeline"
+                : "Collapse decision timeline"
+            }
+          >
+            {decisionsCollapsed ? <IconChevronUp size={10} /> : <IconChevronDown size={10} />}
+          </button>
+          <h3>Decision timeline ({anchor.decisions.length})</h3>
+        </header>
+        {!decisionsCollapsed && (
+          <div id="trace-decision-timeline-body">
+            <DecisionTimeline
+              decisions={anchor.decisions}
+              lowConfidenceIndices={lowConfidenceSet}
+              appId={appId}
+            />
+          </div>
+        )}
       </section>
 
       <section className="trace-section">
