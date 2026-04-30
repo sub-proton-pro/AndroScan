@@ -413,6 +413,34 @@ Use the following format for new entries:
 
 ---
 
+### ISSUE-015: Settings tab "Save" silently strips comments + blank lines + quotes from `global_config.yaml`
+- status: Open
+- impact: Medium
+- area: web / Settings / config persistence
+- introduced / observed: 2026-04-30 (surfaced when `global_config.yaml` appeared as a 50-line destructive working-tree change after a Settings UI interaction during a Hook Lab UX session; the underlying behaviour predates the observation — `dump_to_yaml` has used `yaml.safe_dump` since the Settings UI's form-save path was first wired in Phase 6 / sub-step DEC-019).
+- summary:
+  Two write paths in `androscan/config/loader.py` round-trip the YAML through PyYAML's `yaml.safe_dump(..., sort_keys=False, default_flow_style=False)`:
+  (1) `dump_to_yaml(config_path, partial)` at line 602 — invoked by `POST /api/settings/global` (the Settings tab's per-section "Save" button);
+  (2) `restore_defaults_yaml(config_path)` at line 709 — invoked by the Settings tab's "Reset to defaults" button.
+  PyYAML's parse layer (`yaml.safe_load`) does not retain comment positions, blank-line positions, original quoting style, or original Unicode encoding; the round-trip dump therefore (a) **strips every comment** including the ten-or-so multi-line documentation blocks that explain field semantics (e.g. the `bypass_risk_max` block, the `rag` provider block, the `frida.trace_ring_buffer_size` clamp note); (b) **removes blank lines** that visually separate sections; (c) **drops "unnecessary" quotes** around strings PyYAML deems unambiguous (`"http://localhost:11434"` → `http://localhost:11434`, `"qwen3.5:35b"` → `qwen3.5:35b`); (d) **escapes non-ASCII characters to `\uXXXX`** because `allow_unicode` defaults to `False` (so the `─` character used for `output.section_rule_char` becomes the unreadable `"\u2500"` escape). The sibling raw-text path `write_raw_yaml` (line ~688) is unaffected — it does `f.write(raw_text)` and preserves the operator's text byte-for-byte. The `dump_to_yaml` docstring says "user comments aren't *removed*" but that promise only applies to **unknown keys** (those are merge-preserved into the output dict before the dump); it does NOT apply to comments, which are unrecoverable after the round-trip. The docstring is misleading on this point.
+- why it matters:
+  The repo's `global_config.yaml` is the canonical, in-tree, self-documenting source of truth for every workbench config knob — comments explain not just what each field does but the trade-offs (e.g. the `max_hops_default` doc block explains the LLM-token / per-method-static-analysis cost trade-off). A single Settings-form save destroys that documentation in the operator's local checkout; if they then commit the change (it shows up as a 50-line diff that's easy to mistake for a deliberate edit when reviewing `git status`), the loss propagates into the repo. Even in single-operator use, the next time the operator opens the file to tune a knob they've lost the inline guidance that told them what the knob does. Trade-off explanation losses compound: future contributors reading the file see only `medium` instead of `# bypass_risk_max: maximum risk level the planner will emit ...`. Failure mode is silent — the form save returns `200 OK`, the values still apply, no warning surfaces in the UI.
+- current workaround:
+  Two options:
+  (1) Use the Settings tab's **Raw YAML** sub-section ("Edit `global_config.yaml` directly. Validation runs on save —" — `SettingsTab.tsx:273`) instead of the form sub-sections. The Raw YAML save path goes through `write_raw_yaml` which preserves the operator's exact text. Validation still runs (the same `Config.from_dict` round-trip) so malformed YAML is rejected before the file is touched.
+  (2) `git checkout -- global_config.yaml` immediately if the destructive reformat shows up unintentionally — the documented version in HEAD is the source of truth and the form-save's value changes can be re-applied through the Raw YAML path or by hand-editing.
+- recommended fix:
+  Switch `dump_to_yaml` and `restore_defaults_yaml` from PyYAML's `yaml.safe_dump` to **ruamel.yaml** in round-trip mode. ruamel.yaml is a YAML 1.2 implementation specifically designed to preserve comments, blank lines, original quoting style, and Unicode characters across a parse → mutate → dump round-trip. Drop-in replacement of ~10 LOC per function: `from ruamel.yaml import YAML; yaml_rt = YAML(typ="rt"); yaml_rt.preserve_quotes = True; yaml_rt.allow_unicode = True; yaml_rt.indent(mapping=2, sequence=4, offset=2); yaml_rt.dump(merged_dict, file_handle)`. Add `ruamel.yaml >= 0.18` to `pyproject.toml`'s install_requires (well-maintained, ~250 KB pure-Python wheel, no compiled deps — fine for the workbench's air-gap-friendly posture). The merge step in `dump_to_yaml` should switch from `existing.update(partial)` (which assumes a plain dict) to `existing[k] = v` per-key on the `CommentedMap` ruamel returns, so per-key comments survive value mutations (ruamel attaches comments to the surrounding `CommentedMap` / `CommentedSeq` nodes, not to the dict literal). Validation (the existing `Config.from_dict` call) runs unchanged because `Config.from_dict` accepts any `Mapping` and `CommentedMap` is one. While in there, also fix the misleading `dump_to_yaml` docstring to spell out that "comments preserved" depends on the YAML library, not on the merge step. Land alongside any future Settings-UI sweep, or as a standalone P3 cleanup PR (~30 LOC + 1 dep + 2 unit tests asserting comments round-trip).
+- related tasks:
+  - `docs/TASKS.md` (no dedicated row yet; capture as a P3 cleanup when next touching Settings or config plumbing).
+- related docs:
+  - `androscan/config/loader.py` (`dump_to_yaml` at line 602, `restore_defaults_yaml` at line 709 — both call sites of `yaml.safe_dump`).
+  - `androscan/web/settings_routes.py` (line 171 — the `POST /api/settings/global` route handler that invokes `dump_to_yaml`).
+  - `androscan/web/frontend/src/tabs/SettingsTab.tsx` (line 273 — the Raw YAML section copy operators currently fall back to as a workaround).
+  - `global_config.yaml` (the documented in-tree source of truth — restore via `git checkout --` if a form save destroys it).
+
+---
+
 ## 7. Accepted limitations
 
 Use this section for limitations that are currently acceptable and not immediate defects.
