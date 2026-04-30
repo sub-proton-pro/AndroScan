@@ -1,3 +1,4 @@
+import { AppPicker } from "./components/AppPicker";
 import { HealthDot } from "./components/HealthDot";
 import { TabBar } from "./components/TabBar";
 import { WorkbenchProvider, useWorkbench } from "./context/WorkbenchContext";
@@ -26,8 +27,13 @@ function ActiveTab() {
 
 function HeaderStatus() {
   const { status, setTab } = useWorkbench();
+  // Layout: [AppPicker | HealthDot | status text], all pinned to the
+  // right edge by ``.status``'s ``margin-left: auto``. AppPicker shares
+  // ``appId`` with the Reports sidebar via WorkbenchContext, so picking
+  // from either surface updates the other in lockstep.
   return (
     <span className="status">
+      <AppPicker />
       <HealthDot onClick={() => setTab("settings")} />
       {status}
     </span>

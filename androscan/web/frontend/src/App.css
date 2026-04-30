@@ -1001,6 +1001,50 @@ body {
   font-size: 0.75rem;
   color: var(--muted);
   margin-left: auto;
+  /* Right-side cluster: [AppPicker | HealthDot | status text]. inline-flex
+   * keeps the select + dot vertically centred without disturbing the
+   * trailing status string's text flow. */
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Global app selector in the header (App.tsx → HeaderStatus). Shares
+ * ``appId`` with the Reports sidebar via WorkbenchContext. */
+.app-picker {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 22px 3px 8px;
+  font: inherit;
+  font-size: 0.78rem;
+  line-height: 1.2;
+  max-width: 260px;
+  cursor: pointer;
+  /* Hand-roll the chevron so the control reads as a dropdown in the
+   * dark theme without depending on the OS-default arrow colour, which
+   * is unreadable on var(--panel-2) in some browsers. */
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23c0c4cc' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'><polyline points='2.5,4.5 6,8 9.5,4.5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  background-size: 10px 10px;
+}
+
+.app-picker:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.app-picker:focus-visible {
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 1px;
+}
+
+.app-picker:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* ----- Buttons ----- */
