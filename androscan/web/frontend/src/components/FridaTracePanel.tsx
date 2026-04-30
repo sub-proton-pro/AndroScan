@@ -19,14 +19,29 @@
  *     ``frida_hooks/entry_exit_log.py``); filtering applies to the
  *     full client buffer, then the cap is applied to the result so
  *     filter matches in older events still surface;
- *   * each row is a two-line stack: a single-line metadata header
- *     (timestamp / kind / phase / label / abbreviated summary) and a
- *     collapsible pretty-printed JSON block below. JSON is
- *     default-collapsed for every event; click the chevron to expand.
- *     The summariser surfaces the override-template fields
- *     (``receiver`` / ``arg`` / ``matched`` / ``forced_return`` /
- *     ``target_literal`` / ``overloads_hooked``) inline so the
- *     pentest-relevant info is visible without expanding;
+ *   * each row is a single grid row: chevron + ts + kind + phase +
+ *     label + a compact unquoted-key JSON serialisation of the full
+ *     payload (``{label:"x",phase:"entry",class:"...",method:"...",
+ *     args:[...]}``). The chevron toggles the payload's wrap mode,
+ *     not its content — collapsed = ``white-space: nowrap`` +
+ *     ``text-overflow: ellipsis`` so the row is exactly one line and
+ *     long payloads get a CSS-native ``…``; expanded = ``white-space:
+ *     normal`` so the same JSON wraps onto as many lines as needed.
+ *     One-row collapsed + N-row expanded comes from the same DOM
+ *     (the JSON is always present in full); no separate ``<pre>``
+ *     block, no per-template summariser. Operators see the entire
+ *     payload's keys/values immediately on hover (``title={text}``
+ *     surfaces the full JSON in the browser tooltip even when the
+ *     row is clipped).
+ *
+ *     "Unquoted keys" matches the user's sketch (``{key:"v"}`` rather
+ *     than ``{"key":"v"}``) and saves ~2 chars per key, which matters
+ *     for the one-line collapsed preview where ellipsis-truncation is
+ *     the only thing standing between a useful preview and a
+ *     ``{"label"…`` cliff. Identifier-only keys are unquoted; any key
+ *     with a non-identifier character (``"class.name"``, ``"foo bar"``,
+ *     etc.) falls back to JSON-quoted form for unambiguity. The inline
+ *     tokeniser handles both forms;
  *   * pause / resume / clear buttons (uses the same hook's APIs);
  *   * Export button: anchor with ``download`` attribute pointing at
  *     ``/api/frida/sessions/:id/export`` so the browser streams the
@@ -354,13 +369,20 @@ function matchesEvent(ev: TraceEvent, needle: string): boolean {
 // ---------------------------------------------------------------------------
 // TraceRow — one event in the list.
 //
-// Two-line stack: a single-line metadata header (timestamp / kind /
-// phase / label / abbreviated summary) and an optional pretty-printed
-// JSON block below. JSON is default-collapsed; the chevron toggles
-// it. Collapsing the JSON block from the parent's expanded set means
-// re-renders cost a single boolean prop change per row, not a Set
-// recomputation per row — important because the visible window can
-// hold up to ``RENDER_CAP + extraOlder`` rows.
+// Single grid row: chevron + ts + kind + phase + label + compact JSON
+// preview of the full payload. The JSON is always rendered in full;
+// the chevron toggles a CSS modifier (``trace-row-expanded``) on the
+// row that switches the payload column's wrap mode between
+// ``nowrap+ellipsis`` (collapsed → one-line preview, browser shows ``…``
+// when clipped) and ``normal+overflow-wrap:anywhere`` (expanded → wraps
+// onto N lines). Same DOM both states, only CSS differs — re-renders
+// cost a single boolean prop change per row, not a Set recomputation,
+// which matters because the visible window can hold up to
+// ``RENDER_CAP + extraOlder`` rows.
+//
+// ``title={compact}`` surfaces the full JSON in a browser tooltip on
+// hover even when the row is collapsed-and-clipped, so the operator
+// can preview a long payload without committing to expanding it.
 
 type TraceRowProps = {
   event: TraceEvent;
@@ -372,17 +394,19 @@ function TraceRow({ event, expanded, onToggle }: TraceRowProps) {
   const ts = formatTs(event.ts);
   const label = extractLabel(event);
   const phase = extractPhase(event);
-  const summary = summarisePayload(event.payload);
+  const compact = useMemo(() => safeCompactPayload(event.payload), [event.payload]);
   return (
-    <div className={`trace-row trace-row-${event.kind}`}>
+    <div
+      className={`trace-row trace-row-${event.kind}${expanded ? " trace-row-expanded" : ""}`}
+    >
       <div className="trace-row-meta">
         <button
           type="button"
           className="trace-payload-toggle"
           onClick={onToggle}
           aria-expanded={expanded}
-          aria-label={expanded ? "Collapse full payload" : "Expand full payload"}
-          title={expanded ? "Hide full JSON payload" : "Show full JSON payload"}
+          aria-label={expanded ? "Collapse payload" : "Expand payload"}
+          title={expanded ? "Wrap to one line" : "Wrap to multiple lines"}
         >
           {/* Plain unicode triangles instead of an Icon component:
            *  these only ever appear inside the trace pane and the
@@ -397,13 +421,10 @@ function TraceRow({ event, expanded, onToggle }: TraceRowProps) {
         <span className={`trace-kind trace-kind-${event.kind}`}>{event.kind}</span>
         {phase && <span className={`trace-phase trace-phase-${phase}`}>{phase}</span>}
         {label && <span className="trace-label">{label}</span>}
-        <span className="trace-payload">{summary}</span>
+        <span className="trace-payload" title={compact}>
+          <JsonView text={compact} />
+        </span>
       </div>
-      {expanded && (
-        <pre className="trace-row-payload">
-          <JsonView value={event.payload} />
-        </pre>
-      )}
     </div>
   );
 }
@@ -430,82 +451,70 @@ function extractPhase(ev: TraceEvent): string | null {
   return null;
 }
 
-function summarisePayload(payload: unknown): string {
-  if (payload == null) return "";
-  if (typeof payload === "string") return payload;
-  if (typeof payload === "number" || typeof payload === "boolean") return String(payload);
-  if (typeof payload === "object") {
-    const p = payload as Record<string, unknown>;
-    // Pull pentester-relevant fields up front. Two field-set
-    // generations live here today and both are surfaced:
-    //
-    //   * v1 observation templates (``entry_exit_log`` /
-    //     ``scope_inspector`` / ``crypto`` / ``shared_preferences`` /
-    //     ``intent``) emit ``method`` + ``args`` (array) + ``return``;
-    //
-    //   * Phase 10 override templates (``force_return_value`` /
-    //     ``force_method_skip`` / ``force_string_compare_equal``) emit
-    //     ``receiver`` + ``arg`` (singular) + ``matched`` +
-    //     ``forced_return`` and ``ready``-phase metadata
-    //     (``target_literal`` / ``overloads_hooked``) — without these
-    //     fields surfaced inline, the bypass payoff (e.g. the secret
-    //     PIN leaked in the ``arg`` field of a ``force_string_compare_equal``
-    //     event) was hidden behind an "expand JSON" click.
-    //
-    // Order matters: the pieces concatenated here read left-to-right
-    // as a sentence, so we put identification (class/method) first,
-    // then the operator-supplied target literal (if any), then the
-    // observed runtime values (receiver / arg / args), then the
-    // verdict (matched / return / forced_return / error / overloads),
-    // and finally any free-form message.
-    const head: string[] = [];
-    if (typeof p.method === "string") head.push(`${p.class ?? "?"}.${p.method}`);
-    if (typeof p.target_literal === "string")
-      head.push(`target=${stringifyValue(p.target_literal)}`);
-    if (typeof p.receiver === "string")
-      head.push(`receiver=${stringifyValue(p.receiver)}`);
-    if (typeof p.arg === "string") head.push(`arg=${stringifyValue(p.arg)}`);
-    if (Array.isArray(p.args)) head.push(`args=${stringifyArgs(p.args)}`);
-    if (typeof p.matched === "string") head.push(`matched=${p.matched}`);
-    if (typeof p.return !== "undefined") head.push(`return=${stringifyValue(p.return)}`);
-    if (typeof p.forced_return !== "undefined")
-      head.push(`forced_return=${stringifyValue(p.forced_return)}`);
-    if (typeof p.error === "string") head.push(`error=${p.error}`);
-    if (typeof p.overloads === "number") head.push(`overloads=${p.overloads}`);
-    if (typeof p.overloads_hooked === "number")
-      head.push(`overloads_hooked=${p.overloads_hooked}`);
-    if (typeof p.message === "string") head.push(p.message);
-    if (head.length > 0) return head.join("  ");
-    try {
-      // Last-resort fallback for payloads with NO recognised fields
-      // (custom-template hooks, future template payload shapes the
-      // summariser hasn't been taught about). The full pretty JSON is
-      // already available via the row's expand chevron, so the
-      // summary line just needs to give the operator enough to know
-      // the row exists — the compact one-line stringify is fine.
-      return JSON.stringify(p);
-    } catch {
-      return String(p);
-    }
+// Compact unquoted-key JSON serialiser used by the trace-pane preview.
+//
+// Output shape: ``{label:"x",phase:"entry",class:"...",method:"...",
+// args:["..."],return:1234}`` — identifier-only keys are left
+// unquoted (saves ~2 chars per key vs. strict JSON, which matters for
+// the one-line collapsed preview that gets ellipsis-clipped); keys
+// with a non-identifier character (``"class.name"``, keys with
+// spaces, etc.) fall back to JSON-quoted form for unambiguity.
+//
+// String values stay quoted (they're the only token where quotes are
+// load-bearing — without them ``key:value`` would be ambiguous between
+// a string-valued key and a bool/number/null-valued one). Numbers,
+// booleans, and ``null`` use their native string form. Arrays render
+// the same way they would in JSON (``[v,v,v]``). Nested objects
+// recurse.
+//
+// ``undefined`` is rendered as the literal string ``undefined`` —
+// shouldn't reach us from the backend (Python's ``json.dumps`` doesn't
+// produce it) but we handle it defensively in case a future client-side
+// payload-fixup step introduces it.
+function compactJsonText(v: unknown): string {
+  if (v === null) return "null";
+  if (v === undefined) return "undefined";
+  if (typeof v === "string") return JSON.stringify(v);
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) return `[${v.map(compactJsonText).join(",")}]`;
+  if (typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return `{${Object.entries(o)
+      .map(([k, x]) => `${jsonKey(k)}:${compactJsonText(x)}`)
+      .join(",")}}`;
   }
-  return String(payload);
+  // Symbol / function / etc. — JSON.stringify would return undefined
+  // for these. Fall back to the value's String() form so the row
+  // renders SOMETHING instead of a confusing empty payload column.
+  return JSON.stringify(v) ?? String(v);
 }
 
-function stringifyArgs(args: unknown[]): string {
-  if (args.length === 0) return "()";
-  return `(${args.map(stringifyValue).join(", ")})`;
+// Identifier-safe keys (matches what's normally allowed for unquoted
+// object literal property names in JS — letters, digits, ``_``, ``$``;
+// can't start with a digit) get rendered without quotes. Anything else
+// — including the empty string, keys containing dots, spaces, dashes,
+// or any non-ASCII character — falls back to ``JSON.stringify(k)``
+// which gives us the standard ``"..."`` form with proper escaping.
+function jsonKey(k: string): string {
+  return /^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k);
 }
 
-function stringifyValue(v: unknown): string {
-  if (typeof v === "string") {
-    return v.length > 80 ? `${v.slice(0, 77)}…` : v;
-  }
-  if (v == null || typeof v === "number" || typeof v === "boolean") return String(v);
+function safeCompactPayload(value: unknown): string {
+  // Two layers of defence: the first try block catches anything the
+  // recursive walker chokes on (cycles → ``InternalError: too much
+  // recursion``, exotic objects whose property access throws, etc.);
+  // the second falls back to ``JSON.stringify`` which has its own
+  // cycle detection. Both failing simultaneously would be a very
+  // sick payload — coerce to ``String`` so the row at least renders
+  // an opaque marker instead of throwing during render.
   try {
-    const s = JSON.stringify(v);
-    return s.length > 80 ? `${s.slice(0, 77)}…` : s;
+    return compactJsonText(value);
   } catch {
-    return String(v);
+    try {
+      return JSON.stringify(value) ?? String(value);
+    } catch {
+      return String(value);
+    }
   }
 }
 
@@ -535,25 +544,30 @@ function eventKey(ev: TraceEvent): string {
 }
 
 // ---------------------------------------------------------------------------
-// JsonView — pretty-print + syntax-highlight a payload as colored spans.
+// JsonView — syntax-highlight a JSON-ish text string as colored spans.
+//
+// Takes pre-serialised text (not a raw value) because the trace panel
+// already needs the same string for the parent ``<span>``'s ``title``
+// attribute (tooltip-on-hover for clipped rows) and recomputing the
+// serialisation here would mean two ``compactJsonText`` calls per row
+// for nothing — better to serialise once in ``TraceRow`` and pass the
+// string through.
 //
 // Why this lives inline (no dependency): JSON is regular enough to
 // tokenise with one regex pass; the alternative (Prism, Highlight.js,
 // react-syntax-highlighter) would have added 100+ KB of bundle for
-// one use case in the entire app. Reusing Monaco was rejected because
-// spawning a Monaco editor instance per row spawns Web Workers per
-// row — catastrophic memory cost for the 500 rows the trace pane can
-// hold.
+// one use case. Reusing Monaco was rejected because spawning a Monaco
+// editor instance per row spawns Web Workers per row — catastrophic
+// memory cost for the 500 rows the trace pane can hold.
 //
-// Tokens emitted: ``key`` (object property name), ``string``
-// (non-key string value), ``number``, ``bool``, ``null``, ``punct``
-// (braces / brackets / colons / commas), ``ws`` (whitespace).
-// Colors live in App.css (``.json-tok-*``).
+// Tokens emitted: ``key`` (object property name, quoted OR unquoted
+// identifier), ``string`` (non-key string value), ``number``,
+// ``bool``, ``null``, ``punct`` (braces / brackets / colons / commas),
+// ``ws`` (whitespace). Colors live in App.css (``.json-tok-*``).
 
-type JsonView_Props = { value: unknown };
+type JsonViewProps = { text: string };
 
-function JsonView({ value }: JsonView_Props) {
-  const text = useMemo(() => safePretty(value), [value]);
+function JsonView({ text }: JsonViewProps) {
   const tokens = useMemo(() => tokenizeJson(text), [text]);
   return (
     <>
@@ -566,19 +580,6 @@ function JsonView({ value }: JsonView_Props) {
   );
 }
 
-function safePretty(value: unknown): string {
-  // ``JSON.stringify(value, null, 2)`` matches what an operator sees
-  // in browser devtools / jq output — 2-space indent, ASCII
-  // delimiters, no trailing newline.
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    // Cycles, BigInt, etc. — fall back to a String() coercion so the
-    // row at least RENDERS something instead of throwing during render.
-    return String(value);
-  }
-}
-
 type JsonTokKind =
   | "key"
   | "string"
@@ -589,49 +590,60 @@ type JsonTokKind =
   | "ws";
 type JsonTok = { kind: JsonTokKind; text: string };
 
-// Single-pass tokeniser. The regex's first alternative uses a
-// lookahead ``(?=\s*:)`` to detect "string followed by colon" without
-// consuming the colon — that's how we discriminate object keys from
-// value-strings. Ordering inside the alternation matters: longer /
-// more-specific patterns first so JavaScript's regex engine doesn't
-// match a generic string before the key-with-lookahead can fire.
+// Single-pass tokeniser. Two key alternatives at the front — quoted
+// string-followed-by-colon (strict-JSON style) and bare-identifier-
+// followed-by-colon (our compact serialiser's output style) — both
+// gated on a ``(?=\s*:)`` lookahead so we discriminate keys from
+// equivalent-shaped value tokens (string value vs. unquoted true/
+// false/null which share the identifier shape but never appear before
+// a colon in well-formed payloads).
 //
-// Anchored to the output of ``JSON.stringify`` (well-formed,
-// 2-space-indented, escapes are ``\X`` form). Doesn't try to be a
-// general JSON parser.
+// Ordering inside the alternation matters: longer / more-specific
+// patterns first so JavaScript's regex engine doesn't match a generic
+// string or identifier before the key-with-lookahead can fire.
+//
+// Anchored to the output of ``compactJsonText`` (no whitespace, no
+// indentation), but tolerant of pretty-printed JSON if a future caller
+// passes that — the ``\s+`` alternative consumes whitespace, and the
+// quoted-key alternative still lights up keys in ``{"k": "v"}`` form.
 const JSON_TOKEN_RE =
-  /"(?:[^"\\]|\\.)*"(?=\s*:)|"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\btrue\b|\bfalse\b|\bnull\b|[{}\[\],:]|\s+/g;
+  /"(?:[^"\\]|\\.)*"(?=\s*:)|[A-Za-z_$][\w$]*(?=\s*:)|"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\btrue\b|\bfalse\b|\bnull\b|[{}\[\],:]|\s+/g;
 
 function tokenizeJson(s: string): JsonTok[] {
   const out: JsonTok[] = [];
   // ``g`` flag means we maintain ``lastIndex`` across iterations;
-  // re-create the regex per call so we don't carry state between
-  // calls (the module-level constant is fine because we reset
-  // ``lastIndex`` implicitly by exhausting the matches each call).
+  // reset on entry so we don't carry state between calls (the
+  // module-level constant is fine because we reset explicitly).
   JSON_TOKEN_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   let last = 0;
   while ((m = JSON_TOKEN_RE.exec(s)) !== null) {
     if (m.index > last) {
-      // Anything between matches shouldn't happen for stringify
-      // output, but if it ever does (e.g. some exotic edge case)
-      // surface it as plain punctuation so the row renders intact.
+      // Anything between matches shouldn't happen for our serialiser's
+      // output, but if it ever does (exotic edge case, future caller
+      // passes free-form text) surface it as plain punctuation so the
+      // row renders intact instead of swallowing characters.
       out.push({ kind: "punct", text: s.slice(last, m.index) });
     }
     const tok = m[0];
+    // Both key alternatives (quoted or bare identifier) require the
+    // ``(?=\s*:)`` lookahead to have matched. We re-test it explicitly
+    // here to label the token — cheaper than threading capture groups
+    // through the regex and clearer than reading ``m`` indices.
+    const followedByColon = /^\s*:/.test(s.slice(m.index + tok.length));
     if (tok.startsWith('"')) {
-      // The regex matched either the key alternative (lookahead-gated)
-      // or the value-string alternative. We re-test the lookahead
-      // explicitly to label the token — cheaper than capturing groups
-      // and clearer than reading ``m`` indices.
-      const after = s.slice(m.index + tok.length).match(/^\s*:/);
-      out.push({ kind: after ? "key" : "string", text: tok });
+      out.push({ kind: followedByColon ? "key" : "string", text: tok });
     } else if (tok === "true" || tok === "false") {
       out.push({ kind: "bool", text: tok });
     } else if (tok === "null") {
       out.push({ kind: "null", text: tok });
     } else if (/^-?\d/.test(tok)) {
       out.push({ kind: "number", text: tok });
+    } else if (/^[A-Za-z_$]/.test(tok)) {
+      // Bare identifier — the lookahead must have fired (otherwise the
+      // alternative wouldn't have matched at all), so this is always a
+      // key in our compact format.
+      out.push({ kind: "key", text: tok });
     } else if (/^\s+$/.test(tok)) {
       out.push({ kind: "ws", text: tok });
     } else {

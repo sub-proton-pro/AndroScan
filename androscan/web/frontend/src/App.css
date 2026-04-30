@@ -3907,12 +3907,16 @@ code { color: var(--accent); }
   gap: 0.1rem;
 }
 
-/* Two-line stack per event: ``.trace-row-meta`` is the always-
- * visible header (chevron + ts + kind + phase + label + abbreviated
- * summary); ``.trace-row-payload`` is the optional pretty-printed
- * JSON that the chevron toggles. The wrapper is a flex column so
- * the JSON block sits flush below the meta line and gets the full
- * row width without fighting the meta line's own grid sub-layout. */
+/* One row per event — chevron + ts + kind + phase + label + a compact
+ * unquoted-key JSON serialisation of the full payload (e.g.
+ * ``{label:"x",phase:"entry",class:"…",method:"…",args:[…]}``).
+ * The chevron toggles wrap mode on the payload column, NOT its
+ * content: collapsed = nowrap+ellipsis (one-line preview, browser
+ * shows ``…`` when clipped), expanded = normal+overflow-wrap so the
+ * SAME serialised text wraps onto N lines without re-rendering. The
+ * wrapper is still a flex column for symmetry with other panes and
+ * to leave room for future siblings (e.g. inline annotations) without
+ * a structural rewrite, but today it has a single child. */
 .trace-row {
   display: flex;
   flex-direction: column;
@@ -3922,18 +3926,20 @@ code { color: var(--accent); }
   border-bottom: 1px dotted rgba(48, 54, 61, 0.6);
 }
 
-/* Meta header row — same column shape as the old ``.trace-row``
- * grid had, plus a leading chevron column. The grid keeps the
- * ts/kind/phase columns aligned across rows so operators can scan
- * vertically without timestamps drifting; the trailing summary
- * (``1fr``) absorbs the remaining width. */
+/* Grid sub-layout: chevron / ts / kind / phase / label / payload.
+ * The first five columns are fixed/intrinsic; the trailing payload
+ * column is ``1fr`` so it absorbs the remaining width and is the only
+ * column that ever needs to grow or wrap. ``align-items: baseline``
+ * keeps the metadata columns baseline-aligned with the FIRST line of
+ * the payload when the payload wraps onto multiple lines (expanded
+ * state) — alternative ``flex-start`` would push them to the top of
+ * a tall expanded payload, leaving a visually odd gap between the
+ * timestamp and the payload's first line. */
 .trace-row-meta {
   display: grid;
   grid-template-columns: 1.2rem 6.5rem 3.4rem 4rem auto 1fr;
   gap: 0.4rem;
   align-items: baseline;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
 /* Chevron toggle. ``logcat-toggle-btn`` would have given us the
@@ -3961,27 +3967,6 @@ code { color: var(--accent); }
   outline: 1px solid var(--accent);
   outline-offset: 2px;
   border-radius: 2px;
-}
-
-/* Pretty-printed JSON block. ``<pre>`` with monospace + tighter
- * line-height than the row meta (operator scans many lines of JSON
- * vertically; default 1.4 leaves visible gaps between brace lines).
- * ``white-space: pre`` (not ``pre-wrap``) because JSON is line-oriented
- * by design — wrapping a long string value mid-token would be
- * actively confusing; horizontal scroll is the intended UX. The
- * 2.4rem left padding aligns the JSON's leading ``{`` with the row's
- * ``ts`` column so the visual indent matches ``timestamp │ json`` in
- * a column-by-column read. */
-.trace-row-payload {
-  margin: 0;
-  padding: 0.4rem 0.5rem 0.5rem 2.4rem;
-  font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
-  font-size: 0.72rem;
-  line-height: 1.45;
-  background: rgba(13, 17, 23, 0.5);
-  border-radius: 3px;
-  overflow-x: auto;
-  white-space: pre;
 }
 
 /* JSON syntax highlighting — single class per token kind so the
@@ -4108,9 +4093,45 @@ code { color: var(--accent); }
   font-weight: 600;
 }
 
+/* Payload column — the trailing ``1fr`` cell of ``.trace-row-meta``.
+ * Houses the compact JSON preview (rendered as syntax-highlighted
+ * spans by ``JsonView``); the row's collapsed/expanded state controls
+ * its wrap behaviour, NOT its content (the full JSON string is
+ * always present in the DOM, the chevron toggles a CSS modifier).
+ *
+ *  * collapsed (default) — ``white-space: nowrap`` + ``overflow:
+ *    hidden`` + ``text-overflow: ellipsis`` give a one-line preview
+ *    with browser-native ``…`` truncation when the JSON is wider
+ *    than the column. ``min-width: 0`` is required because grid
+ *    items default to ``min-content`` minimum width, which would
+ *    let a long unbroken JSON string push the column wider than the
+ *    grid track and defeat the ellipsis. The hover-tooltip on the
+ *    parent ``<span>`` (``title={compact}``) surfaces the FULL JSON
+ *    in the browser tooltip without committing to expand.
+ *
+ *  * expanded (``.trace-row-expanded`` modifier on the row) —
+ *    ``white-space: normal`` + ``overflow-wrap: anywhere`` lets the
+ *    same JSON wrap onto as many lines as needed; ``overflow:
+ *    visible`` releases the clip so the wrapped lines render
+ *    instead of being hidden under the next row.
+ *    ``overflow-wrap: anywhere`` is the modern equivalent of
+ *    ``word-break: break-all`` but more polite — only breaks when a
+ *    line would otherwise overflow, instead of unconditionally at
+ *    every char. JSON is generally one long unspaced token-stream,
+ *    so the polite version still breaks where needed. */
 .trace-payload {
   color: var(--text);
-  font-family: inherit;
+  font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
+  font-size: 0.72rem;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.trace-row-expanded .trace-payload {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
 }
 
 /* ===========================================================================
