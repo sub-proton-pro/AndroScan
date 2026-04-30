@@ -2267,11 +2267,13 @@ code { color: var(--accent); }
  * as if it didn't exist — and the `[hidden]` attribute (set when another tab
  * is active) collapses the whole subtree to `display: none` so it takes no
  * space and isn't reachable via tab/AT, while preserving React state. */
-.settings-tab-host {
+.settings-tab-host,
+.lab-tab-host {
   display: contents;
 }
 
-.settings-tab-host[hidden] {
+.settings-tab-host[hidden],
+.lab-tab-host[hidden] {
   display: none;
 }
 

@@ -7,6 +7,7 @@ import {
   useMemo,
   useState,
 } from "react";
+import { mapTap, type MapResult } from "../api/inspect";
 import { fetchTriage, postTriage, type TriageUpdate } from "../api/triage";
 import type {
   ChatMessage,
@@ -94,6 +95,23 @@ type WorkbenchState = {
   // a row.
   pendingCodeNav: PendingCodeNav | null;
   setPendingCodeNav: (n: PendingCodeNavInput | null) => void;
+
+  // UI Mapping result + busy/error flags lifted out of ``InspectTab`` so
+  // the most recent click-to-code mapping survives tab hops. ``InspectTab``
+  // is unmounted on switch (intentional — to release the mirror + logcat
+  // WebSockets) which would otherwise nuke the result the operator just
+  // produced. The action returns the result so callers can chain a
+  // local side effect (e.g. open the best candidate in Code Browser)
+  // without re-reading from state.
+  //
+  // Cleared automatically whenever ``appId`` changes — the result is
+  // keyed to one app's UI coordinates and would mislead if surfaced
+  // against a different project.
+  mapResult: MapResult | null;
+  mapBusy: boolean;
+  mapError: string | null;
+  runMapTap: (x: number, y: number) => Promise<MapResult | null>;
+  clearMapResult: () => void;
 
   // Phase 10 sub-step 10.7: the active mode inside the Lab tab. Lifted
   // out of LabTab.tsx so callers in Trace mode (BypassPlanCard's "Stage
@@ -200,6 +218,9 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   const [pendingTraceEntry, setPendingTraceEntryState] =
     useState<PendingTraceEntry | null>(null);
   const [labMode, setLabModeState] = useState<LabMode>(() => loadStoredLabMode());
+  const [mapResult, setMapResult] = useState<MapResult | null>(null);
+  const [mapBusy, setMapBusy] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
   const [chats, setChats] = useState<Record<TabId, ChatMessage[]>>({
     reports: [],
     inspect: [],
@@ -360,6 +381,44 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // Drop any cached UI Mapping result the moment the operator switches
+  // projects — the (x, y) coordinates and resolved candidates are tied
+  // to a specific app's foreground activity and would mislead the
+  // operator if surfaced against a different project.
+  useEffect(() => {
+    setMapResult(null);
+    setMapBusy(false);
+    setMapError(null);
+  }, [appId]);
+
+  const runMapTap = useCallback<WorkbenchState["runMapTap"]>(
+    async (x, y) => {
+      if (!appId) {
+        setMapError("select a project first");
+        return null;
+      }
+      setMapBusy(true);
+      setMapError(null);
+      try {
+        const r = await mapTap(appId, x, y);
+        if (!r) {
+          setMapError("map request failed");
+          return null;
+        }
+        setMapResult(r);
+        return r;
+      } finally {
+        setMapBusy(false);
+      }
+    },
+    [appId],
+  );
+
+  const clearMapResult = useCallback(() => {
+    setMapResult(null);
+    setMapError(null);
+  }, []);
+
   const value = useMemo<WorkbenchState>(
     () => ({
       tab,
@@ -386,6 +445,11 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setPendingHookPrefill,
       pendingTraceEntry,
       setPendingTraceEntry,
+      mapResult,
+      mapBusy,
+      mapError,
+      runMapTap,
+      clearMapResult,
       chats,
       appendChat,
       updateChat,
@@ -413,6 +477,11 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setPendingHookPrefill,
       pendingTraceEntry,
       setPendingTraceEntry,
+      mapResult,
+      mapBusy,
+      mapError,
+      runMapTap,
+      clearMapResult,
       chats,
       appendChat,
       updateChat,

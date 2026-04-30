@@ -9,15 +9,30 @@ import { SettingsTab } from "./tabs/SettingsTab";
 
 function ActiveTab() {
   const { tab } = useWorkbench();
-  // Settings is mounted persistently and hidden via CSS so the user's in-progress
-  // edits (form draft, raw YAML buffer, selected sub-section, fetched data)
-  // survive tab hops. The other tabs unmount/remount as before — keeps live
-  // resources (mirror WS, logcat WS) tied to actual tab visibility.
+  // Persistent-mount tabs: Settings + Lab.
+  //
+  //   * Settings — preserves in-progress edits (form draft, raw YAML
+  //     buffer, selected sub-section, fetched data) across tab hops.
+  //   * Lab — preserves Trace mode form + active anchor, Manual Hooks
+  //     selected-node + active Frida session + right-pane tab,
+  //     hook-builder collapse state, etc. Keeping it mounted also
+  //     keeps the Frida session polling alive so the operator's
+  //     in-flight trace doesn't go silent while they look at Reports
+  //     / Inspect (the polling only runs when ``activeSession`` is
+  //     set, so there's no idle-tab cost).
+  //
+  // The Inspect + Reports tabs still unmount/remount on switch —
+  // intentional, to release Inspect's mirror WS + logcat WS the moment
+  // the operator looks elsewhere. UI Mapping state survives anyway
+  // because it's lifted into ``WorkbenchContext`` (``mapResult`` /
+  // ``runMapTap``).
   return (
     <>
       {tab === "reports" && <ReportsTab />}
       {tab === "inspect" && <InspectTab />}
-      {tab === "lab" && <LabTab />}
+      <div className="lab-tab-host" hidden={tab !== "lab"}>
+        <LabTab />
+      </div>
       <div className="settings-tab-host" hidden={tab !== "settings"}>
         <SettingsTab />
       </div>

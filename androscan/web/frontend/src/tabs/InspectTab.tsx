@@ -12,7 +12,6 @@ import {
   type CodeTree,
   type DecompileStatus,
 } from "../api/code";
-import { mapTap, type MapResult } from "../api/inspect";
 import { AdbShell } from "../components/AdbShell";
 import { ChatDock } from "../components/ChatDock";
 import { ClassMethodTree } from "../components/ClassMethodTree";
@@ -44,6 +43,10 @@ export function InspectTab() {
     setPendingTraceEntry,
     setLabMode,
     setTab,
+    mapResult,
+    mapBusy,
+    mapError,
+    runMapTap,
   } = useWorkbench();
   const packageName = useMemo<string | null>(() => {
     const apk = (dossier as Record<string, unknown> | null)?.apk_info as
@@ -62,9 +65,6 @@ export function InspectTab() {
   const logcatRef = useRef<ImperativePanelHandle>(null);
   const [adbCollapsed, setAdbCollapsed] = useState(true);
   const adbRef = useRef<ImperativePanelHandle>(null);
-  const [mapResult, setMapResult] = useState<MapResult | null>(null);
-  const [mapBusy, setMapBusy] = useState(false);
-  const [mapError, setMapError] = useState<string | null>(null);
   const sidebarRef = useRef<ImperativePanelHandle>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const treeColRef = useRef<ImperativePanelHandle>(null);
@@ -86,14 +86,15 @@ export function InspectTab() {
     [number, number] | null
   >(null);
 
-  // Initial decompile-status load on app change.
+  // Initial decompile-status load on app change. ``mapResult`` is reset
+  // by the WorkbenchContext when ``appId`` changes — we only need to
+  // wipe the InspectTab-local pieces here.
   useEffect(() => {
     setDecompile(null);
     setTree(null);
     setOpenClassPath(null);
     setOpenClassSource(null);
     setOpenMethod(null);
-    setMapResult(null);
     setScrollTarget(null);
     setHighlightRange(null);
     if (!appId) return;
@@ -212,20 +213,15 @@ export function InspectTab() {
   };
 
   const handleTap = async (x: number, y: number) => {
-    if (!appId) {
-      setMapError("select a project first");
-      return;
-    }
-    setMapBusy(true);
-    setMapError(null);
     setCenterTab("mapping");
-    const r = await mapTap(appId, x, y);
-    setMapBusy(false);
-    if (!r) {
-      setMapError("map request failed");
-      return;
-    }
-    setMapResult(r);
+    // ``runMapTap`` lives on the WorkbenchContext so the result + busy
+    // flag survive an unmount of this tab. It returns the parsed result
+    // so we can chain the InspectTab-local Code Browser side effect
+    // below; ``null`` means either (a) no project selected or (b) the
+    // server replied with a non-2xx — in both cases ``mapError`` has
+    // already been populated and the panel surfaces the failure.
+    const r = await runMapTap(x, y);
+    if (!r || !appId) return;
     // Prefer the fuser's pick (resolution.best) over the raw first
     // deterministic candidate so the Code Browser jumps straight to the
     // most likely handler — including RAG hits when the deterministic
