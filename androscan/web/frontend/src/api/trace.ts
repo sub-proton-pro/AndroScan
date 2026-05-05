@@ -286,6 +286,74 @@ export function deleteTraceAnchor(
   );
 }
 
+/** Phase 11 v2.1 sub-step v2.1.2 — response shape for the
+ *  ``POST /api/trace/{app_id}/normalise-entry`` coalescer endpoint.
+ *
+ *  Translates the operator's typed input (dotted Java method, partial
+ *  Smali, stack-trace line) into a canonical Smali method-prefix
+ *  (``Lcom/example/Foo;->onClick(``) AND validates the underlying
+ *  class against the call graph in the same round-trip — the
+ *  validation signal is what makes Trace mode's ✓ / ⚠ pill
+ *  meaningful.
+ *
+ *  Wire-shape contract pinned by ``tests/test_trace_routes.py::
+ *  test_normalise_entry_*`` (Phase 11 v2.1.2). Any field-level change
+ *  ripples through both the route and the consuming
+ *  ``LabTraceMode``'s pill renderer.
+ *
+ *  ``error`` is non-null only on the 200-but-the-coalescer-flagged-
+ *  something rare path — un-parseable inputs land as 422 with the
+ *  detail string carried via ``ApiResult<>.error`` (the
+ *  ``_request`` helper unwraps FastAPI's ``{detail: ...}`` shape).
+ *  In v2.1.2's response shape ``error`` is reserved for future
+ *  use; currently the field is always ``null`` on a 200. */
+export type NormaliseEntryResponse = {
+  /** Canonical Smali entry — full signature when the input was
+   *  already a full sig, method-prefix (``...->name(``) when only
+   *  class+method was given, bare class descriptor when no method
+   *  was supplied. ``null`` only on the un-parseable path (which
+   *  surfaces as 422; the ``error`` field is the operator-readable
+   *  reason then). */
+  normalised_entry: string | null;
+  /** The bare Smali class descriptor extracted from the input
+   *  (``Lcom/example/Foo;``). Used by the v2.1.3 "Find similar
+   *  classes" button as the fuzzy-match seed. */
+  smali_class: string | null;
+  /** ``true`` iff the call-graph store has at least one non-external
+   *  method node on this class. ``false`` is the v2.1.3 entry-point
+   *  signal — the ⚠ pill renders, and the operator can ask for
+   *  fuzzy-match suggestions. */
+  class_exists_in_graph: boolean;
+  /** Number of non-external method nodes on the class. Matches what
+   *  the MethodPicker would surface on the same class. ``0`` when
+   *  ``class_exists_in_graph`` is ``false``. */
+  method_count: number;
+  /** Reserved for future use (currently always ``null`` on a 200).
+   *  v2.1.2 422 errors land via ``ApiResult.error`` instead. */
+  error: string | null;
+};
+
+/** Translate + validate the operator's typed Trace-mode entry input.
+ *  Returns the coalescer's structured response on a 200; on 422
+ *  (un-parseable input) the error string carries the operator-
+ *  readable parse-failure reason; on 404 / 409 / network error the
+ *  caller is responsible for surfacing "validation unavailable" copy
+ *  to the operator (the validation pill renders ⚠ in those cases
+ *  rather than ✓ / ✗). */
+export function normaliseTraceEntry(
+  appId: string,
+  entry: string,
+): Promise<ApiResult<NormaliseEntryResponse>> {
+  return _request<NormaliseEntryResponse>(
+    `/api/trace/${encodeURIComponent(appId)}/normalise-entry`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entry }),
+    },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // useTraceAnchor — React hook owning the GET → fall-back-to-POST lifecycle
 // for one ``(appId, entry, hops)`` triple. The Trace mode UI is the only

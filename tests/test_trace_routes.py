@@ -484,3 +484,209 @@ def test_anchored_methods_route_registered(tmp_path: Path) -> None:
     client = _client(tmp_path)
     paths = {r.path for r in client.app.routes}  # type: ignore[attr-defined]
     assert "/api/trace/{app_id}/anchored-methods" in paths
+
+
+# ---------------------------------------------------------------------------
+# 9) POST /normalise-entry — Phase 11 v2.1 sub-step v2.1.2 coalescer
+#
+# Translates the operator's typed input (dotted Java, partial Smali, or
+# stack-trace line) → canonical Smali method-prefix + validates the
+# class against the call graph. Powers Trace mode's debounced inline
+# spinner + ✓ / ⚠ validation pill.
+#
+# The fixture's call-graph contains ``Lcom/trace/Plans;`` (with multiple
+# methods), so the "valid class" path uses dotted form
+# ``com.trace.Plans.gateBoolPredicate`` and asserts the round-tripped
+# Smali matches what the picker would surface.
+
+
+def test_normalise_entry_route_registered(tmp_path: Path) -> None:
+    """The factory must register the v2.1.2 coalescer endpoint
+    alongside the existing six — guards against a refactor
+    accidentally dropping it from ``build_trace_router``."""
+    client = _client(tmp_path)
+    paths = {r.path for r in client.app.routes}  # type: ignore[attr-defined]
+    assert "/api/trace/{app_id}/normalise-entry" in paths
+
+
+def test_normalise_entry_dotted_java_method_translates_to_smali(
+    tmp_path: Path,
+) -> None:
+    """Dotted Java method form ``com.trace.Plans.gateBoolPredicate`` →
+    Smali method-prefix ``Lcom/trace/Plans;->gateBoolPredicate(``.
+
+    Validates the class against the call graph in the same round-trip:
+    ``com.trace.Plans`` is in the fixture, so ``class_exists_in_graph``
+    is ``True`` and ``method_count`` is non-zero. This is the headline
+    operator path — a pasted dotted method name lands as a canonical
+    Smali prefix the MethodPicker can immediately consume."""
+    client = _client(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "com.trace.Plans.gateBoolPredicate"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["normalised_entry"] == "Lcom/trace/Plans;->gateBoolPredicate("
+    assert body["smali_class"] == "Lcom/trace/Plans;"
+    assert body["class_exists_in_graph"] is True
+    assert body["method_count"] >= 2  # gateBoolPredicate + gateIntPredicate
+    assert body["error"] is None
+
+
+def test_normalise_entry_partial_smali_passes_through(tmp_path: Path) -> None:
+    """Operator-typed Smali (the ``Advanced`` form path) round-trips
+    unchanged through the coalescer's pass-through branch — the input
+    is already canonical and any partial / full descriptor tail
+    carries information downstream consumers (MethodPicker, trace
+    skill) need preserved."""
+    client = _client(tmp_path)
+    # Class+separator shape (Inspect → Trace seed, partial).
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "Lcom/trace/Plans;->"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["normalised_entry"] == "Lcom/trace/Plans;->"
+    assert body["smali_class"] == "Lcom/trace/Plans;"
+    assert body["class_exists_in_graph"] is True
+
+    # Class+method-prefix shape (Inspect → Trace seed, method-known).
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "Lcom/trace/Plans;->gateBoolPredicate("},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (
+        body["normalised_entry"] == "Lcom/trace/Plans;->gateBoolPredicate("
+    )
+
+    # Full signature shape — descriptor list preserved end-to-end so
+    # the trace skill can be fired directly off the coalescer's
+    # ``normalised_entry`` without re-typing the params.
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": ENTRY_BOOL},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["normalised_entry"] == ENTRY_BOOL
+    assert body["smali_class"] == "Lcom/trace/Plans;"
+
+
+def test_normalise_entry_stack_trace_line_drops_location(tmp_path: Path) -> None:
+    """Stack-trace line ``com.trace.Plans.gateBoolPredicate(Plans.java:42)``
+    drops the ``(Plans.java:42)`` source-location tail before mapping
+    to Smali — the operator pasted the line straight from a logcat /
+    crash report and expects the entry method to come out cleanly."""
+    client = _client(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "com.trace.Plans.gateBoolPredicate(Plans.java:42)"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["normalised_entry"] == "Lcom/trace/Plans;->gateBoolPredicate("
+    assert body["smali_class"] == "Lcom/trace/Plans;"
+    assert body["class_exists_in_graph"] is True
+
+
+def test_normalise_entry_class_not_in_graph_returns_200_with_false_flag(
+    tmp_path: Path,
+) -> None:
+    """Parseable input that doesn't match any class in the call graph
+    → 200 with ``class_exists_in_graph: false`` + ``method_count: 0``.
+    This is the v2.1.3 entry point — the ⚠ pill renders, and the
+    "Find similar classes" button (lands in v2.1.3) hangs off the
+    same response."""
+    client = _client(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "com.trace.NotARealClass.foo"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["normalised_entry"] == "Lcom/trace/NotARealClass;->foo("
+    assert body["smali_class"] == "Lcom/trace/NotARealClass;"
+    assert body["class_exists_in_graph"] is False
+    assert body["method_count"] == 0
+    assert body["error"] is None
+
+
+def test_normalise_entry_unparseable_input_returns_422(tmp_path: Path) -> None:
+    """Inputs the heuristic dispatcher can't classify as either Smali
+    or dotted Java → 422 with an operator-readable ``detail`` string
+    the frontend renders inline as the ✗ pill."""
+    client = _client(tmp_path)
+    # Empty body → 422 from the model validator (max_length=500 + required).
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": ""},
+    )
+    # The Pydantic model accepts empty strings (no min_length); the
+    # 422 comes from ``_coalesce_entry`` returning "entry is empty".
+    assert r.status_code == 422, r.text
+    assert "empty" in r.json()["detail"].lower()
+
+    # Bare lowercase input — no UpperCamelCase class segment found.
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "com.example.foo"},
+    )
+    assert r.status_code == 422, r.text
+    assert "class" in r.json()["detail"].lower()
+
+    # Junk characters that don't form any valid identifier.
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "@#$%^&*"},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_normalise_entry_unknown_app_returns_404(tmp_path: Path) -> None:
+    """Unknown ``app_id`` → 404 via the shared ``app_dir_resolver``.
+    Same contract as every other route in this module."""
+    client = _client(tmp_path)
+    r = client.post(
+        "/api/trace/ghost-app/normalise-entry",
+        json={"entry": "com.example.Foo.bar"},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_normalise_entry_decompile_not_ready_returns_409(
+    tmp_path: Path,
+) -> None:
+    """App dir exists but decompile cache is missing → 409 with the
+    standard ``decompile not ready`` message — call-graph validation
+    requires a built call graph, which requires a built decompile
+    cache."""
+    client = _client_no_decompile(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "com.example.Foo.bar"},
+    )
+    assert r.status_code == 409, r.text
+
+
+def test_normalise_entry_inner_class_preserves_dollar(tmp_path: Path) -> None:
+    """Inner-class form ``com.example.Foo$Inner.onClick`` → Smali
+    ``Lcom/example/Foo$Inner;->onClick(`` — the ``$`` is preserved as
+    a class-name character (matches dex / smali's representation of
+    inner classes; without this the method picker would query the
+    wrong Smali descriptor and miss every inner-class method)."""
+    client = _client(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/normalise-entry",
+        json={"entry": "com.example.Foo$Inner.onClick"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["normalised_entry"] == "Lcom/example/Foo$Inner;->onClick("
+    assert body["smali_class"] == "Lcom/example/Foo$Inner;"
+    # The class isn't in the fixture's call graph; the parse path
+    # is what we're pinning here, not the existence check.
+    assert body["class_exists_in_graph"] is False

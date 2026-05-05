@@ -62,6 +62,39 @@
  * ``fetchTree`` once status is ``ready``, polling while ``pending``).
  * No new backend routes; reuses ``/api/decompile/{app_id}/status``
  * and ``/api/code/{app_id}/tree``.
+ *
+ * **v2.1.2 — backend coalescer + debounced spinner + validation
+ * pill** (Q5 (A) class+method-only translation; Q6 (B) backend
+ * coalescer for authoritative call-graph validation):
+ *
+ *   * Debounced effect (400ms) on ``entryDraft`` calls
+ *     ``POST /api/trace/{app_id}/normalise-entry`` — the new
+ *     :func:`androscan.web.trace_routes._coalesce_entry` heuristic
+ *     dispatcher translates dotted Java / partial Smali / stack-trace
+ *     lines into a canonical Smali method-prefix and validates the
+ *     class against the call graph in the same round-trip.
+ *   * Inline spinner renders during the call (``trace-entry-spinner``).
+ *   * Result pill renders ``trace-entry-validation-pill`` in one of
+ *     four states:
+ *       - **✓ valid** — class exists in the graph; pill copy is
+ *         "Lcom/example/Foo; · N method(s)" so the operator sees the
+ *         normalised form alongside the count the picker would
+ *         surface.
+ *       - **⚠ class not found** — input parsed cleanly but no
+ *         matching class in the call graph. v2.1.3's "Find similar
+ *         classes" button (lands next sub-step) hangs off this state.
+ *       - **✗ couldn't parse** — coalescer returned 422; the pill
+ *         carries the operator-readable parse-failure reason.
+ *       - **— validation unavailable** — 404 / 409 / network error;
+ *         pill renders neutrally so the operator can still proceed
+ *         via Browse / Advanced without a spurious red ⚠.
+ *   * Stale-response guard (``coalescerInflightKeyRef``) — keyed on
+ *     ``(appId, entry)`` so a slow request for an old entry doesn't
+ *     clobber the pill state for the current input.
+ *   * The pill sits below the inline-row (Hops + Advanced toggle)
+ *     and above the MethodPicker so it's visible regardless of which
+ *     entry-discovery path the operator is using (Browse / Advanced /
+ *     cross-tab seed).
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -81,8 +114,10 @@ import {
   deleteTraceAnchor,
   fetchTraceStatus,
   listTraceAnchors,
+  normaliseTraceEntry,
   useTraceAnchor,
   type BehaviorAnchor,
+  type NormaliseEntryResponse,
   type TraceAnchorRow,
   type TraceStatusPayload,
 } from "../api/trace";
@@ -171,6 +206,22 @@ const PICKER_DEBOUNCE_MS = 150;
  *  backend route caps at 500, but anything past ~50 isn't a useful
  *  pick list (operator should narrow with more name prefix). */
 const PICKER_DISPLAY_LIMIT = 50;
+/** v2.1.2 coalescer debounce — longer than the picker because the
+ *  coalescer runs a single SQLite COUNT(*) call (~5-10ms) and the
+ *  validation pill is the operator's main feedback signal: we'd
+ *  rather wait 400ms for a stable value than render a flickering
+ *  pill that updates every keystroke. */
+const COALESCER_DEBOUNCE_MS = 400;
+
+/** v2.1.2 — discriminated union describing the three pill states the
+ *  ``EntryValidationPill`` sub-component renders. Lifted to module
+ *  scope so both the parent ``LabTraceMode`` (which produces it via
+ *  the debounced effect) and the consumer can share the type without
+ *  re-deriving it. */
+type CoalescerResult =
+  | { kind: "ok"; data: NormaliseEntryResponse }
+  | { kind: "parse_error"; detail: string }
+  | { kind: "unavailable"; status: number; detail: string };
 
 export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
   const { pendingTraceEntry, setPendingTraceEntry, dossier } = useWorkbench();
@@ -237,6 +288,9 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
     setDecompile(null);
     setTree(null);
     setTreeFilter("");
+    setCoalescerLoading(false);
+    setCoalescerResult(null);
+    coalescerInflightKeyRef.current = null;
     clear();
   }, [appId, clear]);
 
@@ -386,6 +440,18 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
   // for the current input.
   const pickerInflightKeyRef = useRef<string | null>(null);
 
+  // v2.1.2 coalescer state. Three flavours of "result":
+  //   - kind: "ok"      → validation pill renders ✓ / ⚠ from the response
+  //   - kind: "parse_error" → pill renders ✗ with the 422 detail string
+  //   - kind: "unavailable" → pill renders neutral (404 / 409 / network)
+  // The "result" + "loading" tuple lives next to each other so a
+  // render never sees a stale (loading: false, result: <previous>)
+  // tuple while a fresh request is in flight — same pattern the
+  // picker uses via its own keyed effect.
+  const [coalescerLoading, setCoalescerLoading] = useState(false);
+  const [coalescerResult, setCoalescerResult] = useState<CoalescerResult | null>(null);
+  const coalescerInflightKeyRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (!appId || !pickerCtx) {
       setPickerMethods(null);
@@ -419,6 +485,49 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
       clearTimeout(handle);
     };
   }, [appId, pickerCtx?.smaliClass, pickerCtx?.methodPrefix, pickerCtx]);
+
+  // v2.1.2 debounced coalescer effect — fires
+  // ``POST /api/trace/{app_id}/normalise-entry`` 400ms after the last
+  // entryDraft change. Powers the inline ✓ / ⚠ / ✗ validation pill.
+  // Skipped (cleared) when entryDraft is empty so the pill doesn't
+  // render on a blank pane.
+  const trimmedEntry = entryDraft.trim();
+  useEffect(() => {
+    if (!appId || !trimmedEntry) {
+      setCoalescerLoading(false);
+      setCoalescerResult(null);
+      coalescerInflightKeyRef.current = null;
+      return;
+    }
+    const key = `${appId}|${trimmedEntry}`;
+    coalescerInflightKeyRef.current = key;
+    setCoalescerLoading(true);
+    const handle = setTimeout(async () => {
+      const r = await normaliseTraceEntry(appId, trimmedEntry);
+      // Stale-response guard.
+      if (coalescerInflightKeyRef.current !== key) return;
+      setCoalescerLoading(false);
+      if (r.ok) {
+        setCoalescerResult({ kind: "ok", data: r.data });
+      } else if (r.status === 422) {
+        // Coalescer returned a parse-failure with an operator-readable
+        // detail — render as the ✗ pill.
+        setCoalescerResult({ kind: "parse_error", detail: r.error });
+      } else {
+        // 404 / 409 / network / 5xx — validation isn't available;
+        // pill renders neutrally rather than misleading the operator
+        // with a red ⚠ that suggests their input is bad.
+        setCoalescerResult({
+          kind: "unavailable",
+          status: r.status,
+          detail: r.error,
+        });
+      }
+    }, COALESCER_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(handle);
+    };
+  }, [appId, trimmedEntry]);
 
   const onPickMethod = (sig: string) => {
     setEntryDraft(sig);
@@ -642,6 +751,12 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
               </div>
             )}
           </form>
+
+          <EntryValidationPill
+            entry={trimmedEntry}
+            loading={coalescerLoading}
+            result={coalescerResult}
+          />
 
           {pickerCtx && (
             <MethodPicker
@@ -919,6 +1034,136 @@ function MethodPicker({
         </ul>
       )}
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// EntryValidationPill — Phase 11 v2.1 sub-step v2.1.2.
+// Renders the inline ✓ / ⚠ / ✗ / "validation unavailable" pill that
+// reflects the debounced ``POST /api/trace/{app_id}/normalise-entry``
+// call. Sits below the inline-row form (Hops + Advanced toggle) and
+// above the MethodPicker so it's visible regardless of which entry-
+// discovery path the operator is using (Browse-tree click, Advanced
+// raw-Smali typing, or cross-tab seed).
+//
+// Pill states:
+//
+//   * Loading        — spinner + "validating…". Renders during the
+//                      400ms debounce window + the in-flight backend
+//                      call. Operator sees a clear "we're checking"
+//                      signal so a slow validation doesn't read as a
+//                      stale ✓ from the prior input.
+//   * ✓ valid class  — class exists in the call graph; pill shows the
+//                      normalised Smali class + method count so the
+//                      operator sees both what AndroScan parsed their
+//                      input as AND how many methods the picker would
+//                      surface.
+//   * ⚠ not in graph — input parsed cleanly but no matching class in
+//                      the call graph. v2.1.3's "Find similar
+//                      classes" button (next sub-step) will hang off
+//                      this state via a sibling pill.
+//   * ✗ parse error  — coalescer returned 422; pill carries the
+//                      operator-readable reason (e.g. "no class name
+//                      found — expected an UpperCamelCase segment").
+//   * — unavailable  — 404 / 409 / network / 5xx; pill renders
+//                      neutrally with the underlying status string in
+//                      the title-tooltip. Operator can still proceed
+//                      via Browse / Advanced — we don't want a
+//                      transient backend hiccup to look like a bad
+//                      input.
+// ---------------------------------------------------------------------------
+
+type EntryValidationPillProps = {
+  /** The trimmed entry input. The pill renders nothing when this is
+   *  empty (so a blank Trace pane doesn't show stale validation). */
+  entry: string;
+  /** ``true`` while a debounce timer is pending OR a fetch is in
+   *  flight. Either way the operator sees the spinner. */
+  loading: boolean;
+  /** ``null`` until the first response arrives for the current
+   *  ``entry``; one of the discriminated kinds afterwards. */
+  result: CoalescerResult | null;
+};
+
+function EntryValidationPill({ entry, loading, result }: EntryValidationPillProps) {
+  if (!entry) return null;
+  if (loading) {
+    return (
+      <div
+        className="trace-entry-validation-pill trace-entry-validation-pill-loading"
+        role="status"
+        aria-live="polite"
+      >
+        <span className="trace-entry-spinner" aria-hidden="true" />
+        <span className="trace-entry-validation-pill-text">validating…</span>
+      </div>
+    );
+  }
+  if (!result) return null;
+  if (result.kind === "ok") {
+    const { normalised_entry, smali_class, class_exists_in_graph, method_count } =
+      result.data;
+    if (class_exists_in_graph) {
+      return (
+        <div
+          className="trace-entry-validation-pill trace-entry-validation-pill-ok"
+          role="status"
+          aria-live="polite"
+          title={normalised_entry ?? smali_class ?? "valid entry"}
+        >
+          <span className="trace-entry-validation-pill-icon">✓</span>
+          <span className="trace-entry-validation-pill-text">
+            <code>{smali_class}</code>{" "}
+            <span className="muted">
+              · {method_count} method{method_count === 1 ? "" : "s"}
+            </span>
+          </span>
+        </div>
+      );
+    }
+    return (
+      <div
+        className="trace-entry-validation-pill trace-entry-validation-pill-warn"
+        role="status"
+        aria-live="polite"
+        title={`${smali_class ?? entry} — class not found in call graph`}
+      >
+        <span className="trace-entry-validation-pill-icon">⚠</span>
+        <span className="trace-entry-validation-pill-text">
+          <code>{smali_class}</code> — class not found in call graph
+        </span>
+      </div>
+    );
+  }
+  if (result.kind === "parse_error") {
+    return (
+      <div
+        className="trace-entry-validation-pill trace-entry-validation-pill-err"
+        role="status"
+        aria-live="polite"
+        title={result.detail}
+      >
+        <span className="trace-entry-validation-pill-icon">✗</span>
+        <span className="trace-entry-validation-pill-text">
+          couldn't parse — {result.detail}
+        </span>
+      </div>
+    );
+  }
+  // ``unavailable`` — neutral copy + tooltip carries the underlying
+  // status code so an operator hunting an outage has a hint.
+  return (
+    <div
+      className="trace-entry-validation-pill trace-entry-validation-pill-neutral"
+      role="status"
+      aria-live="polite"
+      title={`validation unavailable: ${result.status || "network"} — ${result.detail}`}
+    >
+      <span className="trace-entry-validation-pill-icon">—</span>
+      <span className="trace-entry-validation-pill-text">
+        validation unavailable
+      </span>
+    </div>
   );
 }
 

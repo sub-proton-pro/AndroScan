@@ -78,6 +78,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response
+from pydantic import BaseModel, Field
 
 from androscan.analysis import call_graph
 from androscan.config import Config
@@ -98,6 +99,175 @@ logger = logging.getLogger(__name__)
 # benefit from the explicit signal that they hit the ceiling).
 _MAX_HOPS = 6
 _MAX_ENTRY_LEN = 500
+
+
+class NormaliseEntryRequest(BaseModel):
+    """Phase 11 v2.1 sub-step v2.1.2 request body for
+    ``POST /{app_id}/normalise-entry``.
+
+    JSON body (rather than query param) because the operator's typed
+    input may contain ``(``, ``)``, ``;``, ``/`` and other characters
+    that need URL-encoding; passing through the body keeps the
+    ``Content-Type: application/json`` contract clean and matches how
+    every other ``POST`` body in the workbench is shaped (cf.
+    :class:`androscan.web.graph_routes.PathsQuery` for the same
+    pattern).
+    """
+
+    entry: str = Field(..., max_length=_MAX_ENTRY_LEN)
+
+
+def _looks_like_java_identifier(s: str) -> bool:
+    """Lightweight check used by :func:`_coalesce_entry`'s dotted-Java
+    path. A Java identifier is ``[A-Za-z_$][A-Za-z0-9_$]*``; we admit a
+    digit-leading first char too so dex-merger output (``$lambda$0``,
+    ``Foo$0``) parses cleanly.
+    """
+    if not s:
+        return False
+    return all(c.isalnum() or c in ("_", "$") for c in s)
+
+
+def _coalesce_entry(
+    entry: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Translate the operator's typed input into a canonical Smali
+    method-prefix (or bare class descriptor) + the underlying Smali
+    class descriptor. Phase 11 v2.1 sub-step v2.1.2 (Q5: A — class +
+    method only; descriptors / overload resolution are
+    ``MethodPicker``'s job).
+
+    Returns ``(normalised_entry, smali_class, error)``:
+
+    * On success — ``normalised_entry`` and ``smali_class`` are both
+      populated; ``error`` is ``None``.
+    * On parse failure — both string fields are ``None`` and ``error``
+      carries an operator-readable one-liner (rendered inline as the
+      ✗ pill in Trace mode).
+
+    Recognised input shapes:
+
+    * Already-canonical Smali ``Lcom/example/Foo;->onClick(Landroid/view/View;)V``
+      → passes through unchanged (``smali_class`` extracted via
+      :func:`call_graph._normalise_smali_class`).
+    * Smali class+separator ``Lcom/example/Foo;->`` → passes through
+      (operator's intent is "show me methods on this class"; the
+      MethodPicker activates downstream).
+    * Smali class+method-prefix ``Lcom/example/Foo;->onClick(`` →
+      passes through (Inspect → Trace seed shape from 10.8).
+    * Bare Smali class descriptor ``Lcom/example/Foo;`` → returned
+      unchanged (operator can extend with ``->method`` or pick from
+      the MethodPicker).
+    * Dotted Java method ``com.example.Foo.onClick`` →
+      ``Lcom/example/Foo;->onClick(``.
+    * Dotted Java class ``com.example.Foo`` → ``Lcom/example/Foo;``.
+    * Stack-trace line ``com.example.Foo.onClick(Foo.java:42)`` →
+      ``Lcom/example/Foo;->onClick(`` (the ``(...)`` tail is dropped
+      — it's a source location, not part of the method signature).
+    * Java-method-arglist line ``com.example.Foo.onClick(int, String)``
+      → ``Lcom/example/Foo;->onClick(`` (same heuristic — the tail is
+      dropped because the descriptor list isn't in Smali form anyway).
+    * Inner classes ``com.example.Foo$Inner.onClick`` →
+      ``Lcom/example/Foo$Inner;->onClick(`` (the ``$`` is preserved as
+      a class-name character, matching how dex / smali represent
+      inner classes).
+    * Default-package class ``MainActivity`` → ``LMainActivity;``.
+
+    Rejected (returns parse error):
+
+    * Empty / whitespace-only input.
+    * Inputs whose dotted form has no UpperCamelCase segment in the
+      class portion (``com.example.foo`` — operator probably typed
+      a method name without its class).
+    * Inputs containing characters outside
+      ``[A-Za-z0-9_$./;()->]`` after the obvious-cleanup pass.
+    * Smali-shaped inputs whose class portion fails
+      :func:`call_graph._normalise_smali_class`'s validity check
+      (``Lcom.bad name;`` etc.).
+
+    Pure / no I/O — call-graph existence validation lives in the
+    route layer (one ``list_methods_on_class`` query against the
+    SQLite call graph).
+    """
+    s = (entry or "").strip()
+    if not s:
+        return None, None, "entry is empty"
+
+    # ----- Branch 1: already-Smali class+method form ---------------------
+    # The ``;->`` substring is the canonical class-vs-method separator
+    # and is present in every shape we want to pass through unchanged.
+    if s.startswith("L") and ";->" in s:
+        klass_part, _, _method_part = s.partition(";->")
+        smali_class = call_graph._normalise_smali_class(klass_part + ";")
+        if not smali_class:
+            return (
+                None,
+                None,
+                f"couldn't parse Smali class {klass_part + ';'!r}",
+            )
+        # Pass the input through unchanged — the operator already typed
+        # canonical Smali, and any partial / full descriptor tail
+        # carries information the picker / trace skill consumes
+        # downstream (Inspect → Trace seed shape, full sig submit, etc.).
+        return s, smali_class, None
+
+    # ----- Branch 2: bare Smali class descriptor (no method) -------------
+    if s.startswith("L") and s.endswith(";"):
+        smali_class = call_graph._normalise_smali_class(s)
+        if not smali_class:
+            return None, None, f"couldn't parse Smali class {s!r}"
+        return smali_class, smali_class, None
+
+    # ----- Branch 3: Java forms (dotted, possibly with stack-trace
+    #                location or method-arglist trailing) ------------------
+    # Drop everything from the first ``(`` — that's either a
+    # stack-trace location ``(Foo.java:42)`` or a Java method-arglist
+    # ``(int, java.lang.String)``; either way we only need class +
+    # method per Q5 (A) — the descriptors / overload resolution is
+    # MethodPicker's job.
+    paren_idx = s.find("(")
+    if paren_idx >= 0:
+        s = s[:paren_idx].rstrip()
+        if not s:
+            return None, None, "couldn't parse entry — empty before '('"
+
+    parts = s.split(".") if "." in s else [s]
+    for p in parts:
+        if not _looks_like_java_identifier(p):
+            return (
+                None,
+                None,
+                f"couldn't parse {entry!r} — invalid identifier {p!r}",
+            )
+
+    # Method-name detection: the last segment that starts with a
+    # lowercase letter is the method (Java naming convention — methods
+    # start lowercase, classes start UpperCamelCase). If every segment
+    # starts uppercase, the input is a bare class name.
+    method_name: Optional[str] = None
+    if len(parts) >= 2 and parts[-1][:1].islower():
+        method_name = parts[-1]
+        class_parts = parts[:-1]
+    else:
+        class_parts = parts
+
+    # The class parts must include at least one UpperCamelCase segment
+    # — otherwise the input is a bare package prefix (``com.example``)
+    # or a method name without its class (``com.example.foo``).
+    if not any(p[:1].isupper() for p in class_parts):
+        return None, None, (
+            f"couldn't parse {entry!r} — no class name found "
+            "(expected an UpperCamelCase class segment)"
+        )
+
+    java_class = ".".join(class_parts)
+    smali_class = call_graph._normalise_smali_class(java_class)
+    if not smali_class:
+        return None, None, f"couldn't parse {entry!r} — bad class form"
+
+    if method_name:
+        return f"{smali_class}->{method_name}(", smali_class, None
+    return smali_class, smali_class, None
 # Synthetic run-folder leaf — the trace_behavior skill resolves
 # ``app_dir = run_folder.parent``, so we just need *any* path under
 # ``app_dir`` that doesn't shadow a real run folder. ``trace-build`` is
@@ -496,6 +666,98 @@ def build_trace_router(
             "methods": methods,
             "total": len(methods),
             "error": error,
+        }
+
+    # ----------------------------------------------------------------------
+    # POST /{app_id}/normalise-entry — Phase 11 v2.1 sub-step v2.1.2
+    #                                  coalescer + call-graph validation
+    #
+    # Translates the operator's typed input (dotted Java, partial
+    # Smali, or stack-trace line) into a canonical Smali method-prefix
+    # (``Lcom/example/Foo;->onClick(``) and validates the underlying
+    # class against the call graph. Powers Trace mode's debounced
+    # inline spinner + ✓ / ⚠ validation pill — gives operators a fast
+    # honest signal that the entry they're typing actually exists in
+    # the app's call graph before they fire the synchronous (LLM-cost-
+    # bearing) ``trace_behavior`` skill.
+    #
+    # Q5 (A): translate class + method name only; descriptor /
+    # overload resolution is MethodPicker's job.
+    # Q6 (B): backend (not frontend) so call-graph validation happens
+    # in the same round-trip as the parse — frontend-only translation
+    # would lack the validation signal that makes the spinner / pill
+    # operator-meaningful.
+    #
+    # Status codes:
+    # * 404 — unknown ``app_id`` (via ``app_dir_resolver``).
+    # * 409 — call graph not ready (``_cache_dir_for`` precondition).
+    # * 422 — un-parseable input (``_coalesce_entry`` returned an
+    #         ``error``); the body's ``detail`` carries the operator-
+    #         readable explanation that the frontend renders inline.
+    # * 200 — parseable input (regardless of whether the class exists
+    #         in the call graph; the response's ``class_exists_in_graph``
+    #         + ``method_count`` carry the validation signal so the
+    #         operator can distinguish "couldn't parse" from "parsed
+    #         but the class isn't in the graph" — the latter is the
+    #         entry point for v2.1.3's "Find similar classes"
+    #         suggestions).
+
+    @router.post("/{app_id}/normalise-entry")
+    def trace_normalise_entry(
+        app_id: str,
+        body: NormaliseEntryRequest,
+    ) -> dict[str, Any]:
+        """Translate + validate. See module docstring above for the
+        full behaviour contract.
+
+        Response shape::
+
+            {
+                "normalised_entry":      "Lcom/example/Foo;->onClick(",
+                "smali_class":           "Lcom/example/Foo;",
+                "class_exists_in_graph": true,
+                "method_count":          3,
+                "error":                 null
+            }
+
+        ``method_count`` is the count of non-external method nodes on
+        the class — same set the MethodPicker would surface — so the
+        ✓ pill copy "valid class with N methods" matches what the
+        operator would see if they expanded the picker.
+        """
+        cache_dir = _cache_dir_for(app_id)
+
+        normalised_entry, smali_class, parse_error = _coalesce_entry(body.entry)
+        if parse_error is not None:
+            # 422 with the operator-readable detail. Frontend renders
+            # this inline as the ✗ validation pill.
+            raise HTTPException(status_code=422, detail=parse_error)
+
+        # ``smali_class`` is guaranteed non-None on the success branch
+        # (the helper's invariant), but mypy / ruff don't know that —
+        # assert so the type narrowing is explicit.
+        assert smali_class is not None
+        assert normalised_entry is not None
+
+        # Single SQLite query against the call-graph store. Cheap —
+        # one ``COUNT(*)`` over a 2-table join — so we don't need to
+        # cache the result. ``include_external=False`` so we only
+        # surface methods the operator can actually trace; matches
+        # the MethodPicker's default visibility.
+        methods_payload = call_graph.list_methods_on_class(
+            cache_dir,
+            smali_class,
+            limit=1,  # We only need ``total``; row payload is wasted.
+            include_external=False,
+        )
+        method_count = int(methods_payload.get("total", 0))
+        class_exists_in_graph = method_count > 0
+        return {
+            "normalised_entry": normalised_entry,
+            "smali_class": smali_class,
+            "class_exists_in_graph": class_exists_in_graph,
+            "method_count": method_count,
+            "error": None,
         }
 
     return router

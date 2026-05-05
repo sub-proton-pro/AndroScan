@@ -4905,6 +4905,122 @@ code { color: var(--accent); }
   border-top: 1px dashed var(--border);
 }
 
+/* ===========================================================================
+ * Phase 11 v2.1 sub-step v2.1.2 — Trace mode coalescer pill
+ *
+ * Renders inline below the ``.trace-form-inline`` row whenever
+ * ``entryDraft`` is non-empty. Five visual variants share the
+ * ``.trace-entry-validation-pill`` base + a per-state modifier:
+ *
+ *   .trace-entry-validation-pill-loading  — spinner + "validating…"
+ *   .trace-entry-validation-pill-ok       — ✓ + class + method count
+ *   .trace-entry-validation-pill-warn     — ⚠ class not in graph
+ *   .trace-entry-validation-pill-err      — ✗ couldn't parse + reason
+ *   .trace-entry-validation-pill-neutral  — — validation unavailable
+ *                                           (404 / 409 / network)
+ *
+ * Colour palette borrows the workbench's existing semantic tokens
+ * (``--accent`` for ok, ``--warn`` / ``--accent`` mix for warn,
+ * ``--err`` for err, ``--muted`` for neutral) so the pill blends
+ * with the rest of the Trace pane rather than introducing a new
+ * palette. The pill sits above the MethodPicker / result region so
+ * operators see the validation signal regardless of which entry-
+ * discovery path they're using (Browse / Advanced / cross-tab seed).
+ * =========================================================================== */
+
+.trace-entry-validation-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.4rem 0 0;
+  padding: 0.25rem 0.6rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 0.78rem;
+  color: var(--text);
+  width: fit-content;
+  /* Constrain on narrow viewports — the parse-error detail string
+   * can be long; allow it to wrap inside the pill rather than
+   * overflowing the pane. */
+  max-width: 100%;
+}
+
+.trace-entry-validation-pill-icon {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.trace-entry-validation-pill-text {
+  /* Allow wrapping for long parse-error strings; keep ``code``
+   * elements inline. */
+  word-break: break-word;
+}
+
+.trace-entry-validation-pill-text code {
+  background: var(--panel);
+  padding: 0 0.25rem;
+  border-radius: 2px;
+  font-size: 0.78rem;
+}
+
+.trace-entry-validation-pill-loading {
+  border-style: dashed;
+  color: var(--muted);
+}
+
+.trace-entry-validation-pill-ok {
+  border-color: var(--accent);
+}
+
+.trace-entry-validation-pill-ok .trace-entry-validation-pill-icon {
+  color: var(--accent);
+}
+
+.trace-entry-validation-pill-warn {
+  border-color: var(--warn, #d49a3a);
+}
+
+.trace-entry-validation-pill-warn .trace-entry-validation-pill-icon {
+  color: var(--warn, #d49a3a);
+}
+
+.trace-entry-validation-pill-err {
+  border-color: var(--err);
+}
+
+.trace-entry-validation-pill-err .trace-entry-validation-pill-icon {
+  color: var(--err);
+}
+
+.trace-entry-validation-pill-neutral {
+  border-style: dashed;
+  color: var(--muted);
+}
+
+.trace-entry-validation-pill-neutral .trace-entry-validation-pill-icon {
+  color: var(--muted);
+}
+
+/* Tiny in-pill spinner — pure CSS, no SVG / image dependency. The
+ * 0.7s rotation is fast enough to feel responsive on the 400ms
+ * debounce window without becoming jittery. */
+.trace-entry-spinner {
+  display: inline-block;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 1.5px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: trace-entry-spinner-rot 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes trace-entry-spinner-rot {
+  to { transform: rotate(360deg); }
+}
+
 /* Phase 10 sub-step 10.8: "Seeded from <source>" pill that sits above
  * the trace form whenever ``pendingTraceEntry`` populated the input
  * field (Inspect → Trace cross-tab handoff). Visually mirrors the
