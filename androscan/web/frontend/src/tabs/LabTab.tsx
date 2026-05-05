@@ -211,7 +211,7 @@ function ManualHooksMode({
    *  without leaving Manual Hooks mode. */
   activeAnchor: BehaviorAnchor | null;
 }) {
-  const { appId, dossier } = useWorkbench();
+  const { appId, dossier, pendingChatPrefill } = useWorkbench();
   const [selected, setSelected] = useState<SelectedNode | null>(null);
 
   // Active trace target. Either the most-recently-Injected session, or
@@ -244,6 +244,27 @@ function ManualHooksMode({
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const rightColRef = useRef<ImperativePanelHandle>(null);
   const [rightColCollapsed, setRightColCollapsed] = useState(false);
+
+  // Phase 11 v2.1 sub-step v2.1.4 — expand the chat panel whenever a
+  // lab-tab prefill arrives via ``pendingChatPrefill``. The prefill
+  // itself is consumed inside ``ChatDock`` (which writes the message
+  // into ``draft`` and clears the pending state); LabTab only owns
+  // the panel-expand half because the imperative
+  // ``chatRef.expand()`` lives in this layer. Both consumers run in
+  // the same commit cycle and close over the original pre-clear
+  // value, so order doesn't matter — see WorkbenchContext.tsx's
+  // ``pendingChatPrefill`` doc-block for the two-consumer rationale.
+  useEffect(() => {
+    if (!pendingChatPrefill) return;
+    if (pendingChatPrefill.tab !== "lab") return;
+    chatRef.current?.expand();
+    // ``setPendingChatPrefill`` is intentionally NOT called here —
+    // ChatDock is the canonical clearer (it owns the textarea and
+    // the consumed state); LabTab's job is purely to make the dock
+    // visible. The dep on ``pendingChatPrefill?.ts`` re-fires the
+    // expand on every fresh prefill (re-click of "Ask AI"), which
+    // is idempotent on an already-expanded panel.
+  }, [pendingChatPrefill?.ts]);
 
   // Hook Builder lives in the middle of the centre vertical PanelGroup, so
   // it can't fold to an edge rail; instead we mirror the AdbShell / logcat

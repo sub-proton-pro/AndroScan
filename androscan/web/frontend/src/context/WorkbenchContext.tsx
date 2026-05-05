@@ -155,6 +155,28 @@ type WorkbenchState = {
   pendingSettingsSection: PendingSettingsSection | null;
   setPendingSettingsSection: (s: SettingsSection | null) => void;
 
+  // Phase 11 v2.1 sub-step v2.1.4: cross-surface "open the chat dock
+  // for this tab with this message pre-filled" intent. Lab Trace
+  // mode's "Ask AI" button writes here (Tier-2(a) of the v2.1
+  // entry-method discoverability scope — guides the operator to the
+  // existing chat-driven semantic search rather than ship a
+  // redundant native search field).
+  //
+  // Two consumers observe this state:
+  //   * ``ChatDock`` (the canonical owner): writes the message into
+  //     its ``draft`` state, focuses the textarea, and clears via
+  //     ``setPendingChatPrefill(null)``.
+  //   * ``LabTab`` (parent of ``ChatDock``): calls
+  //     ``chatRef.current?.expand()`` to ensure the dock is visible
+  //     when the prefill arrives — the dock's ``draft`` write is
+  //     useless if the panel is collapsed.
+  //
+  // Each consumer guards its own ``consumedTsRef`` so the two paths
+  // don't fight over the clear semantics. ``ts`` forces re-fire when
+  // the operator clicks "Ask AI" twice in a row with the same entry.
+  pendingChatPrefill: PendingChatPrefill | null;
+  setPendingChatPrefill: (p: PendingChatPrefillInput | null) => void;
+
   // per-tab chat history (persisted client-side)
   chats: Record<TabId, ChatMessage[]>;
   appendChat: (tab: TabId, msg: ChatMessage) => void;
@@ -217,6 +239,29 @@ export type SettingsSection = "global" | "perApp" | "status" | "diagnostics";
 
 export type PendingSettingsSection = { section: SettingsSection; ts: number };
 
+export type PendingChatPrefillInput = {
+  /** Which tab's chat dock to target. v2.1.4 only writes ``"lab"``,
+   *  but the field is typed as a full ``TabId`` so future Tier-2
+   *  surfaces (e.g. an "Ask AI" button on the Inspect tab) reuse
+   *  the same plumbing without a schema change. */
+  tab: TabId;
+  /** The message to pre-fill into the chat textarea. Plain text;
+   *  Markdown / inline backticks render via ReactMarkdown when the
+   *  operator submits. The chat dock does NOT auto-send — the
+   *  operator reviews / edits, then explicitly clicks Send. */
+  message: string;
+  /** Optional human-readable label shown alongside the chat dock so
+   *  the operator can tell at a glance that the textarea was
+   *  populated by an external source rather than typed in by hand
+   *  (e.g. "Trace mode → entry suggestions"). v2.1.4 doesn't render
+   *  this yet (no UI surface for it on ChatDock today), but the
+   *  field is reserved so v2.2+ can grow a "Prefilled from <source>"
+   *  pill above the textarea without a schema migration. */
+  sourceLabel?: string | null;
+};
+
+export type PendingChatPrefill = PendingChatPrefillInput & { ts: number };
+
 const WorkbenchContext = createContext<WorkbenchState | null>(null);
 
 export function WorkbenchProvider({ children }: { children: ReactNode }) {
@@ -238,6 +283,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     useState<PendingTraceEntry | null>(null);
   const [pendingSettingsSection, setPendingSettingsSectionState] =
     useState<PendingSettingsSection | null>(null);
+  const [pendingChatPrefill, setPendingChatPrefillState] =
+    useState<PendingChatPrefill | null>(null);
   const [labMode, setLabModeState] = useState<LabMode>(() => loadStoredLabMode());
   const [mapResult, setMapResult] = useState<MapResult | null>(null);
   const [mapBusy, setMapBusy] = useState(false);
@@ -399,6 +446,13 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const setPendingChatPrefill = useCallback(
+    (p: PendingChatPrefillInput | null) => {
+      setPendingChatPrefillState(p ? { ...p, ts: Date.now() } : null);
+    },
+    [],
+  );
+
   const setLabMode = useCallback((m: LabMode) => {
     setLabModeState(m);
     try {
@@ -475,6 +529,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setPendingTraceEntry,
       pendingSettingsSection,
       setPendingSettingsSection,
+      pendingChatPrefill,
+      setPendingChatPrefill,
       mapResult,
       mapBusy,
       mapError,
@@ -509,6 +565,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setPendingTraceEntry,
       pendingSettingsSection,
       setPendingSettingsSection,
+      pendingChatPrefill,
+      setPendingChatPrefill,
       mapResult,
       mapBusy,
       mapError,

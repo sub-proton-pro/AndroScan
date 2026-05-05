@@ -4891,6 +4891,54 @@ code { color: var(--accent); }
   font-weight: 500;
 }
 
+/* Phase 11 v2.1 sub-step v2.1.4 — "Ask AI" Tier-2(a) button. Sits in
+ * the same inline-row as the Hops field + Advanced toggle. Visual
+ * weight intentionally matches ``.trace-advanced-toggle`` (same
+ * dashed border, same baseline alignment, same dimensions) so the
+ * inline row reads as a row of peer actions rather than an asymmetric
+ * mix of "primary" + "afterthought". The accent comes through on the
+ * leading sparkle icon, NOT on the border, so the button doesn't
+ * compete with v2.1.2's ✓/⚠/✗ validation pill (which owns the
+ * accent-coloured border discipline below the row). */
+.trace-ask-ai-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 3px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.8rem;
+  padding: 0.35rem 0.6rem;
+  align-self: end;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.trace-ask-ai-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.trace-ask-ai-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* Sparkle icon (✨) carries the LLM-flavour visual cue. Slightly
+ * larger than the surrounding text so it reads as an icon rather
+ * than an inline glyph, but kept under 1rem so the button doesn't
+ * grow past the Hops field's vertical bound. */
+.trace-ask-ai-icon {
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.trace-ask-ai-label {
+  font-weight: 500;
+}
+
 .trace-advanced-form-body {
   /* Span the full inline-row width when expanded so the entry input
    * has room for a real Smali signature (mirrors the v1 form's

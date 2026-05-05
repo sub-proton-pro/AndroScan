@@ -127,6 +127,33 @@
  *   * Suggestion state clears on ``entryDraft`` change (so a stale
  *     candidate list from a previous typo doesn't linger after the
  *     operator types something new).
+ *
+ * **v2.1.4 — Tier-2(a) "Ask AI" button + chat-dock prefill**:
+ *
+ *   * A small "Ask AI" button lives in the inline-row form alongside
+ *     the Hops field and Advanced toggle (always visible — works
+ *     regardless of whether Advanced is expanded).
+ *   * Click → writes ``pendingChatPrefill = {tab: "lab", message:
+ *     "I want to trace ` + "`<entry>`" + `. What entry methods should I
+ *     consider?"}`` to ``WorkbenchContext`` (timestamp-stamped via the
+ *     setter, mirrors the existing ``pendingTraceEntry`` /
+ *     ``pendingHookPrefill`` re-fire semantics).
+ *   * The chat dock observes ``pendingChatPrefill`` and writes the
+ *     message into its ``draft`` state + focuses the textarea +
+ *     clears the pending state. The parent ``LabTab`` ALSO observes
+ *     it and calls ``chatRef.current?.expand()`` to ensure the dock
+ *     is visible (a prefill into a collapsed dock is invisible).
+ *   * Disabled when ``entryDraft.trim()`` is empty — the prompt
+ *     template substitutes the operator's typed entry, so an empty
+ *     entry would produce a meaningless "I want to trace ``" prompt.
+ *   * NO new skill ships in v2.1.4. The pre-filled prompt
+ *     leverages the existing tier-3 skills
+ *     (``search_decompiled_sources`` for RAG over decompiled
+ *     sources + ``query_call_graph`` for call-graph context) which
+ *     are already registered in the chat skill table — the LLM
+ *     picks them up automatically based on the prompt's intent.
+ *     v2.1.5 adds a dedicated ``suggest_trace_entry`` skill, but
+ *     v2.1.4 ships chat-only ahead of that.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -258,7 +285,12 @@ type CoalescerResult =
   | { kind: "unavailable"; status: number; detail: string };
 
 export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
-  const { pendingTraceEntry, setPendingTraceEntry, dossier } = useWorkbench();
+  const {
+    pendingTraceEntry,
+    setPendingTraceEntry,
+    setPendingChatPrefill,
+    dossier,
+  } = useWorkbench();
 
   // ----- form state ------------------------------------------------------
   const [entryDraft, setEntryDraft] = useState("");
@@ -633,6 +665,22 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
     // via the existing 11.2 auto-fire on overload-pick path.
   }, []);
 
+  // v2.1.4 — Tier-2(a) "Ask AI" handler. Writes a pre-filled prompt
+  // to ``pendingChatPrefill`` so the chat dock pops open (LabTab
+  // expands the panel) with a textarea seeded with a natural-
+  // language question containing the operator's typed entry.
+  // Disabled when ``trimmedEntry`` is empty (the prompt template
+  // substitutes the typed entry — an empty entry would produce a
+  // degenerate "I want to trace ``" prompt).
+  const onAskAI = useCallback(() => {
+    if (!trimmedEntry) return;
+    setPendingChatPrefill({
+      tab: "lab",
+      message: `I want to trace \`${trimmedEntry}\`. What entry methods should I consider?`,
+      sourceLabel: "Trace mode → entry suggestions",
+    });
+  }, [trimmedEntry, setPendingChatPrefill]);
+
   const onPickMethod = (sig: string) => {
     setEntryDraft(sig);
     setSeedLabel(null);
@@ -811,6 +859,29 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
               <span className="trace-advanced-toggle-title">
                 Advanced: type Smali signature directly
               </span>
+            </button>
+            {/* v2.1.4 — Tier-2(a) "Ask AI" button. Pre-fills the chat
+                dock with a natural-language question seeded with the
+                operator's typed entry, then expands the dock (parent
+                LabTab observes ``pendingChatPrefill`` and calls
+                ``chatRef.current?.expand()``). Disabled when the entry
+                is empty — the prompt template substitutes the typed
+                value, so an empty entry would produce a degenerate
+                "I want to trace ``" prompt. */}
+            <button
+              type="button"
+              className="trace-ask-ai-button"
+              onClick={onAskAI}
+              disabled={!trimmedEntry}
+              title={
+                trimmedEntry
+                  ? "Open the chat dock with a pre-filled prompt asking about entry methods related to your typed input"
+                  : "Type something into the entry field first — Ask AI uses your input as the prompt seed"
+              }
+              aria-label="Ask AI for entry-method suggestions related to the current input"
+            >
+              <span className="trace-ask-ai-icon" aria-hidden="true">✨</span>
+              <span className="trace-ask-ai-label">Ask AI</span>
             </button>
             {advancedExpanded && (
               <div

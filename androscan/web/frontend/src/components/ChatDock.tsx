@@ -96,7 +96,16 @@ function buildPreview(attachments: ChatAttachment[]): string {
  * wrapping, allowlisted system prompts) and persists transcripts.
  */
 export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props) {
-  const { chats, appendChat, updateChat, clearChat, appId, runTs } = useWorkbench();
+  const {
+    chats,
+    appendChat,
+    updateChat,
+    clearChat,
+    appId,
+    runTs,
+    pendingChatPrefill,
+    setPendingChatPrefill,
+  } = useWorkbench();
   const history = chats[tab];
   const [draft, setDraft] = useState("");
   const [showContext, setShowContext] = useState(false);
@@ -106,6 +115,12 @@ export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props
   const listRef = useRef<HTMLDivElement>(null);
   // Cancel any in-flight stream when the user switches tabs / unmounts.
   const abortRef = useRef<AbortController | null>(null);
+  // Phase 11 v2.1 sub-step v2.1.4 — textarea ref for focusing on
+  // ``pendingChatPrefill`` consumption. Without focus, the operator
+  // would need to click the textarea before they could edit the
+  // prefilled prompt — adds friction the "Ask AI" button is trying
+  // to remove.
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -127,6 +142,41 @@ export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [history, busy]);
+
+  // Phase 11 v2.1 sub-step v2.1.4 — consume ``pendingChatPrefill`` for
+  // this tab. Writes the prefill ``message`` into ``draft``, focuses the
+  // textarea, and clears the pending state so a downstream observer
+  // (LabTab's chatRef.expand()) doesn't keep re-firing on every render.
+  //
+  // Two-consumer pattern: the parent (LabTab) ALSO observes
+  // ``pendingChatPrefill`` to expand the chat panel. Both effects run
+  // in the same commit cycle and close over the same pre-clear value,
+  // so the order of clear-vs-expand doesn't matter — LabTab's effect
+  // sees the original value via its own closure even after this
+  // effect calls ``setPendingChatPrefill(null)``.
+  //
+  // Re-fire semantics: the dep is ``pendingChatPrefill?.ts``, so the
+  // operator clicking "Ask AI" twice in a row with the same entry
+  // (each click stamps a fresh ``ts``) reliably re-fires the prefill.
+  // The ``if (!pendingChatPrefill) return;`` short-circuit handles
+  // the post-clear render where ``ts`` flips to ``undefined``.
+  useEffect(() => {
+    if (!pendingChatPrefill) return;
+    if (pendingChatPrefill.tab !== tab) return;
+    setDraft(pendingChatPrefill.message);
+    setError(null);
+    // Focus + place caret at end so the operator can immediately edit
+    // / extend the prefilled prompt without having to click first.
+    const ta = textareaRef.current;
+    if (ta) {
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
+    setPendingChatPrefill(null);
+    // ``setPendingChatPrefill`` is a stable callback; intentional
+    // partial deps to avoid re-firing on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingChatPrefill?.ts, tab]);
 
   const tooLong = draft.length > MAX_PROMPT_CHARS;
   const atLimit = draft.length >= MAX_PROMPT_CHARS;
@@ -331,6 +381,7 @@ export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props
       </div>
       <div className="chat-input-row">
         <textarea
+          ref={textareaRef}
           className="chat-input"
           placeholder="Ask about the current selection… (Enter to send, Shift+Enter for newline)"
           value={draft}
