@@ -276,25 +276,27 @@ Use the following format for new entries:
 ---
 
 ### ISSUE-009: Workbench chat cannot dig deeper than the initial RAG sweep
-- status: Open
+- status: Resolved (Phase 11 v2.1.5 — landed 2026-05-05 as a side-effect of the chat-widget pattern needing an agentic-loop substrate to live on)
 - impact: Medium
 - area: web / chat / RAG
 - introduced / observed: 2026-04 (Inspect-tab testing on a fixture banking APK)
 - summary:
-  `androscan/web/chat.py` is single-pass: it runs at most one `_enrich_inspect_with_rag` sweep (top-4 chunks, fail-soft) up-front, then calls the LLM once and returns prose. The LLM cannot request additional skills mid-turn the way `androscan/internal/workflow.py` does. When the question hinges on a specific method-level chunk that didn't make `_INSPECT_RAG_TOP_K = 4`, the model honestly hedges with "decompile and look it up yourself" instead of being able to call `search_decompiled_sources` (or `get_decompiled_method`) for the missing piece — even though those skills are registered and the analysis pipeline already uses them.
-- why it matters:
-  It produces low-trust answers for questions that the registered skill set can answer in milliseconds, undercutting the workbench's "ask the LLM about this APK" value proposition. Operators learn not to trust Inspect chat for deep questions, which weakens adoption.
-- current workaround:
-  Ask narrower questions, paste the suspected class name explicitly into the prompt so the RAG embedding aligns with the class header chunk, or run the full `androscan.py --apk ... --task ...` analysis pipeline (which has the agentic loop).
-- recommended fix:
-  Implement the bounded agentic skill loop + consent-class hook described in **DEC-022**. Independently, raise `_INSPECT_RAG_TOP_K` from 4 → 8–10 and bump `_INSPECT_RAG_PER_HIT_CHARS` proportionally as a same-day band-aid that reduces (but does not eliminate) the failure rate.
+  `androscan/web/chat.py` was single-pass through Phase 11 v2: it ran at most one `_enrich_inspect_with_rag` sweep (top-4 chunks, fail-soft) up-front, then called the LLM once and returned prose. The LLM could not request additional skills mid-turn the way `androscan/internal/workflow.py` did. When the question hinged on a specific method-level chunk that didn't make `_INSPECT_RAG_TOP_K = 4`, the model honestly hedged with "decompile and look it up yourself" instead of being able to call `search_decompiled_sources` (or `get_decompiled_method`) for the missing piece — even though those skills were registered and the analysis pipeline already used them.
+- why it mattered:
+  Produced low-trust answers for questions that the registered skill set could answer in milliseconds, undercutting the workbench's "ask the LLM about this APK" value proposition. Operators learned not to trust Inspect chat for deep questions, which weakened adoption.
+- resolution (2026-05-05, v2.1.5 — architectural deviation from the v2.1.0 spec):
+  The v2.1.0 spec for v2.1.5 was scoped to "Tier 3 skill + skill-response `widgets[]` schema extension + `<TraceEntryCandidateWidget>` chat renderer + auto-fire handoff" — and assumed the chat agentic loop already existed. It did not (the loop existed only in the CLI's `androscan/internal/workflow.py`, not in the chat-streaming code path). The chat-widget pattern needed an agentic loop substrate to live on (`widget` SSE events forwarded between turns, consent-class skills emitting `skill_pending` and halting, skill-result text appended to message history for subsequent turns) — so v2.1.5 had to ship the bounded agentic loop refactor first as the substrate the widget pattern is built on, then ship the widget pattern + the new `suggest_trace_entry` skill on top. **The agentic loop refactor was DEC-022's explicit recommended fix for this issue** — v2.1.5 just shipped it earlier than expected and as part of a different release than originally framed. **As-shipped:** new `_stream_chat_agentic_request` async generator in `androscan/web/chat.py` orchestrates multiple blocking `llm.client.complete()` calls within a bounded loop (`MAX_AGENTIC_TURNS = 5`, `MAX_SKILLS_PER_TURN = 3`), parses LLM JSON responses (`thinking`, `content`, `skill_requests`), executes non-confirmation skills server-side (consent-class `requires_confirmation=True` skills emit `skill_pending` and halt with explanatory `content` instead of auto-executing — safer than auto-execution because consent-class skills like `generate_frida_hook` / `extract_apk` / device-touching skills now stay explicitly gated behind operator UI consent which simply isn't wired yet), appends skill results to message history for subsequent LLM turns, and emits four new SSE events (`skill_request` / `skill_result` / `skill_pending` / `widget`). New `agentic_loop: bool` request body field (optional, defaults to `False` for backward compatibility); `stream_chat_request` dispatches to `_stream_chat_agentic_request` when `True`, else falls back to the legacy single-pass streaming path. Frontend opt-in via `AGENTIC_LOOP_TABS = new Set(["lab"])` in `ChatDock.tsx` — Lab tab opts into agentic loop; Reports / Inspect / Settings stay on the legacy single-pass path for now (rolling agentic-loop opt-in out to other tabs is a v3 / Phase 12 candidate — see DEC-022 cross-link below). Verified end-to-end in `tests/test_chat_stream.py` (+8 new tests covering: agentic loop dispatch on `agentic_loop: true`; backward-compat single-pass on `agentic_loop: false` / absent; `skill_request` + `skill_result` events forwarded; `widget` event forwarded after `skill_result`; bounded `MAX_AGENTIC_TURNS` halts gracefully; consent-class skills emit `skill_pending` and halt without executing). The `_INSPECT_RAG_TOP_K = 4` band-aid that the original "recommended fix" mentioned was not necessary — the agentic loop's ability to call `search_decompiled_sources` / `get_decompiled_method` / `query_call_graph` mid-turn covers the original failure mode.
 - related tasks:
-  - "RE Workbench chat — agentic skill loop (P2, planned per DEC-022)" in `docs/TASKS.md` (under § Interactive RE Workbench)
+  - **Closed:** "RE Workbench chat — agentic skill loop (P2, planned per DEC-022)" in `docs/TASKS.md` (under § Interactive RE Workbench) — ratified as part of the v2.1.5 sub-step.
+  - **Forward link:** rolling agentic-loop opt-in out to Inspect / Reports / Settings tabs is a v3 / Phase 12 candidate (operator-demand-gated; the v2.1.5 pattern needs to prove itself in operator hands on the Lab tab first).
 - related docs:
-  - `docs/DECISIONS.md` DEC-022
-  - `docs/STATE.md` (Partially implemented — workbench chat single-pass)
-  - `androscan/web/chat.py`
-  - `androscan/internal/workflow.py`
+  - `docs/DECISIONS.md` DEC-022 (parent — chat agentic loop)
+  - `docs/DECISIONS.md` DEC-025 (v2.1 closing-note extension documents the architectural deviation in detail)
+  - `docs/STATE.md` "Recent completed work" v2.1.5 entry
+  - `docs/TASKS.md` § Phase 11 v2.1 follow-up release — sub-step backlog v2.1.5 row
+  - `androscan/web/chat.py` (the bounded agentic loop substrate)
+  - `androscan/skills/suggest_trace_entry.py` (the first widget-emitting skill — first concrete operator-visible benefit of the closed loop)
+  - `androscan/internal/workflow.py` (the original CLI agentic loop — the chat loop is structurally similar but with SSE event emission for streaming UX)
 
 ---
 
