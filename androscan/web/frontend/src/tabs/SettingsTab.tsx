@@ -11,7 +11,7 @@
  * source pills and live_reloadable badges are consistent.
  */
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   fetchAppSettings,
   fetchGlobalSettings,
@@ -35,9 +35,12 @@ import { rebuildRagIndex } from "../api/rag";
 import { rebuildGraph } from "../api/graph";
 import { startFridaServer } from "../api/frida";
 import { IconCheck, IconCopy } from "../components/Icons";
-import { useWorkbench } from "../context/WorkbenchContext";
+import { useWorkbench, type SettingsSection } from "../context/WorkbenchContext";
 
-type Section = "global" | "perApp" | "status" | "diagnostics";
+// Keep ``Section`` an alias of the canonical ``SettingsSection`` exported
+// from WorkbenchContext so the deep-link plumbing stays type-safe at the
+// boundary (HealthDot writes ``SettingsSection``, this tab reads it).
+type Section = SettingsSection;
 
 const SECTION_NAV: { id: Section; label: string; hint: string }[] = [
   { id: "global",      label: "Global settings", hint: "global_config.yaml" },
@@ -47,7 +50,27 @@ const SECTION_NAV: { id: Section; label: string; hint: string }[] = [
 ];
 
 export function SettingsTab() {
-  const [section, setSection] = useState<Section>("global");
+  const { pendingSettingsSection, setPendingSettingsSection } = useWorkbench();
+  // Initial section honours a pending deep-link if one is queued at
+  // mount time (HealthDot click on a non-Settings tab → SettingsTab
+  // mounts fresh with the seed), otherwise falls back to "global".
+  const [section, setSection] = useState<Section>(
+    () => pendingSettingsSection?.section ?? "global",
+  );
+  // Track which deep-link timestamp we've already consumed so we don't
+  // fire the effect twice on the same seed (StrictMode double-mount in
+  // dev would otherwise re-route the operator away from a sub-section
+  // they navigated to themselves).
+  const consumedTsRef = useRef<number | null>(
+    pendingSettingsSection?.ts ?? null,
+  );
+  useEffect(() => {
+    if (!pendingSettingsSection) return;
+    if (pendingSettingsSection.ts === consumedTsRef.current) return;
+    consumedTsRef.current = pendingSettingsSection.ts;
+    setSection(pendingSettingsSection.section);
+    setPendingSettingsSection(null);
+  }, [pendingSettingsSection, setPendingSettingsSection]);
   return (
     <div className="settings-tab">
       <aside className="settings-nav" aria-label="Settings sections">

@@ -143,6 +143,18 @@ type WorkbenchState = {
   pendingTraceEntry: PendingTraceEntry | null;
   setPendingTraceEntry: (p: PendingTraceEntryInput | null) => void;
 
+  // Cross-surface "land on this Settings sub-section" intent. The
+  // global header's ``HealthDot`` writes here (with section ``"status"``)
+  // before flipping the active tab to ``"settings"`` so the operator
+  // lands directly on the live-probe panel rather than on the default
+  // Global settings panel. ``SettingsTab`` reads this on mount + on
+  // ``ts`` change and clears via ``setPendingSettingsSection(null)``.
+  // Re-fire semantics mirror ``pendingTraceEntry`` so a second pill
+  // click after the operator navigated to a different sub-section
+  // reliably routes back to ``"status"``.
+  pendingSettingsSection: PendingSettingsSection | null;
+  setPendingSettingsSection: (s: SettingsSection | null) => void;
+
   // per-tab chat history (persisted client-side)
   chats: Record<TabId, ChatMessage[]>;
   appendChat: (tab: TabId, msg: ChatMessage) => void;
@@ -198,6 +210,13 @@ export type PendingTraceEntryInput = {
 
 export type PendingTraceEntry = PendingTraceEntryInput & { ts: number };
 
+/** Canonical Settings tab sub-section id. Must stay in sync with
+ *  ``SettingsTab.tsx``'s local ``Section`` alias and the ``SECTION_NAV``
+ *  table that drives the left-rail nav. */
+export type SettingsSection = "global" | "perApp" | "status" | "diagnostics";
+
+export type PendingSettingsSection = { section: SettingsSection; ts: number };
+
 const WorkbenchContext = createContext<WorkbenchState | null>(null);
 
 export function WorkbenchProvider({ children }: { children: ReactNode }) {
@@ -217,6 +236,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     useState<PendingHookPrefill | null>(null);
   const [pendingTraceEntry, setPendingTraceEntryState] =
     useState<PendingTraceEntry | null>(null);
+  const [pendingSettingsSection, setPendingSettingsSectionState] =
+    useState<PendingSettingsSection | null>(null);
   const [labMode, setLabModeState] = useState<LabMode>(() => loadStoredLabMode());
   const [mapResult, setMapResult] = useState<MapResult | null>(null);
   const [mapBusy, setMapBusy] = useState(false);
@@ -371,6 +392,13 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const setPendingSettingsSection = useCallback(
+    (s: SettingsSection | null) => {
+      setPendingSettingsSectionState(s ? { section: s, ts: Date.now() } : null);
+    },
+    [],
+  );
+
   const setLabMode = useCallback((m: LabMode) => {
     setLabModeState(m);
     try {
@@ -445,6 +473,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setPendingHookPrefill,
       pendingTraceEntry,
       setPendingTraceEntry,
+      pendingSettingsSection,
+      setPendingSettingsSection,
       mapResult,
       mapBusy,
       mapError,
@@ -477,6 +507,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setPendingHookPrefill,
       pendingTraceEntry,
       setPendingTraceEntry,
+      pendingSettingsSection,
+      setPendingSettingsSection,
       mapResult,
       mapBusy,
       mapError,

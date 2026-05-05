@@ -41,15 +41,24 @@ function ActiveTab() {
 }
 
 function HeaderStatus() {
-  const { status, setTab } = useWorkbench();
+  const { status, setTab, setPendingSettingsSection } = useWorkbench();
   // Layout: [AppPicker | HealthDot | status text], all pinned to the
   // right edge by ``.status``'s ``margin-left: auto``. AppPicker shares
   // ``appId`` with the Reports sidebar via WorkbenchContext, so picking
-  // from either surface updates the other in lockstep.
+  // from either surface updates the other in lockstep. Clicking the
+  // dot writes ``pendingSettingsSection: "status"`` *before* flipping
+  // the tab so SettingsTab picks up the deep-link signal on its first
+  // render and lands the operator on the live-probe panel directly
+  // (rather than the default Global settings panel — the operator
+  // wants the unhappy probe, not the YAML form).
+  const onPillClick = () => {
+    setPendingSettingsSection("status");
+    setTab("settings");
+  };
   return (
     <span className="status">
       <AppPicker />
-      <HealthDot onClick={() => setTab("settings")} />
+      <HealthDot onClick={onPillClick} />
       {status}
     </span>
   );
