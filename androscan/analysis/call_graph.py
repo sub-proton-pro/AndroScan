@@ -1127,6 +1127,63 @@ def list_methods_on_class(
     }
 
 
+def list_class_names(
+    decompile_cache_dir: Path,
+    *,
+    include_external: bool = False,
+) -> list[dict[str, str]]:
+    """List every class indexed in the call graph as ``{smali_class,
+    simple_name, package}`` triples.
+
+    Phase 11 v2.1 sub-step v2.1.3 backbone for the
+    ``POST /api/trace/{app_id}/suggest-similar-classes`` route. The
+    "Find similar classes" Tier-1 suggestion path fuzzy-matches the
+    operator's typed input against the ``simple_name`` column (the
+    last class-name segment, e.g. ``MainActivity`` for
+    ``Lcom/example/MainActivity;``) — a typo in either the package
+    OR the class name still surfaces the right candidate.
+
+    Returns the bare list (not a SQLite cursor / generator) because
+    fuzzy matching needs random-access traversal anyway, and the
+    materialised list lets the caller call
+    :func:`difflib.SequenceMatcher` once per candidate without
+    re-binding the connection. Per-row cost is bounded — three
+    short strings per class — so even a 50k-class app stays well
+    inside the per-request memory budget.
+
+    ``include_external=False`` (default) drops ``is_external=1``
+    rows because the call-graph store materialises every external
+    callee as an in-graph class node — usually noise from the
+    operator's perspective when they're hunting their own typo.
+
+    Returns ``[]`` when the SQLite store doesn't exist yet (call
+    graph not built). Logs + returns ``[]`` on a SQLite read error
+    (fail-soft: the suggestion path's UX is "no candidates" — the
+    operator's primary discovery path is still Browse / Advanced).
+    """
+    db = call_graph_db_path(decompile_cache_dir)
+    if not db.is_file():
+        return []
+    where = "WHERE is_external = 0" if not include_external else ""
+    try:
+        with _connect(db) as conn:
+            rows = conn.execute(
+                "SELECT smali_class, simple_name, package FROM classes "
+                f"{where} ORDER BY package, simple_name"
+            ).fetchall()
+    except sqlite3.Error as e:
+        logger.warning("list_class_names sqlite error: %s", e)
+        return []
+    return [
+        {
+            "smali_class": str(r["smali_class"]),
+            "simple_name": str(r["simple_name"]),
+            "package": str(r["package"]),
+        }
+        for r in rows
+    ]
+
+
 def _normalise_smali_class(s: str) -> str:
     """Accept any of ``Lcom/example/Foo;`` / ``com/example/Foo`` /
     ``com.example.Foo`` and return the canonical Smali class descriptor.

@@ -95,9 +95,41 @@
  *     and above the MethodPicker so it's visible regardless of which
  *     entry-discovery path the operator is using (Browse / Advanced /
  *     cross-tab seed).
+ *
+ * **v2.1.3 — Tier-1 "Find similar classes" suggestions on the ⚠
+ * validation-pill state**:
+ *
+ *   * When the v2.1.2 pill renders ⚠ (input parsed cleanly but the
+ *     class isn't in the call graph — typo, wrong package, stale
+ *     class name from a crash report), an inline "Find similar
+ *     classes" button grows next to the pill.
+ *   * Click → fires ``POST /api/trace/{app_id}/suggest-similar-classes``
+ *     (a deliberate operator action, NOT debounced — we want the
+ *     suggestion list to materialise within one tap of the click).
+ *   * Backend fuzzy-matches the operator's typed class name against
+ *     the call graph's ``classes.simple_name`` column via
+ *     :func:`difflib.SequenceMatcher` and returns up to 5 candidates
+ *     with ratio >= 0.6 (no LLM in v2.1.3; the LLM-fallback path
+ *     ships in v2.1.5 wired through the same endpoint).
+ *   * Candidates render as clickable suggestion pills below the
+ *     validation pill (``trace-similar-classes-list``); each pill
+ *     shows ``simple_name`` (bold lead) + ``package`` (muted trail)
+ *     + a confidence-based opacity cue.
+ *   * Click a candidate → seeds ``entryDraft`` with the candidate's
+ *     Smali class-prefix (``Lcom/example/MainActivity;->``) → the
+ *     v2.1.2 coalescer auto-re-fires (entryDraft change triggers
+ *     the debounced effect) → MethodPicker activates because the
+ *     new entry is a class-prefix → operator picks an overload →
+ *     trace fires via the existing 11.2 auto-fire path.
+ *   * **No auto-fire on Tier-1 candidate click** (per spec) — the
+ *     click is "I pick this class", not "I pick this entry method";
+ *     the MethodPicker is still the explicit trace-fire step.
+ *   * Suggestion state clears on ``entryDraft`` change (so a stale
+ *     candidate list from a previous typo doesn't linger after the
+ *     operator types something new).
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IconChevronDown, IconChevronUp } from "../components/Icons";
 import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
@@ -115,9 +147,11 @@ import {
   fetchTraceStatus,
   listTraceAnchors,
   normaliseTraceEntry,
+  suggestSimilarClasses,
   useTraceAnchor,
   type BehaviorAnchor,
   type NormaliseEntryResponse,
+  type SimilarClassCandidate,
   type TraceAnchorRow,
   type TraceStatusPayload,
 } from "../api/trace";
@@ -291,6 +325,9 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
     setCoalescerLoading(false);
     setCoalescerResult(null);
     coalescerInflightKeyRef.current = null;
+    setSimilarLoading(false);
+    setSimilarCandidates(null);
+    setSimilarError(null);
     clear();
   }, [appId, clear]);
 
@@ -452,6 +489,18 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
   const [coalescerResult, setCoalescerResult] = useState<CoalescerResult | null>(null);
   const coalescerInflightKeyRef = useRef<string | null>(null);
 
+  // v2.1.3 similar-classes state. Triggered explicitly by the
+  // operator clicking the "Find similar classes" button on the ⚠
+  // validation pill (NOT a debounced effect — see the v2.1.3 doc
+  // block on the component for the rationale). Cleared on
+  // ``entryDraft`` change so a stale candidate list doesn't
+  // linger after the operator starts typing again.
+  const [similarLoading, setSimilarLoading] = useState(false);
+  const [similarCandidates, setSimilarCandidates] = useState<
+    SimilarClassCandidate[] | null
+  >(null);
+  const [similarError, setSimilarError] = useState<string | null>(null);
+
   useEffect(() => {
     if (!appId || !pickerCtx) {
       setPickerMethods(null);
@@ -528,6 +577,61 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
       clearTimeout(handle);
     };
   }, [appId, trimmedEntry]);
+
+  // v2.1.3 — clear the Tier-1 similar-classes suggestion list
+  // whenever the operator's entry changes. Without this, a stale
+  // candidate list from the previous typo would still hang under
+  // the validation pill after the operator typed a corrected name
+  // (or seeded a fresh entry from Browse / cross-tab handoff).
+  // Intentionally NOT debounced — the suggestions are only fetched
+  // on the explicit "Find similar classes" button click, so the
+  // clear must fire on the keystroke (not on the debounced
+  // settle) to keep the UI honest.
+  useEffect(() => {
+    setSimilarLoading(false);
+    setSimilarCandidates(null);
+    setSimilarError(null);
+  }, [trimmedEntry]);
+
+  // v2.1.3 — explicit-click handler for the "Find similar classes"
+  // button on the ⚠ validation pill. POSTs the operator's typed
+  // input to the v2.1.3 suggestion endpoint and renders the
+  // returned candidates as clickable pills. NOT debounced — this
+  // is a deliberate operator action.
+  const onFindSimilarClasses = useCallback(async () => {
+    if (!appId || !trimmedEntry || similarLoading) return;
+    setSimilarLoading(true);
+    setSimilarError(null);
+    setSimilarCandidates(null);
+    const r = await suggestSimilarClasses(appId, trimmedEntry);
+    setSimilarLoading(false);
+    if (r.ok) {
+      setSimilarCandidates(r.data.candidates);
+    } else {
+      setSimilarCandidates([]);
+      setSimilarError(
+        r.status > 0
+          ? `Suggestion lookup failed (${r.status}): ${r.error}`
+          : `Suggestion lookup failed: ${r.error}`,
+      );
+    }
+  }, [appId, trimmedEntry, similarLoading]);
+
+  // v2.1.3 — operator picked one of the fuzzy / LLM candidates.
+  // Seed entryDraft with ``<smali_class>->`` (class-prefix shape that
+  // activates the v1 MethodPicker) — this triggers the v2.1.2
+  // coalescer auto-re-fire (entryDraft change → debounced effect)
+  // and clears the picker's previous selection so the new class's
+  // overload list materialises. NO auto-fire on the trace itself
+  // (per spec — operator picks an overload via the picker, which
+  // is the explicit Trace step).
+  const onPickSimilarClass = useCallback((c: SimilarClassCandidate) => {
+    const seed = `${c.smali_class}->`;
+    setEntryDraft(seed);
+    setSeedLabel(null);
+    // Don't activate the trace here — let the picker handle it
+    // via the existing 11.2 auto-fire on overload-pick path.
+  }, []);
 
   const onPickMethod = (sig: string) => {
     setEntryDraft(sig);
@@ -756,6 +860,22 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
             entry={trimmedEntry}
             loading={coalescerLoading}
             result={coalescerResult}
+            similarLoading={similarLoading}
+            similarCount={similarCandidates?.length ?? null}
+            onFindSimilar={onFindSimilarClasses}
+          />
+
+          {/* v2.1.3 — Tier-1 fuzzy / LLM suggestion list. Renders
+              under the validation pill when the operator has clicked
+              "Find similar classes" on the ⚠ state. The pill itself
+              owns the button + spinner; this region renders only
+              the result-list (or its loading / empty / error
+              states). */}
+          <SimilarClassesList
+            loading={similarLoading}
+            candidates={similarCandidates}
+            error={similarError}
+            onPick={onPickSimilarClass}
           />
 
           {pickerCtx && (
@@ -1059,9 +1179,12 @@ function MethodPicker({
 //                      input as AND how many methods the picker would
 //                      surface.
 //   * ⚠ not in graph — input parsed cleanly but no matching class in
-//                      the call graph. v2.1.3's "Find similar
-//                      classes" button (next sub-step) will hang off
-//                      this state via a sibling pill.
+//                      the call graph. v2.1.3 grows a "Find similar
+//                      classes" button on the right of the pill — on
+//                      click, the suggestion endpoint fuzzy-matches
+//                      against the call graph's class list and the
+//                      <SimilarClassesList> sibling renders the
+//                      candidates as clickable pills.
 //   * ✗ parse error  — coalescer returned 422; pill carries the
 //                      operator-readable reason (e.g. "no class name
 //                      found — expected an UpperCamelCase segment").
@@ -1083,9 +1206,28 @@ type EntryValidationPillProps = {
   /** ``null`` until the first response arrives for the current
    *  ``entry``; one of the discriminated kinds afterwards. */
   result: CoalescerResult | null;
+  /** v2.1.3 — ``true`` while the "Find similar classes" suggestion
+   *  fetch is in flight. The pill renders the button as a disabled
+   *  spinner in this state. */
+  similarLoading: boolean;
+  /** v2.1.3 — number of suggestion candidates already fetched for
+   *  the current entry, or ``null`` if the operator hasn't clicked
+   *  the button yet. Used to label the button as "Find again" once
+   *  the operator has fetched at least once for this entry. */
+  similarCount: number | null;
+  /** v2.1.3 — click handler for the "Find similar classes" button.
+   *  Only wired when the pill renders the ⚠ state. */
+  onFindSimilar: () => void;
 };
 
-function EntryValidationPill({ entry, loading, result }: EntryValidationPillProps) {
+function EntryValidationPill({
+  entry,
+  loading,
+  result,
+  similarLoading,
+  similarCount,
+  onFindSimilar,
+}: EntryValidationPillProps) {
   if (!entry) return null;
   if (loading) {
     return (
@@ -1121,6 +1263,13 @@ function EntryValidationPill({ entry, loading, result }: EntryValidationPillProp
         </div>
       );
     }
+    // v2.1.3 — when the input parses cleanly but the class isn't
+    // in the call graph, grow the "Find similar classes" button on
+    // the right of the pill. Operator click → fuzzy / LLM
+    // suggestion lookup → <SimilarClassesList> sibling renders the
+    // candidates as clickable suggestion pills.
+    const buttonLabel =
+      similarCount !== null && !similarLoading ? "Find again" : "Find similar classes";
     return (
       <div
         className="trace-entry-validation-pill trace-entry-validation-pill-warn"
@@ -1132,6 +1281,22 @@ function EntryValidationPill({ entry, loading, result }: EntryValidationPillProp
         <span className="trace-entry-validation-pill-text">
           <code>{smali_class}</code> — class not found in call graph
         </span>
+        <button
+          type="button"
+          className="trace-entry-validation-pill-action"
+          onClick={onFindSimilar}
+          disabled={similarLoading}
+          title="Fuzzy-match against the call graph's class list"
+        >
+          {similarLoading ? (
+            <>
+              <span className="trace-entry-spinner" aria-hidden="true" />{" "}
+              searching…
+            </>
+          ) : (
+            buttonLabel
+          )}
+        </button>
       </div>
     );
   }
@@ -1163,6 +1328,94 @@ function EntryValidationPill({ entry, loading, result }: EntryValidationPillProp
       <span className="trace-entry-validation-pill-text">
         validation unavailable
       </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SimilarClassesList — Phase 11 v2.1 sub-step v2.1.3.
+// Renders the Tier-1 fuzzy / LLM suggestion-candidate list under the
+// validation pill. Visible only after the operator has clicked
+// "Find similar classes" on the ⚠ pill (see <EntryValidationPill>).
+//
+// States:
+//
+//   * Loading — operator clicked the button; backend lookup in
+//               flight. (The button itself shows a spinner; this
+//               region renders nothing during loading to avoid
+//               "ghost" placeholder pills flickering in.)
+//   * Empty   — backend returned no candidates above the cutoff.
+//               Shows operator-facing copy explaining the next step
+//               (try Browse / Advanced).
+//   * Error   — network / 404 / 5xx; shows the underlying detail
+//               so the operator knows whether to retry.
+//   * List    — N candidates; each renders as a clickable pill with
+//               simple_name (lead) + package (muted trail) + a
+//               confidence-based opacity cue. Click → seeds entryDraft
+//               with the candidate's class-prefix → coalescer
+//               auto-re-fires → MethodPicker activates.
+// ---------------------------------------------------------------------------
+
+type SimilarClassesListProps = {
+  loading: boolean;
+  candidates: SimilarClassCandidate[] | null;
+  error: string | null;
+  onPick: (c: SimilarClassCandidate) => void;
+};
+
+function SimilarClassesList({ loading, candidates, error, onPick }: SimilarClassesListProps) {
+  if (loading) return null;
+  if (candidates === null && !error) return null;
+  if (error) {
+    return (
+      <div className="trace-similar-classes trace-similar-classes-err" role="status">
+        {error}
+      </div>
+    );
+  }
+  if (candidates && candidates.length === 0) {
+    return (
+      <div className="trace-similar-classes trace-similar-classes-empty" role="status">
+        No similar classes found. Try the Browse panel or paste a full Smali signature
+        via the Advanced toggle.
+      </div>
+    );
+  }
+  return (
+    <div className="trace-similar-classes" role="region" aria-label="Similar classes">
+      <div className="trace-similar-classes-head">
+        <span className="trace-similar-classes-title">Similar classes</span>
+        <span className="muted small">
+          ({candidates!.length}) · click to seed
+        </span>
+      </div>
+      <ul className="trace-similar-classes-list">
+        {candidates!.map((c) => {
+          // Confidence-based opacity cue: 1.0 → fully opaque, 0.6 → 0.65.
+          // Matches the linear ramp the operator sees on other
+          // confidence-styled pills in the Trace pane.
+          const opacity = 0.65 + 0.35 * Math.min(1, Math.max(0, (c.confidence - 0.6) / 0.4));
+          return (
+            <li key={c.smali_class}>
+              <button
+                type="button"
+                className="trace-similar-classes-pill"
+                onClick={() => onPick(c)}
+                title={`${c.smali_class} — ${c.rationale}`}
+                style={{ opacity }}
+              >
+                <span className="trace-similar-classes-simple">{c.simple_name}</span>
+                <span className="trace-similar-classes-package muted small">
+                  {c.package || "(no package)"}
+                </span>
+                <span className="trace-similar-classes-confidence muted small">
+                  {(c.confidence * 100).toFixed(0)}%
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }

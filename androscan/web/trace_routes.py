@@ -71,6 +71,7 @@ operator works in another mode (10.7 / 10.8).
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import sqlite3
@@ -115,6 +116,51 @@ class NormaliseEntryRequest(BaseModel):
     """
 
     entry: str = Field(..., max_length=_MAX_ENTRY_LEN)
+
+
+class SuggestSimilarClassesRequest(BaseModel):
+    """Phase 11 v2.1 sub-step v2.1.3 request body for
+    ``POST /{app_id}/suggest-similar-classes`` — the Tier-1 "Find
+    similar classes" suggestion path that grows off the v2.1.2 ⚠
+    "class not found in call graph" validation pill.
+
+    Same body shape as :class:`NormaliseEntryRequest` so the frontend
+    can pass the *exact* same operator-typed input through both
+    endpoints without massaging the payload — the suggestion
+    endpoint runs its own ``_coalesce_entry`` pass to extract the
+    class portion + then fuzzy-matches against the call graph's
+    class list.
+    """
+
+    entry: str = Field(..., max_length=_MAX_ENTRY_LEN)
+
+
+# ---------------------------------------------------------------------------
+# v2.1.3 — fuzzy-match Tier-1 constants
+#
+# Tunables for the ``_suggest_similar_classes`` helper. Kept module-
+# scope (rather than inside the route closure) so tests can patch them
+# if needed and so the values are documented alongside the rest of the
+# route module's hard caps.
+#
+# v2.1.5 will add an LLM fallback path on top of this helper — the
+# constants below stay pure-Python / no-LLM (hot path, sub-100ms
+# target) and the LLM path will sit behind a separate budget knob.
+
+_SIMILAR_CLASSES_LIMIT = 5
+"""Hard cap on suggestion-candidate count returned. Five is a
+deliberate operator-cognitive limit — past 5 the operator is
+better off scrolling Browse than scanning a long suggestion list,
+and past 5 the lower-similarity tail tends to be noise rather than
+signal."""
+
+_SIMILAR_CLASSES_CUTOFF = 0.6
+"""Minimum :func:`difflib.SequenceMatcher.ratio` for a candidate to
+be returned. Matches :func:`difflib.get_close_matches`'s default —
+empirically catches single-character typos (``MainActvity`` →
+``MainActivity``, ratio ≈ 0.92) without surfacing wholly-unrelated
+classes that happen to share a prefix (``MainActivity`` →
+``MainAdapter``, ratio ≈ 0.5)."""
 
 
 def _looks_like_java_identifier(s: str) -> bool:
@@ -268,6 +314,90 @@ def _coalesce_entry(
     if method_name:
         return f"{smali_class}->{method_name}(", smali_class, None
     return smali_class, smali_class, None
+
+
+def _smali_class_simple_name(smali_class: str) -> str:
+    """Extract the simple-name (last class segment, including any
+    inner-class ``$`` suffix) from a canonical Smali class
+    descriptor. Used by :func:`_suggest_similar_classes` to fuzzy-
+    match against the call graph's ``classes.simple_name`` column.
+
+    Examples::
+
+        "Lcom/example/MainActivity;"          → "MainActivity"
+        "Lcom/example/Foo$Inner;"             → "Foo$Inner"
+        "LMainActivity;"                      → "MainActivity"
+        ""                                    → ""
+    """
+    if not smali_class.startswith("L") or not smali_class.endswith(";"):
+        return ""
+    inner = smali_class[1:-1]  # strip leading L and trailing ;
+    last_slash = inner.rfind("/")
+    return inner[last_slash + 1:] if last_slash >= 0 else inner
+
+
+def _suggest_similar_classes(
+    typed_simple_name: str,
+    candidate_classes: list[dict[str, str]],
+    *,
+    limit: int = _SIMILAR_CLASSES_LIMIT,
+    cutoff: float = _SIMILAR_CLASSES_CUTOFF,
+) -> list[dict[str, Any]]:
+    """Fuzzy-match ``typed_simple_name`` against the simple-names of
+    every class in ``candidate_classes`` (the materialised list from
+    :func:`call_graph.list_class_names`). Returns up to ``limit``
+    candidates with ratio >= ``cutoff``, sorted by descending
+    similarity then by Smali class descriptor (deterministic ties
+    so the test surface is stable).
+
+    Each returned candidate is a dict::
+
+        {
+            "smali_class": "Lcom/example/MainActivity;",
+            "simple_name": "MainActivity",
+            "package":     "com.example",
+            "rationale":   "fuzzy match on simple class name (similarity 0.92)",
+            "confidence":  0.92,
+        }
+
+    Pure / no I/O — the SQLite read happens once in the route layer
+    via :func:`call_graph.list_class_names`. Hot path: target
+    sub-100ms even on a 50k-class app (one ``SequenceMatcher.ratio()``
+    call per class, each O(N*M) on tiny strings).
+
+    Phase 11 v2.1 sub-step v2.1.3 ships the fuzzy-only path. v2.1.5's
+    ``suggest_trace_entry`` skill will wire an LLM-backed semantic-
+    search fallback here when the fuzzy ratio falls below ``cutoff``
+    AND the operator's input has at least 3 word-segments — that's
+    a separate code-path on top of this helper, not a replacement.
+    """
+    if not typed_simple_name:
+        return []
+    target = typed_simple_name
+    scored: list[tuple[float, dict[str, str]]] = []
+    for c in candidate_classes:
+        ratio = difflib.SequenceMatcher(None, target, c["simple_name"]).ratio()
+        if ratio >= cutoff:
+            scored.append((ratio, c))
+    # Sort by descending similarity; tie-break on smali_class for
+    # deterministic ordering (tests + operator UX).
+    scored.sort(key=lambda t: (-t[0], t[1]["smali_class"]))
+    out: list[dict[str, Any]] = []
+    for ratio, c in scored[:limit]:
+        out.append(
+            {
+                "smali_class": c["smali_class"],
+                "simple_name": c["simple_name"],
+                "package": c["package"],
+                "rationale": (
+                    f"fuzzy match on simple class name (similarity {ratio:.2f})"
+                ),
+                "confidence": round(float(ratio), 4),
+            }
+        )
+    return out
+
+
 # Synthetic run-folder leaf — the trace_behavior skill resolves
 # ``app_dir = run_folder.parent``, so we just need *any* path under
 # ``app_dir`` that doesn't shadow a real run folder. ``trace-build`` is
@@ -757,6 +887,98 @@ def build_trace_router(
             "smali_class": smali_class,
             "class_exists_in_graph": class_exists_in_graph,
             "method_count": method_count,
+            "error": None,
+        }
+
+    # ----------------------------------------------------------------------
+    # POST /{app_id}/suggest-similar-classes — Phase 11 v2.1 sub-step v2.1.3
+    #                                          Tier-1 "Find similar classes"
+    #
+    # Grows off v2.1.2's ⚠ "class not found in call graph" validation
+    # pill: when the operator's typed input parses cleanly but the
+    # class isn't in the call graph (a typo, a wrong package, an old
+    # class name from a stale crash report), the frontend grows a
+    # "Find similar classes" button next to the pill — clicking it
+    # POSTs the same input here and renders the returned candidates as
+    # clickable suggestion pills.
+    #
+    # v2.1.3 ships the fuzzy-match-only path (no LLM, sub-100ms);
+    # v2.1.5 will wire an LLM-backed semantic-search fallback into
+    # this same endpoint when the fuzzy match yields no candidates
+    # AND the input has at least 3 word-segments. The endpoint shape
+    # is forward-compatible with that extension — same response,
+    # different ``rationale`` strings + slightly higher latency.
+    #
+    # Status codes:
+    # * 404 — unknown ``app_id`` (via ``app_dir_resolver``).
+    # * 409 — call graph not ready (``_cache_dir_for`` precondition).
+    # * 422 — un-parseable input (``_coalesce_entry`` returned an
+    #         ``error``); the body's ``detail`` carries the reason —
+    #         the frontend hides the suggestion list in this case
+    #         (the v2.1.2 ✗ pill is the relevant signal, not a sibling
+    #         empty suggestion list).
+    # * 200 — parseable input; ``candidates`` carries 0..N matches.
+    #         An empty list is the "no fuzzy candidates" path —
+    #         frontend renders "no similar classes found" copy
+    #         beneath the suggestion-list region.
+
+    @router.post("/{app_id}/suggest-similar-classes")
+    def trace_suggest_similar_classes(
+        app_id: str,
+        body: SuggestSimilarClassesRequest,
+    ) -> dict[str, Any]:
+        """Fuzzy-match the operator's typed input against the call
+        graph's class list. See module-level comment block above for
+        the full behaviour contract.
+
+        Response shape::
+
+            {
+                "candidates": [
+                    {
+                        "smali_class": "Lcom/example/MainActivity;",
+                        "simple_name": "MainActivity",
+                        "package":     "com.example",
+                        "rationale":   "fuzzy match on simple class name (similarity 0.92)",
+                        "confidence":  0.92,
+                    },
+                    ...
+                ],
+                "total": 3,
+                "source": "fuzzy",
+                "error": null
+            }
+
+        ``source`` is currently always ``"fuzzy"``; v2.1.5 will add
+        ``"llm_fallback"`` as a second source value when the
+        ``suggest_trace_entry`` skill backstops a no-fuzzy-match
+        case. ``error`` is reserved for future non-blocking warnings
+        (currently always ``null`` on a 200).
+        """
+        cache_dir = _cache_dir_for(app_id)
+
+        # Re-use the v2.1.2 coalescer to extract the bare class form
+        # from any of the input shapes the operator might paste
+        # (dotted Java, partial Smali, stack-trace line). We only need
+        # the ``smali_class`` portion here — the normalised method-
+        # prefix isn't useful for fuzzy class matching.
+        _normalised_entry, smali_class, parse_error = _coalesce_entry(body.entry)
+        if parse_error is not None:
+            raise HTTPException(status_code=422, detail=parse_error)
+        assert smali_class is not None  # guaranteed on the success branch
+
+        typed_simple = _smali_class_simple_name(smali_class)
+        all_classes = call_graph.list_class_names(
+            cache_dir, include_external=False
+        )
+        candidates = _suggest_similar_classes(
+            typed_simple,
+            all_classes,
+        )
+        return {
+            "candidates": candidates,
+            "total": len(candidates),
+            "source": "fuzzy",
             "error": None,
         }
 

@@ -5021,6 +5021,146 @@ code { color: var(--accent); }
   to { transform: rotate(360deg); }
 }
 
+/* Phase 11 v2.1 sub-step v2.1.3 — "Find similar classes" Tier-1
+ * suggestion path on the ⚠ validation-pill state.
+ *
+ * Two surfaces:
+ *
+ *   1. The pill grows an inline action button on the right via
+ *      ``.trace-entry-validation-pill-action``. Sits in the same
+ *      flex row as the icon + text, right-aligned via
+ *      ``margin-left: auto``. While the suggestion fetch is in
+ *      flight, the button hosts the same ``.trace-entry-spinner``
+ *      element the validation pill uses (visual continuity).
+ *
+ *   2. Below the pill, ``.trace-similar-classes`` renders the
+ *      candidate-list block (or its empty / error states). Each
+ *      candidate is a clickable pill with three columns:
+ *      simple_name (lead) + package (muted trail) + confidence
+ *      percent (muted trail). Confidence-based opacity is set
+ *      inline on each pill (see <SimilarClassesList>).
+ *
+ * Colour tokens reuse the same semantic surface as the validation
+ * pill so the suggestion list reads as part of the same pane (NOT
+ * a foreign overlay). The ⚠ pill's accent colour also carries
+ * through to the action-button border on hover. */
+
+.trace-entry-validation-pill-action {
+  margin-left: auto;
+  padding: 0.15rem 0.55rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.trace-entry-validation-pill-action:hover:not(:disabled) {
+  border-color: var(--warn);
+  background: var(--surface);
+}
+
+.trace-entry-validation-pill-action:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.trace-similar-classes {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface-2, var(--surface));
+  font-size: 0.875rem;
+}
+
+.trace-similar-classes-empty,
+.trace-similar-classes-err {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.trace-similar-classes-err {
+  border-color: var(--err, var(--warn));
+  color: var(--err, var(--warn));
+  font-style: normal;
+}
+
+.trace-similar-classes-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.trace-similar-classes-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.trace-similar-classes-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.trace-similar-classes-list li {
+  margin: 0;
+}
+
+.trace-similar-classes-pill {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.875rem;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.trace-similar-classes-pill:hover {
+  border-color: var(--accent);
+  background: var(--surface);
+  opacity: 1 !important; /* Override the inline confidence-opacity on hover */
+}
+
+.trace-similar-classes-simple {
+  font-weight: 600;
+  font-family: var(--mono, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-similar-classes-package {
+  font-family: var(--mono, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-similar-classes-confidence {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Phase 10 sub-step 10.8: "Seeded from <source>" pill that sits above
  * the trace form whenever ``pendingTraceEntry`` populated the input
  * field (Inspect → Trace cross-tab handoff). Visually mirrors the

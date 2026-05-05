@@ -354,6 +354,87 @@ export function normaliseTraceEntry(
   );
 }
 
+/** Phase 11 v2.1 sub-step v2.1.3 — one fuzzy / LLM suggestion
+ *  candidate returned by ``POST /api/trace/{app_id}/suggest-similar-classes``.
+ *
+ *  Class-level (not method-level) — the operator's typed input
+ *  matched on simple class name; the candidate seeds a class-prefix
+ *  (``Lcom/example/MainActivity;->``) that activates the existing
+ *  v1 MethodPicker for the explicit Trace step.
+ *
+ *  ``confidence`` is a ``[0.0, 1.0]`` ratio:
+ *  * fuzzy source — :func:`difflib.SequenceMatcher.ratio` between
+ *    the typed simple-name and the candidate's simple-name.
+ *  * llm_fallback source (v2.1.5+) — the LLM's own ranking score,
+ *    normalised to the same scale. */
+export type SimilarClassCandidate = {
+  /** Bare Smali class descriptor (e.g. ``Lcom/example/MainActivity;``).
+   *  Frontend builds the seed prefix by appending ``->`` to this
+   *  before writing to ``entryDraft`` (matches what
+   *  ``javaRelPathToSmaliMethodPrefix(rel_path, null)`` produces
+   *  for a class-only seed from the Browse-tree click path). */
+  smali_class: string;
+  /** Last class-name segment (e.g. ``MainActivity``); rendered as
+   *  the bold lead in the candidate pill so the operator sees the
+   *  typo-corrected name at a glance without parsing the full
+   *  Smali descriptor. */
+  simple_name: string;
+  /** Dotted package (e.g. ``com.example``); rendered as the muted
+   *  trailing context in the candidate pill so the operator can
+   *  disambiguate same-named classes across packages
+   *  (``com.foo.MainActivity`` vs ``com.bar.MainActivity``). */
+  package: string;
+  /** One-line operator-readable explanation of why this candidate
+   *  was suggested. v2.1.3: ``"fuzzy match on simple class name
+   *  (similarity 0.92)"``; v2.1.5: an LLM-emitted phrase. */
+  rationale: string;
+  /** ``[0.0, 1.0]``; higher is more confident. Used to sort
+   *  candidates and to render an opacity / colour cue on the pill. */
+  confidence: number;
+};
+
+/** Phase 11 v2.1 sub-step v2.1.3 response shape for
+ *  ``POST /api/trace/{app_id}/suggest-similar-classes``.
+ *
+ *  ``source`` is currently always ``"fuzzy"`` (v2.1.3 ships fuzzy-
+ *  only); v2.1.5 will add ``"llm_fallback"`` as a second source
+ *  value when the ``suggest_trace_entry`` skill backstops a
+ *  no-fuzzy-match case. The frontend currently doesn't render the
+ *  source badge but exposing it on the type lets future UI surface
+ *  the distinction (e.g. "🤖 LLM-suggested" pill modifier). */
+export type SimilarClassesResponse = {
+  candidates: SimilarClassCandidate[];
+  total: number;
+  /** ``"fuzzy"`` (v2.1.3) or ``"llm_fallback"`` (v2.1.5+). */
+  source: string;
+  /** Reserved for future non-blocking warnings; currently always
+   *  ``null`` on a 200. */
+  error: string | null;
+};
+
+/** Fetch fuzzy / LLM suggestion candidates for the operator's typed
+ *  input. v2.1.3: fuzzy-only via :func:`difflib.SequenceMatcher`
+ *  against the call graph's class list; v2.1.5: LLM fallback added.
+ *
+ *  Triggered on the explicit "Find similar classes" button click
+ *  (the v2.1.2 ⚠ validation pill grew the button when the input
+ *  parsed cleanly but didn't match any class in the call graph) —
+ *  *not* automatically on the debounce window; this is a deliberate
+ *  operator action so the network round-trip is fine. */
+export function suggestSimilarClasses(
+  appId: string,
+  entry: string,
+): Promise<ApiResult<SimilarClassesResponse>> {
+  return _request<SimilarClassesResponse>(
+    `/api/trace/${encodeURIComponent(appId)}/suggest-similar-classes`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entry }),
+    },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // useTraceAnchor — React hook owning the GET → fall-back-to-POST lifecycle
 // for one ``(appId, entry, hops)`` triple. The Trace mode UI is the only

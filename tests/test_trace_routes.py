@@ -690,3 +690,145 @@ def test_normalise_entry_inner_class_preserves_dollar(tmp_path: Path) -> None:
     # The class isn't in the fixture's call graph; the parse path
     # is what we're pinning here, not the existence check.
     assert body["class_exists_in_graph"] is False
+
+
+# ---------------------------------------------------------------------------
+# 10) POST /suggest-similar-classes — Phase 11 v2.1 sub-step v2.1.3
+#
+# Tier-1 "Find similar classes" suggestion path that grows off the
+# v2.1.2 ⚠ "class not found in call graph" validation pill. v2.1.3
+# ships fuzzy-only (``difflib.SequenceMatcher`` against the call
+# graph's ``classes.simple_name`` column); v2.1.5 will wire an
+# LLM-backed semantic-search fallback into the same endpoint.
+#
+# The fixture's call-graph contains ``Lcom/trace/Plans;``,
+# ``Lcom/trace/Gates;``, ``Lcom/trace/Helpers;``, etc. — the typo
+# tests use these as the target classes.
+
+
+def test_suggest_similar_classes_route_registered(tmp_path: Path) -> None:
+    """The factory must register the v2.1.3 suggestion endpoint
+    alongside the existing seven — guards against a refactor
+    accidentally dropping it from ``build_trace_router``."""
+    client = _client(tmp_path)
+    paths = {r.path for r in client.app.routes}  # type: ignore[attr-defined]
+    assert "/api/trace/{app_id}/suggest-similar-classes" in paths
+
+
+def test_suggest_similar_classes_fuzzy_match_finds_typo(tmp_path: Path) -> None:
+    """Operator-typed typo ``com.trace.Plnas`` (transposed letters)
+    surfaces ``Lcom/trace/Plans;`` as a high-confidence fuzzy
+    candidate. This is the headline operator path — the ⚠ pill
+    grew the "Find similar classes" button and clicking it lands
+    the typo's correction within the operator's eye-line."""
+    client = _client(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/suggest-similar-classes",
+        json={"entry": "com.trace.Plnas"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["source"] == "fuzzy"
+    assert body["error"] is None
+    assert body["total"] >= 1
+    candidate_classes = {c["smali_class"] for c in body["candidates"]}
+    assert "Lcom/trace/Plans;" in candidate_classes
+    # The Plans hit must carry a high confidence (single-character
+    # transposition vs. a 5-char simple name → ratio ≈ 0.8+).
+    plans_hit = next(
+        c for c in body["candidates"] if c["smali_class"] == "Lcom/trace/Plans;"
+    )
+    assert plans_hit["confidence"] >= 0.7
+    assert plans_hit["simple_name"] == "Plans"
+    assert plans_hit["package"] == "com.trace"
+    assert "fuzzy match" in plans_hit["rationale"]
+    assert "similarity" in plans_hit["rationale"]
+
+
+def test_suggest_similar_classes_no_match_returns_empty_list(
+    tmp_path: Path,
+) -> None:
+    """Operator-typed input with no fuzzy match in the call graph →
+    200 with ``candidates: []`` (NOT 404 — operator's input parsed
+    cleanly, the response just has nothing to suggest). v2.1.5's
+    LLM fallback would re-fire on this path, but in v2.1.3 the
+    empty list is the terminal answer."""
+    client = _client(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/suggest-similar-classes",
+        json={"entry": "com.unrelated.Zzzzzzzzz"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["candidates"] == []
+    assert body["total"] == 0
+    assert body["source"] == "fuzzy"
+    assert body["error"] is None
+
+
+def test_suggest_similar_classes_unparseable_input_returns_422(
+    tmp_path: Path,
+) -> None:
+    """Same parse-error contract as ``normalise-entry`` — un-parseable
+    input lands as 422 with the ``_coalesce_entry`` reason in the
+    detail. Frontend hides the suggestion list in this case (the
+    v2.1.2 ✗ pill is the relevant signal; a sibling empty
+    suggestion list would be operator-confusing)."""
+    client = _client(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/suggest-similar-classes",
+        json={"entry": ""},
+    )
+    assert r.status_code == 422, r.text
+    assert "empty" in r.json()["detail"].lower()
+
+    r = client.post(
+        f"/api/trace/{APP_ID}/suggest-similar-classes",
+        json={"entry": "com.example.foo"},  # No UpperCamelCase class.
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_suggest_similar_classes_unknown_app_returns_404(
+    tmp_path: Path,
+) -> None:
+    """Unknown ``app_id`` → 404 via the shared ``app_dir_resolver``.
+    Same contract as every other route in this module."""
+    client = _client(tmp_path)
+    r = client.post(
+        "/api/trace/ghost-app/suggest-similar-classes",
+        json={"entry": "com.example.Foo"},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_suggest_similar_classes_decompile_not_ready_returns_409(
+    tmp_path: Path,
+) -> None:
+    """App dir exists but decompile cache is missing → 409 — fuzzy
+    matching needs the call graph SQLite, which needs the decompile
+    cache. Mirrors every other route in this module that gates on
+    ``_cache_dir_for``."""
+    client = _client_no_decompile(tmp_path)
+    r = client.post(
+        f"/api/trace/{APP_ID}/suggest-similar-classes",
+        json={"entry": "com.example.Foo"},
+    )
+    assert r.status_code == 409, r.text
+
+
+def test_suggest_similar_classes_caps_results_at_five(tmp_path: Path) -> None:
+    """The hard cap at 5 candidates per request keeps the operator-
+    facing list focused — past 5 the lower-similarity tail tends to
+    be noise. Pin the cap so a future refactor can't accidentally
+    raise it without surfacing a planning conversation."""
+    client = _client(tmp_path)
+    # Use a single-character input that fuzzy-matches half the call
+    # graph at low confidence — the cap is what bounds the response.
+    r = client.post(
+        f"/api/trace/{APP_ID}/suggest-similar-classes",
+        json={"entry": "com.trace.SomeClass"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["candidates"]) <= 5
