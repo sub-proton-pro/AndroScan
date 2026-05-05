@@ -13,6 +13,22 @@ Layered defence:
    responsible for surfacing code blocks behind explicit "stage" affordances.
 4. **Audit** — every chat turn is appended to
    ``apps/<app_id>/<run_ts>/chat/<tab>.jsonl``.
+
+Phase 11 v2.1 sub-step v2.1.5 — bounded agentic-skill loop (DEC-022 +
+DEC-025 v2.1 closing-note). Opt-in via ``body.agentic_loop=true`` (the
+v2.1.5 frontend always sets this for the lab tab; other tabs stay
+single-pass for back-compat). When enabled, the chat performs up to
+``MAX_AGENTIC_TURNS`` rounds of: (a) blocking JSON LLM call;
+(b) parse ``skill_requests`` from the response; (c) execute requested
+``requires_confirmation=False`` skills (consent-class skills halt the
+loop with a ``skill_pending`` SSE event since the chat-side consent
+UI is still pending — ISSUE-009 close-out); (d) emit
+``skill_request`` / ``skill_result`` / ``widget`` SSE events as they
+fire; (e) append skill results to the conversation history and loop
+until the LLM emits a ``content`` field (final answer) or the turn
+budget is exhausted. Widgets — first introduced in v2.1.5 via
+``suggest_trace_entry`` — flow through the new ``widget`` SSE event
+kind and render inline in the chat dock as clickable cards.
 """
 
 from __future__ import annotations
@@ -38,6 +54,17 @@ MAX_HISTORY_CHARS_TOTAL = 16_000
 MAX_TOTAL_CONTEXT_CHARS = 32_000
 MAX_ATTACHMENTS = 8
 RATE_LIMIT_TURNS_PER_MIN = 20
+
+# v2.1.5 agentic-loop budgets (DEC-022 envelope). MAX_AGENTIC_TURNS
+# bounds total LLM round-trips per chat request — matches the
+# analysis pipeline's default loop budget. MAX_SKILLS_PER_TURN caps
+# fan-out within a single turn so a runaway LLM can't issue 20
+# skill_requests in one JSON. Both are deliberately small enough that
+# a typical entry-discovery question completes in 2–3 turns
+# (1 RAG/CG sweep + 1 ranking + 1 final answer) without the operator
+# noticing the multi-turn machinery.
+MAX_AGENTIC_TURNS = 5
+MAX_SKILLS_PER_TURN = 3
 
 # Per-attachment-kind soft budget (truncate longer attachments)
 ATTACHMENT_BUDGETS: dict[str, int] = {
@@ -278,6 +305,9 @@ def validate_chat_request(body: dict[str, Any]) -> tuple[bool, str]:
         return False, "attachments must be a list"
     if len(attachments) > MAX_ATTACHMENTS:
         return False, f"too many attachments (max {MAX_ATTACHMENTS})"
+    # v2.1.5 — agentic_loop is optional; only validate type if present.
+    if "agentic_loop" in body and not isinstance(body["agentic_loop"], bool):
+        return False, "agentic_loop must be a boolean"
     return True, ""
 
 
@@ -575,6 +605,18 @@ async def stream_chat_request(
         })
         return
 
+    # v2.1.5 — opt into the bounded agentic-skill loop. The frontend
+    # always sets this for the lab tab so Trace-mode "Ask AI" + chat-
+    # widget surfacing flow through the same path; other tabs default
+    # to the legacy single-pass path so existing tests / Inspect-tab
+    # RAG enrichment / Reports-tab triage Q&A are unchanged.
+    if bool(body.get("agentic_loop")):
+        async for frame in _stream_chat_agentic_request(
+            body, config, root, now=now,
+        ):
+            yield frame
+        return
+
     history = body.get("history") or []
     attachments = body.get("attachments") or []
     prompt = str(body["prompt"])
@@ -684,4 +726,458 @@ async def stream_chat_request(
         "done_reason": metadata.get("done_reason"),
         "thinking_chars": thinking_chars,
         "content_chars": content_chars,
+    })
+
+
+# ---------------------------------------------------------------------------
+# v2.1.5 — Bounded agentic-skill loop (DEC-022 + DEC-025 v2.1 closing-note)
+#
+# Design — blocking JSON per turn, NOT token-streaming:
+#   * Each turn is one ``complete(response_format="json")`` call. The
+#     LLM response is JSON with optional ``thinking`` / ``content`` /
+#     ``skill_requests`` fields.
+#   * Skill execution happens server-side between turns. Each
+#     execution emits a ``skill_request`` SSE event before running and
+#     a ``skill_result`` SSE event after. Skills with
+#     ``requires_confirmation=True`` emit ``skill_pending`` and halt
+#     the loop — chat-side consent UI is still pending (ISSUE-009).
+#   * Widgets emitted by skills (v2.1.5's ``suggest_trace_entry`` is
+#     the first consumer of the ``SkillResult.widgets`` channel) flow
+#     through a new ``widget`` SSE event kind, one event per widget.
+#   * Loop terminates when (a) the LLM emits non-empty ``content``
+#     (final answer), (b) a consent-class skill is requested, or (c)
+#     ``MAX_AGENTIC_TURNS`` is reached.
+#
+# Why blocking-per-turn over token-streaming:
+#   * The analysis pipeline's ``run_workflow`` already uses this exact
+#     pattern (``androscan/internal/workflow.py`` lines 233 / 313) — we
+#     reuse the same mental model and the same ``response_format=json``
+#     contract. Mid-stream JSON parsing for skill_request markers
+#     would be a separate research project.
+#   * Operator UX cost is small — final content arrives in one delta
+#     per turn instead of token-by-token; the ``skill_request`` /
+#     ``skill_result`` events emitted between turns give the operator
+#     much richer per-skill progress feedback than token streaming
+#     ever could.
+
+def _agentic_system_prompt(tab: str, llm_skills: list[Any]) -> str:
+    """System prompt for the v2.1.5 agentic-skill loop.
+
+    Layered: tab-specific role instruction (re-uses
+    ``_TAB_SYSTEM_PROMPTS``) + the agentic-loop output schema +
+    skill catalog with descriptions and parameter schemas. The LLM is
+    instructed to emit JSON with a strict ``{thinking?, content?,
+    skill_requests?}`` shape per turn — same posture as the analysis
+    pipeline's prompt format so model-side behaviour is consistent
+    across surfaces.
+    """
+    tab_role = _TAB_SYSTEM_PROMPTS.get(_normalise_tab(tab), _TAB_SYSTEM_PROMPTS["reports"])
+    parts = [
+        tab_role,
+        "",
+        "## Output format (per turn)",
+        (
+            "You operate inside a BOUNDED AGENTIC LOOP with at most "
+            f"{MAX_AGENTIC_TURNS} turns. Respond with valid JSON only "
+            "(no markdown fences, no prose preamble) shaped like:\n\n"
+            '  {"thinking": "<your reasoning, optional>", '
+            '"skill_requests": [{"skill": "<name>", "params": {...}}, ...], '
+            '"content": "<final operator-facing answer, when ready>"}\n\n'
+            "Decision rules:\n"
+            "- If you need more information, emit `skill_requests` "
+            f"(at most {MAX_SKILLS_PER_TURN} per turn) and OMIT or "
+            "leave empty the `content` field. The system will execute "
+            "the skills and re-prompt you with the results.\n"
+            "- When you have enough information, emit `content` with "
+            "your final answer and OMIT `skill_requests`. The loop "
+            "terminates on this turn.\n"
+            "- The `thinking` field is optional but encouraged; it is "
+            "shown to the operator as a separate channel from "
+            "`content`.\n"
+            "- Skill names MUST be exact matches from the catalog "
+            "below. Skill params MUST match each skill's documented "
+            "schema — invalid params will be returned as errors and "
+            "burn one of your turns."
+        ),
+        "",
+        _INJECTION_GUARD,
+    ]
+    if llm_skills:
+        parts.extend([
+            "",
+            "## Skill catalog (call by name; consent-class skills are "
+            "rejected by the chat surface in this build — use "
+            "`requires_confirmation=False` skills only)",
+        ])
+        for meta in llm_skills:
+            if getattr(meta, "requires_confirmation", False):
+                continue
+            parts.append(f"- **{meta.name}**: {meta.description}")
+            params_schema = getattr(meta, "params_schema", None)
+            if params_schema:
+                parts.append(f"  Params: {json.dumps(params_schema)}")
+    return "\n".join(parts)
+
+
+def _build_agentic_messages(
+    tab: str,
+    prompt: str,
+    history: list[dict[str, Any]],
+    attachments: list[dict[str, Any]],
+    llm_skills: list[Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Same posture as :func:`build_messages` but with the agentic
+    system prompt + skill catalog. Returns (messages, trim_report).
+
+    The user's first message carries any attachments + the natural-
+    language prompt; subsequent turns are appended in-loop by the
+    agentic driver as it folds skill results back into the
+    conversation.
+    """
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "content": _agentic_system_prompt(tab, llm_skills)},
+    ]
+    used = 0
+    for h in history[-MAX_HISTORY_TURNS:]:
+        role = str(h.get("role") or "").lower()
+        if role not in ALLOWED_ROLES:
+            continue
+        text = sanitize_text(str(h.get("text") or h.get("content") or ""))
+        if not text:
+            continue
+        text, _ = truncate_for_budget(text, MAX_HISTORY_CHARS_PER_MSG)
+        if used + len(text) > MAX_HISTORY_CHARS_TOTAL:
+            break
+        used += len(text)
+        msgs.append({"role": role, "content": text})
+
+    user_text, trims = build_user_message(prompt, attachments)
+    msgs.append({"role": "user", "content": user_text})
+    return msgs, trims
+
+
+def _widget_to_jsonable(widget: Any) -> dict[str, Any]:
+    """Serialise a ``SkillWidget`` dataclass to a plain dict for the
+    SSE wire format. Uses ``dataclasses.asdict`` for the canonical
+    shape (matches the dataclass field names verbatim, ``kind``
+    included). Defensive ``isinstance`` check so a future widget that
+    isn't a dataclass falls back to ``vars()`` rather than crashing.
+    """
+    import dataclasses as _dc
+
+    if _dc.is_dataclass(widget):
+        return _dc.asdict(widget)
+    if hasattr(widget, "__dict__"):
+        return dict(vars(widget))
+    return {"kind": "unknown", "repr": repr(widget)}
+
+
+async def _stream_chat_agentic_request(
+    body: dict[str, Any],
+    config: Config,
+    root: Path,
+    *,
+    completer: Optional[Callable[..., Any]] = None,
+    skill_executor: Optional[Callable[..., Any]] = None,
+    now: Optional[float] = None,
+) -> AsyncIterator[bytes]:
+    """Bounded agentic-skill loop streamer.
+
+    ``completer`` injects the JSON-format LLM call (defaults to
+    ``androscan.llm.client.complete``). ``skill_executor`` injects
+    the skill-execution function (defaults to
+    ``androscan.skills.execute``). Both are dispatched to a thread
+    executor because the underlying HTTP call / SQLite read is
+    blocking; widget / skill_request / skill_result SSE events are
+    yielded between turns to keep operator-side feedback responsive.
+
+    Validation, rate-limiting and tab normalisation are performed by
+    the parent :func:`stream_chat_request` before this is called, so
+    we trust the inputs here.
+    """
+    tab = _normalise_tab(str(body["tab"]))
+    history = body.get("history") or []
+    attachments = body.get("attachments") or []
+    prompt = str(body["prompt"])
+    app_id = (body.get("app_id") or None) or None
+    run_ts = (body.get("run_ts") or None) or None
+
+    # Lazy imports — the agentic path pulls in the full skill registry,
+    # which we'd prefer not to load on every chat request when the
+    # opt-in flag is off.
+    from androscan.skills import (
+        SkillContext as _SkillContext,
+        execute as _default_execute_skill,
+        list_llm_skills,
+    )
+    if completer is None:
+        from androscan.llm.client import complete as _default_complete
+
+        completer = _default_complete
+    if skill_executor is None:
+        skill_executor = _default_execute_skill
+
+    skill_catalog = list_llm_skills()
+    skill_meta_by_name = {m.name: m for m in skill_catalog}
+
+    # Best-effort SkillContext — many skills (RAG / call_graph / Trace)
+    # need the run folder to resolve ``apps/<app_id>/``. If app_id /
+    # run_ts are missing the agentic loop still runs but skills will
+    # fail-open with "[skill] No app context available" text, and the
+    # LLM gets that as feedback so it can pivot to a different
+    # approach (or just answer from the prompt alone).
+    run_folder: Optional[Path] = None
+    if app_id and run_ts:
+        candidate = root / app_id / run_ts
+        if candidate.is_dir():
+            run_folder = candidate
+
+    # Inspect-tab RAG enrichment is intentionally NOT applied to the
+    # agentic path — the LLM can request ``search_decompiled_sources``
+    # itself, which is the agentic-loop's whole point. Pre-stuffing
+    # the context would burn the per-turn budget on chunks the LLM
+    # might not need.
+
+    messages, trims = _build_agentic_messages(
+        tab, prompt, history, attachments, skill_catalog,
+    )
+
+    started = time.time()
+    loop = asyncio.get_running_loop()
+
+    thinking_chars = 0
+    content_chars = 0
+    skill_calls_count = 0
+    widget_count = 0
+    final_content: Optional[str] = None
+    halted_reason: Optional[str] = None
+
+    for turn in range(MAX_AGENTIC_TURNS):
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: completer(
+                    "",
+                    config=config,
+                    stream=False,
+                    response_format="json",
+                    messages=list(messages),
+                ),
+            )
+        except Exception as e:
+            yield _sse("error", {"error": f"LLM call failed: {type(e).__name__}: {e}"})
+            return
+
+        raw_content = getattr(result, "content", "") or ""
+        try:
+            parsed = json.loads(raw_content) if raw_content else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        thinking_text = str(parsed.get("thinking") or "").strip()
+        if thinking_text:
+            thinking_chars += len(thinking_text)
+            yield _sse("thinking", {"delta": thinking_text})
+
+        skill_requests_raw = parsed.get("skill_requests") or []
+        if not isinstance(skill_requests_raw, list):
+            skill_requests_raw = []
+        skill_requests_raw = skill_requests_raw[:MAX_SKILLS_PER_TURN]
+
+        content_text = str(parsed.get("content") or "").strip()
+
+        if skill_requests_raw:
+            messages.append({"role": "assistant", "content": raw_content})
+            results_text_parts: list[str] = []
+            consent_halt = False
+
+            for req in skill_requests_raw:
+                if not isinstance(req, dict):
+                    continue
+                skill_name = str(req.get("skill") or "").strip()
+                skill_params = req.get("params") or {}
+                if not isinstance(skill_params, dict):
+                    skill_params = {}
+
+                request_id = f"req-t{turn}-s{skill_calls_count}"
+                skill_calls_count += 1
+                yield _sse("skill_request", {
+                    "request_id": request_id,
+                    "skill": skill_name,
+                    "params": skill_params,
+                })
+
+                meta = skill_meta_by_name.get(skill_name)
+                if meta is None:
+                    err_text = (
+                        f"[chat] Unknown skill: {skill_name!r}. Available: "
+                        f"{sorted(skill_meta_by_name.keys())}"
+                    )
+                    yield _sse("skill_result", {
+                        "request_id": request_id,
+                        "skill": skill_name,
+                        "success": False,
+                        "text": err_text,
+                    })
+                    results_text_parts.append(f"### {skill_name}\n{err_text}")
+                    continue
+
+                if getattr(meta, "requires_confirmation", False):
+                    yield _sse("skill_pending", {
+                        "request_id": request_id,
+                        "skill": skill_name,
+                        "params": skill_params,
+                        "reason": (
+                            "Consent-class skill requested; chat-side "
+                            "approval UI is not yet wired (ISSUE-009). "
+                            "Halting agentic loop."
+                        ),
+                    })
+                    consent_halt = True
+                    break
+
+                if run_folder is None:
+                    err_text = (
+                        f"[chat] Skill {skill_name!r} requires an app "
+                        "context but no app_id / run_ts is selected."
+                    )
+                    yield _sse("skill_result", {
+                        "request_id": request_id,
+                        "skill": skill_name,
+                        "success": False,
+                        "text": err_text,
+                    })
+                    results_text_parts.append(f"### {skill_name}\n{err_text}")
+                    continue
+
+                ctx = _SkillContext(
+                    config=config, run_folder=run_folder,
+                    dossier_dict=None, apk_path=None,
+                )
+                try:
+                    skill_result = await loop.run_in_executor(
+                        None, lambda: skill_executor(skill_name, skill_params, ctx),
+                    )
+                except Exception as e:
+                    err_text = (
+                        f"[chat] Skill {skill_name!r} raised "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    yield _sse("skill_result", {
+                        "request_id": request_id,
+                        "skill": skill_name,
+                        "success": False,
+                        "text": err_text,
+                    })
+                    results_text_parts.append(f"### {skill_name}\n{err_text}")
+                    continue
+
+                yield _sse("skill_result", {
+                    "request_id": request_id,
+                    "skill": skill_name,
+                    "success": bool(skill_result.success),
+                    "text": skill_result.text,
+                })
+                results_text_parts.append(
+                    f"### {skill_name}\n{skill_result.text}"
+                )
+
+                # v2.1.5 — forward each emitted widget through a
+                # dedicated SSE event so the chat dock can render it
+                # as an interactive card on the same assistant turn.
+                for widget in (skill_result.widgets or ()):
+                    widget_count += 1
+                    yield _sse("widget", {
+                        "request_id": request_id,
+                        "skill": skill_name,
+                        "widget": _widget_to_jsonable(widget),
+                    })
+
+            if consent_halt:
+                halted_reason = "consent_required"
+                final_content = (
+                    "I attempted to call a consent-class skill, but the "
+                    "chat-side approval UI is not yet wired in this "
+                    "build (ISSUE-009). Please run this skill via the "
+                    "Lab tab's Stage / Inject affordance or the "
+                    "analysis pipeline."
+                )
+                content_chars += len(final_content)
+                yield _sse("content", {"delta": final_content})
+                break
+
+            messages.append({
+                "role": "user",
+                "content": (
+                    "## Skill results\n\n"
+                    + "\n\n".join(results_text_parts)
+                    + "\n\nContinue. If you have enough information, emit "
+                    "the final answer in `content`; otherwise request more "
+                    "skills."
+                ),
+            })
+            continue
+
+        if content_text:
+            content_chars += len(content_text)
+            yield _sse("content", {"delta": content_text})
+            final_content = content_text
+            break
+
+        # Empty turn — neither skill_requests nor content. Give the
+        # LLM one chance to recover; otherwise fall through to the
+        # turn-budget check on the next iteration.
+        messages.append({"role": "assistant", "content": raw_content})
+        messages.append({
+            "role": "user",
+            "content": (
+                "Your last response was empty (no `skill_requests` and "
+                "no `content`). Emit either skill_requests to gather "
+                "more info, or final content with your answer."
+            ),
+        })
+
+    if final_content is None and halted_reason is None:
+        # Loop budget exhausted without a final answer.
+        msg = (
+            f"[chat] Agentic loop exhausted {MAX_AGENTIC_TURNS} turns "
+            "without a final answer. The LLM may need more context — "
+            "try rephrasing the question or attaching specific evidence."
+        )
+        yield _sse("error", {"error": msg})
+        return
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "tab": tab,
+        "app_id": app_id,
+        "run_ts": run_ts,
+        "prompt_chars": len(prompt),
+        "history_turns": len(history),
+        "attachment_count": len(attachments),
+        "trims": trims,
+        "elapsed_ms": elapsed_ms,
+        "reply_chars": content_chars,
+        "thinking_chars": thinking_chars,
+        "agentic": True,
+        "skill_calls": skill_calls_count,
+        "widgets": widget_count,
+        "halted_reason": halted_reason,
+        "streamed": True,
+    }
+    transcript = append_transcript(root, app_id, run_ts, tab, record)
+
+    yield _sse("done", {
+        "trims": trims,
+        "elapsed_ms": elapsed_ms,
+        "transcript_path": str(transcript) if transcript else None,
+        "done_reason": halted_reason or "stop",
+        "thinking_chars": thinking_chars,
+        "content_chars": content_chars,
+        "skill_calls": skill_calls_count,
+        "widgets": widget_count,
+        "agentic": True,
     })

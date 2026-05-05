@@ -6088,3 +6088,238 @@ code { color: var(--accent); }
   border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
   margin-left: 0.4rem;
 }
+
+/* =====================================================================
+ * Phase 11 v2.1 sub-step v2.1.5 — Chat agentic-skill loop visuals
+ * (DEC-022 + DEC-025 v2.1 closing-note Q7).
+ *
+ * Two surfaces:
+ *   1. ``.chat-skill-call*`` — inline timeline of skill_request /
+ *      skill_result / skill_pending events emitted while the LLM is
+ *      running its bounded agentic loop. Rendered as a compact
+ *      <details> disclosure block above the assistant's text.
+ *   2. ``.chat-widget*`` — interactive widget cards emitted by skills
+ *      (v2.1.5 ships TraceEntryCandidateWidget; future kinds register
+ *      via <ChatWidgetRenderer>). Rendered below the assistant's
+ *      text so the operator reads the prose first then acts.
+ * ===================================================================== */
+
+/* ----- Skill-call timeline ----- */
+
+.chat-skill-calls {
+  margin: 0.4rem 0 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  font-size: 0.78rem;
+}
+
+.chat-skill-calls-toggle {
+  cursor: pointer;
+  padding: 0.35rem 0.6rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  user-select: none;
+}
+
+.chat-skill-calls-toggle::-webkit-details-marker { display: none; }
+.chat-skill-calls-toggle::before {
+  content: "▸";
+  display: inline-block;
+  transition: transform 0.15s ease-out;
+  color: var(--text-muted);
+}
+.chat-skill-calls[open] .chat-skill-calls-toggle::before {
+  transform: rotate(90deg);
+}
+
+.chat-skill-calls-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0.6rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.chat-skill-call {
+  display: grid;
+  grid-template-columns: max-content max-content 1fr;
+  gap: 0.4rem;
+  align-items: center;
+  padding: 0.3rem 0.4rem;
+  border-radius: 4px;
+  background: var(--surface);
+  border-left: 3px solid var(--border);
+}
+
+.chat-skill-call-running { border-left-color: var(--accent); }
+.chat-skill-call-success { border-left-color: var(--ok); }
+.chat-skill-call-failed  { border-left-color: var(--err); }
+.chat-skill-call-pending { border-left-color: var(--warn); }
+
+.chat-skill-call-name {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--text);
+}
+
+.chat-skill-call-status {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--bg);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+.chat-skill-call-running .chat-skill-call-status {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+.chat-skill-call-success .chat-skill-call-status {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 50%, transparent);
+}
+.chat-skill-call-failed .chat-skill-call-status {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 50%, transparent);
+}
+.chat-skill-call-pending .chat-skill-call-status {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 50%, transparent);
+}
+
+.chat-skill-call-reason {
+  grid-column: 1 / -1;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.chat-skill-call-text {
+  grid-column: 1 / -1;
+  margin: 0.2rem 0 0;
+  padding: 0.3rem 0.45rem;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  white-space: pre-wrap;
+  max-height: 8rem;
+  overflow-y: auto;
+}
+
+/* ----- Chat widget container ----- */
+
+.chat-widgets {
+  margin-top: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.chat-widget {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.55rem 0.7rem;
+  background: var(--surface);
+}
+
+/* ----- TraceEntryCandidateWidget ----- */
+
+.chat-widget-trace-entry-candidate {
+  /* Cluster visually with the rest of Trace mode UI by re-using the
+     accent palette the trace-* namespaces share. */
+  border-left: 3px solid var(--accent);
+}
+
+.chat-widget-trace-entry-candidate-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.35rem;
+}
+
+.chat-widget-trace-entry-candidate-smali {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-widget-trace-entry-candidate-confidence {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+}
+
+.trace-entry-candidate-confidence-high {
+  background: color-mix(in srgb, var(--ok) 15%, transparent);
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 50%, transparent);
+}
+.trace-entry-candidate-confidence-medium {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+.trace-entry-candidate-confidence-low {
+  background: color-mix(in srgb, var(--text-muted) 15%, transparent);
+  color: var(--text-muted);
+}
+
+.chat-widget-trace-entry-candidate-rationale {
+  margin: 0 0 0.5rem;
+  font-size: 0.78rem;
+  color: var(--text);
+  line-height: 1.35;
+}
+
+.chat-widget-trace-entry-candidate-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.chat-widget-trace-entry-candidate-button {
+  appearance: none;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.74rem;
+  font-weight: 600;
+  padding: 0.3rem 0.7rem;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background-color 0.12s ease-out, border-color 0.12s ease-out;
+}
+
+.chat-widget-trace-entry-candidate-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 25%, var(--surface));
+  border-color: var(--accent);
+}
+
+.chat-widget-trace-entry-candidate-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

@@ -4,8 +4,22 @@ import remarkGfm from "remark-gfm";
 import { streamChat } from "../api/chat";
 import { getLlmInfo, type LlmInfo } from "../api/llm";
 import { useWorkbench } from "../context/WorkbenchContext";
-import type { ChatAttachment, TabId } from "../types";
+import type {
+  ChatAttachment,
+  ChatSkillCall,
+  ChatWidget,
+  TabId,
+} from "../types";
+import { ChatWidgetRenderer } from "./chat/widgets";
 import { IconChevronDown } from "./Icons";
+
+// Phase 11 v2.1 sub-step v2.1.5 — opt-in to the bounded agentic-skill
+// loop on a per-tab basis. The lab tab is the v2.1.5 launch consumer
+// (Trace mode "Ask AI" button → suggest_trace_entry skill →
+// TraceEntryCandidateWidget cards in chat). Other tabs stay on the
+// legacy single-pass path so existing Reports / Inspect chat
+// behaviour is unchanged.
+const AGENTIC_LOOP_TABS: ReadonlySet<TabId> = new Set<TabId>(["lab"]);
 
 const MAX_PROMPT_CHARS = 8000;
 
@@ -221,7 +235,15 @@ export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props
     let terminated = false;
 
     await streamChat(
-      { tab, prompt: trimmed, history, attachments, appId, runTs },
+      {
+        tab,
+        prompt: trimmed,
+        history,
+        attachments,
+        appId,
+        runTs,
+        agenticLoop: AGENTIC_LOOP_TABS.has(tab),
+      },
       {
         onThinking: (delta) => {
           updateChat(tab, assistantId, (m) => ({
@@ -235,6 +257,58 @@ export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props
           updateChat(tab, assistantId, (m) => ({
             text: (m.text ?? "") + delta,
           }));
+        },
+        // v2.1.5 — record the skill-call timeline inline on the
+        // assistant message that triggered it. ``skill_request``
+        // creates a new entry; ``skill_result`` / ``skill_pending``
+        // update the matching entry by request_id.
+        onSkillRequest: (info) => {
+          updateChat(tab, assistantId, (m) => {
+            const existing: ChatSkillCall[] = m.skill_calls ?? [];
+            const next: ChatSkillCall = {
+              request_id: info.request_id,
+              skill: info.skill,
+              params: info.params,
+              status: "running",
+            };
+            return { skill_calls: [...existing, next] };
+          });
+        },
+        onSkillResult: (info) => {
+          updateChat(tab, assistantId, (m) => {
+            const existing: ChatSkillCall[] = m.skill_calls ?? [];
+            const updated = existing.map((c) =>
+              c.request_id === info.request_id
+                ? {
+                    ...c,
+                    status: (info.success ? "success" : "failed") as ChatSkillCall["status"],
+                    text: info.text,
+                  }
+                : c,
+            );
+            return { skill_calls: updated };
+          });
+        },
+        onSkillPending: (info) => {
+          updateChat(tab, assistantId, (m) => {
+            const existing: ChatSkillCall[] = m.skill_calls ?? [];
+            const updated = existing.map((c) =>
+              c.request_id === info.request_id
+                ? {
+                    ...c,
+                    status: "pending" as ChatSkillCall["status"],
+                    reason: info.reason,
+                  }
+                : c,
+            );
+            return { skill_calls: updated };
+          });
+        },
+        onWidget: (info) => {
+          updateChat(tab, assistantId, (m) => {
+            const existing: ChatWidget[] = m.widgets ?? [];
+            return { widgets: [...existing, info.widget] };
+          });
         },
         onDone: () => {
           terminated = true;
@@ -361,6 +435,44 @@ export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props
                       <div className="chat-thinking-body">{m.thinking}</div>
                     </details>
                   )}
+                  {/* v2.1.5 — agentic skill-call timeline. Each call
+                       fires a ``skill_request`` (status=running) then
+                       a ``skill_result`` (status=success / failed) or
+                       ``skill_pending`` (consent gate). Rendered as a
+                       compact disclosure block above the main text so
+                       the operator can see the LLM's tool-use trace
+                       without it crowding the answer. */}
+                  {m.skill_calls && m.skill_calls.length > 0 && (
+                    <details
+                      className="chat-skill-calls"
+                      // Auto-open while at least one call is still
+                      // running; collapse once everything resolves so
+                      // the operator's reading-flow eye lands on the
+                      // final answer.
+                      open={m.skill_calls.some((c) => c.status === "running")}
+                    >
+                      <summary className="chat-skill-calls-toggle">
+                        Skill calls ({m.skill_calls.length})
+                      </summary>
+                      <ul className="chat-skill-calls-list">
+                        {m.skill_calls.map((c) => (
+                          <li
+                            key={c.request_id}
+                            className={`chat-skill-call chat-skill-call-${c.status}`}
+                          >
+                            <code className="chat-skill-call-name">{c.skill}</code>
+                            <span className="chat-skill-call-status">{c.status}</span>
+                            {c.reason && (
+                              <span className="chat-skill-call-reason">{c.reason}</span>
+                            )}
+                            {c.text && c.status !== "running" && (
+                              <pre className="chat-skill-call-text">{c.text}</pre>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
                   {(m.text ?? "").length > 0 ? (
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text}</ReactMarkdown>
                   ) : (
@@ -370,6 +482,20 @@ export function ChatDock({ tab, attachments, contextSummary, onCollapse }: Props
                         waiting for model<span className="chat-thinking-dot" aria-hidden="true">●</span>
                       </span>
                     )
+                  )}
+                  {/* v2.1.5 — interactive widgets emitted by skills
+                       (DEC-022 + DEC-025 v2.1 closing-note Q7). The
+                       <ChatWidgetRenderer> dispatcher routes by
+                       widget.kind; unknown kinds render null. Widgets
+                       sit BELOW the assistant text so the operator
+                       reads the natural-language summary first, then
+                       acts on the cards. */}
+                  {m.widgets && m.widgets.length > 0 && (
+                    <div className="chat-widgets">
+                      {m.widgets.map((w, i) => (
+                        <ChatWidgetRenderer key={i} widget={w} />
+                      ))}
+                    </div>
                   )}
                 </>
               ) : (

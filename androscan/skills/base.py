@@ -1,11 +1,11 @@
-"""Skill contract: SkillMeta, SkillContext, SkillResult. Used by all skills."""
+"""Skill contract: SkillMeta, SkillContext, SkillResult, SkillWidget. Used by all skills."""
 
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 
 @dataclass(frozen=True)
@@ -37,12 +37,91 @@ class SkillContext:
     apk_path: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Phase 11 v2.1 sub-step v2.1.5 — Chat-interactive widget pattern
+#
+# DEC-025 v2.1 closing-note Q7 (ii) — extends DEC-022's chat agentic loop
+# with a new outbound channel for LLM-emitted interactive widgets.
+# Skills can attach a tuple of structured widgets to their ``SkillResult``;
+# the chat agentic loop forwards each widget through a new ``widget`` SSE
+# event to the chat client, which dispatches by ``kind`` to a matching
+# React widget component.
+#
+# Architectural pattern lock — additive-by-design:
+#   * ``SkillWidget`` is a typed union; new widget kinds add as new union
+#     members without breaking the schema.
+#   * The frontend ``<ChatWidgetRenderer>`` dispatcher gracefully handles
+#     unknown widget kinds (renders the skill's ``text`` field only,
+#     ignores the unknown widget). A server / client version skew is
+#     non-fatal — operator never sees a broken render.
+#   * ``SkillResult.widgets`` defaults to ``()`` so every existing skill
+#     (decompile / RAG / fuser / planner / hook gen / etc.) is unchanged.
+#
+# v2.1.5 ships ONE widget kind — ``trace_entry_candidate`` — the first
+# real consumer of the pattern (the ``suggest_trace_entry`` skill).
+# Future kinds (Hook Builder template suggestions, Inspect "did you mean"
+# UI elements) add as new dataclasses + new union members.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TraceEntryCandidateWidget:
+    """LLM-emitted clickable trace-entry-method candidate. Rendered by
+    the chat dock as a compact card with the candidate's Smali sig +
+    rationale + confidence + a "Trace this" button. On click, the
+    frontend writes ``pendingTraceEntry`` (the same plumbing the 10.8
+    Inspect → Trace seed uses) and flips the workbench to Lab → Trace
+    mode — auto-fire on landing if the seed has a complete return
+    descriptor (DEC-025 v2.1 Q8 (a)).
+
+    Fields are deliberately tight — DEC-022's per-skill output budget
+    is ~6 KB total, and v2.1.5's ``suggest_trace_entry`` caps the
+    candidate list at 3, so the per-widget envelope stays well under
+    1 KB. ``confidence`` is a ``[0.0, 1.0]`` ratio (LLM ranking score
+    normalised to that scale by the skill).
+    """
+
+    kind: Literal["trace_entry_candidate"] = "trace_entry_candidate"
+    smali_id: str = ""
+    """Full Smali method id — e.g. ``Lcom/example/Foo;->onClick(Landroid/view/View;)V``.
+    The frontend "Trace this" button writes this verbatim to
+    ``pendingTraceEntry.entryPrefix``; if the value already looks like
+    a complete signature (return-descriptor terminal), the existing
+    auto-fire path fires the trace immediately on landing in Lab →
+    Trace mode."""
+    rationale: str = ""
+    """One-line operator-readable explanation of why this candidate
+    was suggested. Capped at 200 chars by the skill (DEC-025 v2.1 risk
+    note — keeps the LLM-budget squeeze bounded on apps with verbose
+    rationale prose)."""
+    confidence: float = 0.0
+    """``[0.0, 1.0]``; higher is more confident. Used to sort
+    candidates client-side and to render an opacity / colour cue on
+    the widget card (matches the v2.1.3 ``SimilarClassCandidate``
+    visual hierarchy)."""
+
+
+# ``SkillWidget`` is a typed union — ``TraceEntryCandidateWidget`` is
+# the first member; future widget kinds add here. The chat agentic
+# loop's SSE-event payload for a widget is the dataclass's
+# ``__dict__`` (so the JSON wire format mirrors the dataclass shape
+# exactly, ``kind`` field included for the frontend dispatcher).
+SkillWidget = Union[TraceEntryCandidateWidget]
+
+
 @dataclass
 class SkillResult:
     """Result of executing a skill: success, structured data, human/LLM-readable text.
 
     For exploit-tier skills, optional log_summary and spinner_text are used by
     orchestration to write a short line to run.log and to drive spinner/UI text.
+
+    Phase 11 v2.1 sub-step v2.1.5 — ``widgets`` extends the result
+    surface with structured chat-renderable widgets. Defaults to ``()``
+    so every existing skill is unchanged; the chat agentic loop forwards
+    each widget through a ``widget`` SSE event to the frontend
+    ``<ChatWidgetRenderer>`` dispatcher. See module-level
+    ``SkillWidget`` doc-block for the architectural pattern.
     """
 
     success: bool
@@ -50,6 +129,12 @@ class SkillResult:
     text: str = ""   # human/LLM-readable summary
     log_summary: Optional[str] = None  # short line for run.log (exploit steps)
     spinner_text: Optional[str] = None  # spinner/UI label (exploit steps)
+    widgets: tuple[SkillWidget, ...] = field(default_factory=tuple)
+    """Tuple of LLM-emitted interactive widgets surfaced through the
+    chat dock. Empty by default. v2.1.5 introduces the first consumer
+    (``suggest_trace_entry`` returning ``TraceEntryCandidateWidget``);
+    future skills add new widget kinds as new ``SkillWidget`` union
+    members without breaking the schema."""
 
 
 _NS_ANDROID = "http://schemas.android.com/apk/res/android"

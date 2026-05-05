@@ -152,6 +152,57 @@ def test_skill_meta_has_requires_confirmation_field():
     assert by_name["generate_frida_hook"].requires_confirmation is True
 
 
+def test_list_llm_skills_includes_v2_1_5_skills():
+    """Phase 11 v2.1 sub-step v2.1.5 / DEC-025 v2.1 closing-note Q11:
+    ``suggest_trace_entry`` is the LLM-tier entry-discovery skill the
+    chat agentic loop surfaces via the v2.1.5 chat-widget pattern."""
+    names = {m.name for m in list_llm_skills()}
+    assert "suggest_trace_entry" in names
+
+
+def test_suggest_trace_entry_is_read_only():
+    """v2.1.5's new skill must default to ``requires_confirmation=False``
+    (DEC-025 § 'Trace itself is read-only'); the entry-discovery
+    surface adds zero new device-touching effects."""
+    by_name = {m.name: m for m in list_llm_skills()}
+    assert by_name["suggest_trace_entry"].requires_confirmation is False
+
+
+def test_skill_result_widgets_default_empty():
+    """Phase 11 v2.1 sub-step v2.1.5 / DEC-025 v2.1 closing-note Q7:
+    ``SkillResult.widgets`` defaults to an empty tuple so every
+    pre-v2.1.5 skill's behaviour is unchanged. The chat-widget
+    pattern is additive-by-design — only ``suggest_trace_entry``
+    populates the widgets channel today; future skills opt in by
+    setting it explicitly."""
+    from androscan.skills.base import SkillResult
+
+    r = SkillResult(success=True, text="hello")
+    assert r.widgets == ()
+    assert isinstance(r.widgets, tuple)
+
+
+def test_trace_entry_candidate_widget_shape():
+    """The v2.1.5 widget dataclass must serialise cleanly through
+    ``dataclasses.asdict`` since that's the chat agentic loop's wire
+    format. ``kind`` must always be present so the frontend
+    ``<ChatWidgetRenderer>`` dispatcher can switch on it."""
+    import dataclasses
+
+    from androscan.skills.base import TraceEntryCandidateWidget
+
+    w = TraceEntryCandidateWidget(
+        smali_id="Lcom/x/Y;->m()V", rationale="r", confidence=0.42,
+    )
+    payload = dataclasses.asdict(w)
+    assert payload == {
+        "kind": "trace_entry_candidate",
+        "smali_id": "Lcom/x/Y;->m()V",
+        "rationale": "r",
+        "confidence": 0.42,
+    }
+
+
 def test_consent_class_skills_are_not_pipeline_or_exploit():
     """DEC-022 only applies to the LLM-driven loop; pipeline + exploit-tier
     skills (orchestrated, not LLM-picked) must not be flagged."""

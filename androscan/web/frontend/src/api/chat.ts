@@ -1,4 +1,4 @@
-import type { ChatAttachment, ChatMessage, TabId } from "../types";
+import type { ChatAttachment, ChatMessage, ChatWidget, TabId } from "../types";
 
 export type ChatSendArgs = {
   tab: TabId;
@@ -7,6 +7,12 @@ export type ChatSendArgs = {
   attachments: ChatAttachment[];
   appId: string | null;
   runTs: string | null;
+  // Phase 11 v2.1 sub-step v2.1.5 — DEC-022 + DEC-025 v2.1 closing-note
+  // Q7. Opt into the bounded agentic-skill loop. v2.1.5 sets this for
+  // the lab tab (where the chat-widget pattern is most useful);
+  // other tabs default to the legacy single-pass path so existing
+  // behaviour is unchanged.
+  agenticLoop?: boolean;
 };
 
 export type ChatResponse =
@@ -21,6 +27,7 @@ function buildPayload(args: ChatSendArgs) {
     attachments: args.attachments,
     app_id: args.appId,
     run_ts: args.runTs,
+    agentic_loop: args.agenticLoop ?? false,
   };
 }
 
@@ -42,11 +49,48 @@ export async function sendChat(args: ChatSendArgs): Promise<ChatResponse> {
 // double-newline frame separator, then split each frame's "event:" /
 // "data:" lines. Cancellation is handled via AbortSignal.
 
+// v2.1.5 — agentic-loop SSE event payloads. The frontend renders
+// skill calls inline on the assistant message that triggered them
+// (per ChatSkillCall in types.ts) and dispatches widgets through
+// <ChatWidgetRenderer> by widget.kind.
+export type ChatStreamSkillRequest = {
+  request_id: string;
+  skill: string;
+  params: Record<string, unknown>;
+};
+
+export type ChatStreamSkillResult = {
+  request_id: string;
+  skill: string;
+  success: boolean;
+  text: string;
+};
+
+export type ChatStreamSkillPending = {
+  request_id: string;
+  skill: string;
+  params: Record<string, unknown>;
+  reason: string;
+};
+
+export type ChatStreamWidget = {
+  request_id: string;
+  skill: string;
+  widget: ChatWidget;
+};
+
 export type ChatStreamCallbacks = {
   onThinking?: (delta: string) => void;
   onContent?: (delta: string) => void;
   onDone?: (info: ChatStreamDone) => void;
   onError?: (err: ChatStreamError) => void;
+  // v2.1.5 agentic-loop callbacks. Optional — single-pass chat
+  // requests never trigger these so existing callers (Reports / Inspect
+  // tabs that haven't migrated) don't need to handle them.
+  onSkillRequest?: (info: ChatStreamSkillRequest) => void;
+  onSkillResult?: (info: ChatStreamSkillResult) => void;
+  onSkillPending?: (info: ChatStreamSkillPending) => void;
+  onWidget?: (info: ChatStreamWidget) => void;
 };
 
 export type ChatStreamDone = {
@@ -56,6 +100,9 @@ export type ChatStreamDone = {
   done_reason: string | null;
   thinking_chars: number;
   content_chars: number;
+  agentic?: boolean;
+  skill_calls?: number;
+  widgets?: number;
 };
 
 export type ChatStreamError = {
@@ -144,6 +191,40 @@ export async function streamChat(
         } else if (evt.event === "content") {
           const delta = typeof obj.delta === "string" ? obj.delta : "";
           if (delta) callbacks.onContent?.(delta);
+        } else if (evt.event === "skill_request") {
+          callbacks.onSkillRequest?.({
+            request_id: (obj.request_id as string) ?? "",
+            skill: (obj.skill as string) ?? "",
+            params: (obj.params as Record<string, unknown>) ?? {},
+          });
+        } else if (evt.event === "skill_result") {
+          callbacks.onSkillResult?.({
+            request_id: (obj.request_id as string) ?? "",
+            skill: (obj.skill as string) ?? "",
+            success: Boolean(obj.success),
+            text: (obj.text as string) ?? "",
+          });
+        } else if (evt.event === "skill_pending") {
+          callbacks.onSkillPending?.({
+            request_id: (obj.request_id as string) ?? "",
+            skill: (obj.skill as string) ?? "",
+            params: (obj.params as Record<string, unknown>) ?? {},
+            reason: (obj.reason as string) ?? "",
+          });
+        } else if (evt.event === "widget") {
+          // The widget payload mirrors the backend's ``SkillWidget``
+          // dataclass shape (kind + per-kind fields). The dispatcher
+          // <ChatWidgetRenderer> ignores unknown kinds so a server /
+          // client version skew is non-fatal — operator never sees a
+          // broken render, just no widget for that one event.
+          const widget = obj.widget as ChatWidget | undefined;
+          if (widget && typeof widget.kind === "string") {
+            callbacks.onWidget?.({
+              request_id: (obj.request_id as string) ?? "",
+              skill: (obj.skill as string) ?? "",
+              widget,
+            });
+          }
         } else if (evt.event === "done") {
           sawTerminal = true;
           callbacks.onDone?.({
@@ -153,6 +234,9 @@ export async function streamChat(
             done_reason: (obj.done_reason as string | null) ?? null,
             thinking_chars: (obj.thinking_chars as number) ?? 0,
             content_chars: (obj.content_chars as number) ?? 0,
+            agentic: (obj.agentic as boolean | undefined),
+            skill_calls: (obj.skill_calls as number | undefined),
+            widgets: (obj.widgets as number | undefined),
           });
         } else if (evt.event === "error") {
           sawTerminal = true;
