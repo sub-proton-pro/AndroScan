@@ -128,3 +128,56 @@ export function javaRelPathToSmaliMethodPrefix(
   const m = (methodName || "").trim();
   return m ? `${klass}->${m}(` : `${klass}->`;
 }
+
+/**
+ * Heuristic: does the string look like the operator typed (or pasted)
+ * a Smali signature? Recognises every shape Trace mode currently
+ * accepts as an entry method:
+ *
+ *   ``Lcom/example/Foo;``                                  → true (class-only)
+ *   ``Lcom/example/Foo;->``                                → true (class+separator,
+ *                                                                  Inspect → Trace
+ *                                                                  bare-class seed)
+ *   ``Lcom/example/Foo;->onClick(``                        → true (class+method-prefix,
+ *                                                                  Inspect → Trace
+ *                                                                  method-known seed)
+ *   ``Lcom/example/Foo;->onClick(Landroid/view/View;)V``   → true (full signature —
+ *                                                                  what
+ *                                                                  ``looksLikeCompleteSmaliSignature``
+ *                                                                  also accepts)
+ *   ``com.example.Foo.onClick``                            → false (dotted Java form
+ *                                                                  — v2.1.2's
+ *                                                                  ``normalise-entry``
+ *                                                                  coalescer translates
+ *                                                                  this to Smali)
+ *   ``com.example.Foo.onClick(Foo.java:42)``               → false (stack-trace line
+ *                                                                  — v2.1.2's coalescer)
+ *   ``MainActivity``                                       → false (bare class name)
+ *   ``""`` / whitespace                                    → false
+ *
+ * Detection rule: starts with ``L``, has at least one ``/`` (package
+ * separator), and contains a ``;`` somewhere (class-descriptor
+ * terminator). Java class names that *happen* to start with ``L`` (like
+ * ``Logger``) are filtered out by the ``/`` requirement — Java doesn't
+ * use ``/`` as a package separator. False positives are still possible
+ * on adversarially-typed inputs (e.g. ``L/;``) but those aren't
+ * operator-realistic; the v2.1.2 coalescer's call-graph validation is
+ * the second-tier honesty check that catches malformed inputs that
+ * pass this heuristic.
+ *
+ * v2.1.1 ships the helper but doesn't consume it yet (the picker-vs-
+ * coalescer-pill switch lands in v2.1.2 alongside the
+ * ``POST /api/trace/{app_id}/normalise-entry`` endpoint). Adding it
+ * here keeps v2.1.2's surface area focused on the coalescer + spinner
+ * + pill rather than splitting helper-additions across two sub-steps.
+ *
+ * Pure / no I/O.
+ */
+export function looksLikeSmali(s: string): boolean {
+  const trimmed = (s || "").trim();
+  if (!trimmed) return false;
+  if (!trimmed.startsWith("L")) return false;
+  if (!trimmed.includes("/")) return false;
+  if (!trimmed.includes(";")) return false;
+  return true;
+}

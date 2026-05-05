@@ -1,33 +1,47 @@
 /**
  * Trace mode for the Lab tab — the headline UI for Phase 10
- * (sub-steps 10.7 + 10.8 + the post-v1 method-picker follow-up). The
+ * (sub-steps 10.7 + 10.8 + the post-v1 method-picker follow-up) plus
+ * Phase 11 v2.1.1's entry-method discoverability restructure. The
  * 10.6 placeholder shipped a status-only view; this rewrite is the
  * real surface:
  *
- *   1. Top-of-pane form: smali entry signature input + hops stepper
- *      (1..6 clamped) + Build / Force-rebuild buttons. The Trace
- *      button is disabled until the input is a syntactically-complete
- *      Smali signature (closing paren + return descriptor); a tooltip
- *      explains what's missing so the operator isn't left guessing.
- *      When the form is seeded from an external source (10.8's
- *      Inspect → Trace cross-tab handoff), a small pill above the
- *      input names the source so the operator knows the field wasn't
- *      typed by hand.
- *   2. Method picker (new): activates whenever the entry is a
- *      class-prefix-only string (``Lcom/.../Foo;->[partial]``) and
- *      reads from ``GET /api/graph/{app_id}/methods``. Closes the
- *      operator-visible workflow gap when the Inspect → Trace seed
- *      couldn't pin a method (most ``findViewById`` candidates) —
+ *   1. Seed pill (when present): a small "Seeded from <source>"
+ *      banner that surfaces 10.8's cross-tab handoff (Inspect → Trace,
+ *      Graph → Trace via 11.2). Sits at the top of the pane so the
+ *      operator knows the entry wasn't typed by hand, with a "×"
+ *      clear button. Cleared on manual edit / submit / app change.
+ *   2. **v2.1.1: Browse classes section** (collapsible, default-
+ *      collapsed). Embeds the existing ``ClassMethodTree`` component
+ *      that the Inspect tab uses, so operators can pick an entry
+ *      method by browsing the call-graph closure rather than typing
+ *      a Smali signature blind. Click a method → seeds the entry
+ *      field with a Smali class-prefix (``Lcom/example/Foo;->onClick(``)
+ *      → activates the MethodPicker (item 4) for overload confirmation
+ *      → operator picks an overload → auto-fires the trace. App/Libs
+ *      filter toggles reuse ``ClassMethodTree``'s existing defaults.
+ *   3. **v2.1.1: Inline controls row** — Hops stepper (1..6 clamped,
+ *      always visible as a small inline control) + "Advanced: type
+ *      Smali signature directly" toggle (default-collapsed). When
+ *      Advanced is expanded, the raw Smali entry input + Trace +
+ *      Force re-trace buttons become available — the operator-power-
+ *      user path that was the v1 default. Browse + MethodPicker is
+ *      the new operator-easy-mode path.
+ *   4. Method picker: activates whenever the entry is a class-prefix-
+ *      only string (``Lcom/.../Foo;->[partial]``) and reads from
+ *      ``GET /api/graph/{app_id}/methods``. Closes the operator-
+ *      visible workflow gap when the Inspect → Trace seed couldn't
+ *      pin a method (most ``findViewById`` candidates) and is the
+ *      committal step for the new v2.1.1 Browse-classes flow —
  *      clicking a row fills the entry with the full Smali signature
  *      and auto-fires the trace. Debounced 150 ms so a fast typist
  *      doesn't fire one request per keystroke.
- *   3. Result region: ``BehaviorAnchorCard`` header + ``DecisionTimeline``
+ *   5. Result region: ``BehaviorAnchorCard`` header + ``DecisionTimeline``
  *      + the per-plan ``BypassPlanCard`` list (default plans visible,
  *      advanced plans behind an ``<details>`` expander per DEC-024).
- *   4. Cached anchors picker: a small list of previously-built
+ *   6. Cached anchors picker: a small list of previously-built
  *      anchors so the operator can flip between them without
  *      re-typing the smali signature.
- *   5. Status row: cache + decompile + call-graph readiness, surfaced
+ *   7. Status row: cache + decompile + call-graph readiness, surfaced
  *      via the same ``GET /status`` shape the 10.6 placeholder hit.
  *
  * Lifecycle owned by the ``useTraceAnchor`` hook in ``api/trace.ts``:
@@ -41,6 +55,13 @@
  * ``BehaviorAnchor`` is published to the parent ``LabTab`` via the
  * ``onActiveAnchorChange`` callback so the Manual Hooks chat
  * builder can fold it into the new ``trace`` ``ChatAttachment``.
+ *
+ * v2.1.1 also bootstraps the decompile status + class-tree fetch
+ * lifecycle that ``ClassMethodTree`` needs (mirrors the same pattern
+ * ``InspectTab`` uses — ``getDecompileStatus`` on app change,
+ * ``fetchTree`` once status is ``ready``, polling while ``pending``).
+ * No new backend routes; reuses ``/api/decompile/{app_id}/status``
+ * and ``/api/code/{app_id}/tree``.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -48,6 +69,13 @@ import { IconChevronDown, IconChevronUp } from "../components/Icons";
 import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { DecisionTimeline } from "../components/trace/DecisionTimeline";
+import { ClassMethodTree } from "../components/ClassMethodTree";
+import {
+  fetchTree,
+  getDecompileStatus,
+  type CodeTree,
+  type DecompileStatus,
+} from "../api/code";
 import { listMethodsOnClass, type GraphNode } from "../api/graph";
 import {
   deleteTraceAnchor,
@@ -59,6 +87,7 @@ import {
   type TraceStatusPayload,
 } from "../api/trace";
 import { useWorkbench } from "../context/WorkbenchContext";
+import { javaRelPathToSmaliMethodPrefix } from "../util/smaliClassToFile";
 
 type Props = {
   appId: string | null;
@@ -144,7 +173,7 @@ const PICKER_DEBOUNCE_MS = 150;
 const PICKER_DISPLAY_LIMIT = 50;
 
 export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
-  const { pendingTraceEntry, setPendingTraceEntry } = useWorkbench();
+  const { pendingTraceEntry, setPendingTraceEntry, dossier } = useWorkbench();
 
   // ----- form state ------------------------------------------------------
   const [entryDraft, setEntryDraft] = useState("");
@@ -157,6 +186,33 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
   // edit the field or fire the trace. Cleared on manual edit / submit /
   // app change so it never lingers stale.
   const [seedLabel, setSeedLabel] = useState<string | null>(null);
+
+  // ----- v2.1.1: Browse classes + Advanced disclosure state -------------
+  // Both default-collapsed (Q1: A1, Q4: B). Browse expands the embedded
+  // ``ClassMethodTree``; Advanced reveals the raw Smali entry input +
+  // Trace + Force re-trace buttons (the v1 power-user surface).
+  const [browseExpanded, setBrowseExpanded] = useState(false);
+  const [advancedExpanded, setAdvancedExpanded] = useState(false);
+
+  // v2.1.1: Decompile status + class tree for the embedded
+  // ``ClassMethodTree``. Mirrors the InspectTab bootstrap pattern
+  // (status first, then tree once ``ready``, poll while ``pending``)
+  // so the two surfaces share the same readiness contract — if Browse
+  // is expanded before jadx finishes, the operator sees the same
+  // "Decompiling APK with jadx…" copy + Refresh button as Inspect.
+  const [decompile, setDecompile] = useState<DecompileStatus | null>(null);
+  const [tree, setTree] = useState<CodeTree | null>(null);
+  const [treeFilter, setTreeFilter] = useState("");
+
+  // App package (used by ``ClassMethodTree`` to split App vs. Library
+  // packages) read off the workbench-wide dossier (Reports tab keeps
+  // it in sync with the active selection).
+  const packageName = useMemo<string | null>(() => {
+    const apk = (dossier as Record<string, unknown> | null)?.apk_info as
+      | { package?: string }
+      | undefined;
+    return apk?.package || null;
+  }, [dossier]);
 
   // ----- status + cached-anchors list ------------------------------------
   const [status, setStatus] = useState<TraceStatusPayload | null>(null);
@@ -176,8 +232,53 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
     setActiveEntry(null);
     setActiveHops(DEFAULT_HOPS);
     setSeedLabel(null);
+    setBrowseExpanded(false);
+    setAdvancedExpanded(false);
+    setDecompile(null);
+    setTree(null);
+    setTreeFilter("");
     clear();
   }, [appId, clear]);
+
+  // v2.1.1: bootstrap decompile status + class tree on app change.
+  // Mirrors InspectTab's bootstrap pattern. We fetch eagerly (rather
+  // than lazily on Browse-expand) so that when the operator opens
+  // Browse the tree is already loaded — avoiding a perceptible
+  // "loading…" flash on the most-common click path. The fetch is
+  // cheap (one HEAD-style status call + one cached tree fetch).
+  useEffect(() => {
+    if (!appId) return;
+    let cancelled = false;
+    void (async () => {
+      const s = await getDecompileStatus(appId);
+      if (cancelled) return;
+      setDecompile(s);
+      if (s.status === "ready") {
+        const t = await fetchTree(appId);
+        if (!cancelled) setTree(t);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [appId]);
+
+  // v2.1.1: poll while jadx is mid-flight so the embedded
+  // ``ClassMethodTree`` flips from the "decompiling…" placeholder to
+  // the real tree without operator intervention. Identical cadence
+  // to InspectTab's poll (2 s).
+  useEffect(() => {
+    if (!appId || decompile?.status !== "pending") return;
+    const id = window.setInterval(async () => {
+      const s = await getDecompileStatus(appId);
+      setDecompile(s);
+      if (s.status === "ready") {
+        const t = await fetchTree(appId);
+        setTree(t);
+      }
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [appId, decompile?.status]);
 
   // 10.8 cross-tab seed: pendingTraceEntry is set by the Inspect tab's
   // BestBanner. We prefill the form, surface a "Seeded from ..." pill,
@@ -327,6 +428,30 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
     setActiveHops(hops);
   };
 
+  // v2.1.1: ``ClassMethodTree`` selection handler. Builds a Smali
+  // class-prefix from the rel-path + optional method name and seeds
+  // the entry field with it — which immediately activates the
+  // MethodPicker because the seeded value matches ``classPrefixContext``
+  // (``Lcom/example/Foo;->`` for class clicks, ``Lcom/example/Foo;->onClick(``
+  // for method clicks). The operator confirms an overload via the
+  // picker, which auto-fires the trace through the existing
+  // ``onPickMethod`` path.
+  //
+  // We *don't* clear ``activeEntry`` here — the MethodPicker is the
+  // commit step. We *do* clear the seed-pill (so a subsequent tree
+  // click after a cross-tab seed doesn't show a stale "Seeded from
+  // Inspect → ..." label).
+  const onSelectFromTree = (sel: {
+    rel_path: string;
+    class_name: string;
+    method?: string;
+  }) => {
+    const prefix = javaRelPathToSmaliMethodPrefix(sel.rel_path, sel.method ?? null);
+    if (!prefix) return;
+    setEntryDraft(prefix);
+    setSeedLabel(null);
+  };
+
   const entryComplete = looksLikeCompleteSmaliSignature(entryDraft);
 
   const onSubmit = (e: React.FormEvent) => {
@@ -401,21 +526,49 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
               </button>
             </div>
           )}
-          <form className="trace-form" onSubmit={onSubmit}>
-            <label className="trace-form-field trace-form-entry">
-              <span>Entry method (smali signature)</span>
-              <input
-                type="text"
-                value={entryDraft}
-                onChange={(e) => {
-                  setEntryDraft(e.target.value);
-                  if (seedLabel) setSeedLabel(null);
-                }}
-                placeholder="Lcom/example/Foo;->onClick(Landroid/view/View;)V"
-                autoComplete="off"
-                spellCheck={false}
-              />
-            </label>
+
+          <section className="trace-class-browser">
+            <button
+              type="button"
+              className="trace-class-browser-head"
+              onClick={() => setBrowseExpanded((v) => !v)}
+              aria-expanded={browseExpanded}
+              aria-controls="trace-class-browser-body"
+              title={
+                browseExpanded
+                  ? "Collapse the class browser"
+                  : "Browse decompiled classes & methods to pick a trace entry"
+              }
+            >
+              {browseExpanded
+                ? <IconChevronDown size={10} />
+                : <IconChevronUp size={10} />}
+              <span className="trace-class-browser-title">Browse classes</span>
+              <span className="muted small trace-class-browser-hint">
+                pick a method to trace from the call-graph closure
+              </span>
+            </button>
+            {browseExpanded && (
+              <div
+                id="trace-class-browser-body"
+                className="trace-class-browser-body"
+              >
+                <ClassMethodTree
+                  appId={appId}
+                  status={decompile}
+                  tree={tree}
+                  filter={treeFilter}
+                  onFilterChange={setTreeFilter}
+                  onTreeLoaded={setTree}
+                  onStatus={setDecompile}
+                  onSelect={onSelectFromTree}
+                  appPackage={packageName}
+                />
+              </div>
+            )}
+          </section>
+
+          <form className="trace-form-inline" onSubmit={onSubmit}>
             <label className="trace-form-field trace-form-hops">
               <span>Hops</span>
               <input
@@ -427,27 +580,67 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
                 onChange={(e) => setHopsDraft(parseInt(e.target.value, 10) || DEFAULT_HOPS)}
               />
             </label>
-            <div className="trace-form-buttons">
-              <button
-                type="submit"
-                disabled={!entryComplete}
-                title={
-                  entryComplete
-                    ? "Run the trace_behavior skill on this entry method"
-                    : "Add the method name + parameter descriptors + return type, e.g. onClick(Landroid/view/View;)V — or pick from the list below"
-                }
+            <button
+              type="button"
+              className="trace-advanced-toggle"
+              onClick={() => setAdvancedExpanded((v) => !v)}
+              aria-expanded={advancedExpanded}
+              aria-controls="trace-advanced-form-body"
+              title={
+                advancedExpanded
+                  ? "Hide the raw Smali signature input"
+                  : "Type a Smali signature directly (advanced)"
+              }
+            >
+              {advancedExpanded
+                ? <IconChevronDown size={10} />
+                : <IconChevronUp size={10} />}
+              <span className="trace-advanced-toggle-title">
+                Advanced: type Smali signature directly
+              </span>
+            </button>
+            {advancedExpanded && (
+              <div
+                id="trace-advanced-form-body"
+                className="trace-advanced-form-body"
               >
-                Trace
-              </button>
-              <button
-                type="button"
-                onClick={onForceRebuild}
-                disabled={!activeEntry || state.kind === "building"}
-                title="Re-run the trace_behavior skill from scratch (bypass cache)"
-              >
-                Force re-trace
-              </button>
-            </div>
+                <label className="trace-form-field trace-form-entry">
+                  <span>Entry method (smali signature)</span>
+                  <input
+                    type="text"
+                    value={entryDraft}
+                    onChange={(e) => {
+                      setEntryDraft(e.target.value);
+                      if (seedLabel) setSeedLabel(null);
+                    }}
+                    placeholder="Lcom/example/Foo;->onClick(Landroid/view/View;)V"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </label>
+                <div className="trace-form-buttons">
+                  <button
+                    type="submit"
+                    disabled={!entryComplete}
+                    title={
+                      entryComplete
+                        ? "Run the trace_behavior skill on this entry method"
+                        : "Add the method name + parameter descriptors + return type, e.g. onClick(Landroid/view/View;)V — or pick from the list below"
+                    }
+                  >
+                    Trace
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onForceRebuild}
+                    disabled={!activeEntry || state.kind === "building"}
+                    title="Re-run the trace_behavior skill from scratch (bypass cache)"
+                  >
+                    Force re-trace
+                  </button>
+                </div>
+              </div>
+            )}
           </form>
 
           {pickerCtx && (
@@ -513,8 +706,10 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   if (state.kind === "idle") {
     return (
       <p className="trace-empty muted small">
-        Type or paste a smali entry method above and click <strong>Trace</strong>.
-        The cached anchors below show what's already been traced for this app.
+        Expand <strong>Browse classes</strong> above to pick a trace entry from
+        the call-graph closure, or open <strong>Advanced</strong> to type a
+        Smali signature directly. The cached anchors below show what's already
+        been traced for this app.
       </p>
     );
   }

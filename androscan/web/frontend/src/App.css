@@ -4785,6 +4785,126 @@ code { color: var(--accent); }
   cursor: not-allowed;
 }
 
+/* ===========================================================================
+ * Phase 11 v2.1.1 — Trace mode entry-method discoverability
+ *
+ * Three new namespaces sit above/around the legacy ``.trace-form`` rules:
+ *   .trace-class-browser   — collapsible "Browse classes" disclosure that
+ *                            embeds the same ``ClassMethodTree`` component
+ *                            the Inspect tab uses. Default-collapsed; the
+ *                            head is a chevron-prefixed button so it lines
+ *                            up visually with the HookBuilder / AdbShell /
+ *                            Chat collapsibles the rest of the workbench
+ *                            ships.
+ *   .trace-form-inline     — single-row Hops + Advanced-toggle. Replaces
+ *                            the v1 grid form when Advanced is collapsed
+ *                            (the operator-easy-mode default).
+ *   .trace-advanced-form-* — the disclosure body that holds the raw Smali
+ *                            input + Trace + Force re-trace buttons (the
+ *                            v1 power-user surface, now opt-in). Inherits
+ *                            the existing ``.trace-form-entry`` /
+ *                            ``.trace-form-buttons`` rules so the inner
+ *                            controls keep the same visual weight they
+ *                            had pre-restructure.
+ * =========================================================================== */
+
+.trace-class-browser {
+  margin: 0.5rem 0 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+}
+
+.trace-class-browser-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.trace-class-browser-head:hover {
+  background: var(--bg);
+}
+
+.trace-class-browser-title {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.trace-class-browser-hint {
+  margin-left: auto;
+  font-size: 0.75rem;
+}
+
+.trace-class-browser-body {
+  padding: 0.5rem 0.6rem 0.6rem;
+  border-top: 1px solid var(--border);
+  /* Bound the embedded tree so a large project's class list doesn't
+   * push the rest of the Trace pane (form, picker, result region) off
+   * the bottom of the viewport. The internal tree scrolls; the
+   * surrounding ``.lab-trace-mode.pane-scroll`` keeps the whole pane
+   * scrollable too. */
+  max-height: 22rem;
+  overflow-y: auto;
+}
+
+.trace-form-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.6rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.trace-advanced-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 3px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.8rem;
+  padding: 0.35rem 0.6rem;
+  /* Sit at the bottom of the inline row, level with the Hops field. */
+  align-self: end;
+}
+
+.trace-advanced-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.trace-advanced-toggle-title {
+  font-weight: 500;
+}
+
+.trace-advanced-form-body {
+  /* Span the full inline-row width when expanded so the entry input
+   * has room for a real Smali signature (mirrors the v1 form's
+   * ``.trace-form-entry input`` min-width). */
+  flex: 1 0 100%;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.5rem;
+  align-items: end;
+  padding-top: 0.4rem;
+  margin-top: 0.4rem;
+  border-top: 1px dashed var(--border);
+}
+
 /* Phase 10 sub-step 10.8: "Seeded from <source>" pill that sits above
  * the trace form whenever ``pendingTraceEntry`` populated the input
  * field (Inspect → Trace cross-tab handoff). Visually mirrors the
