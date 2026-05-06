@@ -33,6 +33,13 @@ import type { ChatAttachment } from "../types";
 import { useWorkbench, type LabMode } from "../context/WorkbenchContext";
 import { LabTraceMode } from "./LabTraceMode";
 import { listAnchoredMethods, type AnchoredMethod, type BehaviorAnchor } from "../api/trace";
+import { AppPicker } from "../components/AppPicker";
+import {
+  CHAT_TRACE_BUDGET,
+  CHAT_TRACE_MAX_DECISIONS,
+  CHAT_TRACE_TOP_PLANS,
+  renderTraceAttachment,
+} from "../util/traceChatAttachment";
 
 /**
  * Lab tab (formerly "Hook Lab"; renamed in Phase 10 sub-step 10.6).
@@ -184,6 +191,14 @@ function GraphMode() {
     typeof dossier?.apk_info?.package === "string" ? dossier.apk_info.package : null;
   return (
     <div className="lab-graph-mode">
+      {/* v2.1.8 — local AppPicker mirrors the global one in the
+          top-right header. Both read/write the same ``appId`` via
+          ``WorkbenchContext`` so picking from either surface updates
+          the other in lockstep with no explicit plumbing. */}
+      <header className="lab-mode-head">
+        <span className="lab-mode-head-title">Call Graph</span>
+        <AppPicker />
+      </header>
       <CallGraphView
         appId={appId}
         onSelectNode={setSelected}
@@ -474,6 +489,15 @@ function ManualHooksMode({
   }, [anchoredMethodRows]);
 
   return (
+    <div className="lab-manual-hooks-mode">
+      {/* v2.1.8 — local AppPicker mirrors the global one in the
+          top-right header. Both read/write the same ``appId`` via
+          ``WorkbenchContext`` so picking from either surface updates
+          the other in lockstep with no explicit plumbing. */}
+      <header className="lab-mode-head">
+        <span className="lab-mode-head-title">Manual Hooks</span>
+        <AppPicker />
+      </header>
     <PanelGroup direction="horizontal" autoSaveId="lab-manual-h" className="tab-panels">
       <Panel defaultSize={32} minSize={20} className="panel">
         <CallGraphView
@@ -662,6 +686,7 @@ function ManualHooksMode({
         )}
       </Panel>
     </PanelGroup>
+    </div>
   );
 }
 
@@ -827,112 +852,13 @@ type BuildAttachmentsArgs = {
   activeAnchor: BehaviorAnchor | null;
 };
 
-// Soft cap matching the backend ``ATTACHMENT_BUDGETS["trace"] == 6_000``.
-// Mirrors ``CHAT_CODE_BUDGET``; we trim client-side so the operator's
-// "show context" preview matches what the model actually sees.
-const CHAT_TRACE_BUDGET = 6_000;
-// We surface only the top-3 ranked (default-tier) bypass plans in the
-// chat attachment to keep the context budget honest. Operators who want
-// the full ranked list (incl. advanced higher-risk plans) read the
-// Trace mode UI directly.
-const CHAT_TRACE_TOP_PLANS = 3;
-// Per-decision summary lines fold into the same 6_000-char budget
-// alongside the entry header + plans; clipping further at this cap
-// prevents a 200-decision closure from monopolising the attachment
-// budget. Anything above this is replaced with a "+ N more decisions"
-// trailer.
-const CHAT_TRACE_MAX_DECISIONS = 40;
-
-function _renderMethodRefForChat(m: { class_name: string; method_name: string }): string {
-  return `${m.class_name}.${m.method_name}`;
-}
-
-function _renderTraceAttachment(anchor: BehaviorAnchor): string {
-  const entry = anchor.entry_method;
-  const parts: string[] = [];
-  parts.push(
-    `Entry method: ${_renderMethodRefForChat(entry)}` +
-      `(${entry.param_descriptors.join(", ")})${entry.return_descriptor}`,
-  );
-  parts.push(
-    `hops=${anchor.hops} · decisions=${anchor.decisions.length} · ` +
-      `plans=${anchor.plans.length} (+${anchor.advanced_plans.length} advanced)` +
-      (anchor.truncated ? " · TRUNCATED (cap hit)" : "") +
-      (anchor.incomplete ? " · INCOMPLETE (unresolved predicate origins)" : ""),
-  );
-  if (anchor.rationale && anchor.rationale.trim()) {
-    parts.push(`Rationale: ${anchor.rationale.trim()}`);
-  }
-
-  // Per-decision verdict list. One line per gate so the model can
-  // reference them by index without us shipping the full nested
-  // verdict / branch / origin structure.
-  parts.push("");
-  parts.push(`Decision timeline (${anchor.decisions.length}):`);
-  const lowConf = new Set(anchor.low_confidence_decision_indices);
-  const decisions = anchor.decisions.slice(0, CHAT_TRACE_MAX_DECISIONS);
-  decisions.forEach((d, i) => {
-    const verdicts =
-      d.branch_outcome?.verdicts
-        .map((v) => `${v.branch_label}=${v.verdict}(${v.score.toFixed(2)})`)
-        .join(", ") ?? "(unclassified)";
-    const origin =
-      d.predicate_origin?.kind === "method_call"
-        ? ` ← ${_renderMethodRefForChat(d.predicate_origin.method)}`
-        : d.predicate_origin?.kind === "field_read"
-        ? ` ← field ${d.predicate_origin.field.class_name}.${d.predicate_origin.field.field_name}`
-        : d.predicate_origin?.kind === "const"
-        ? ` ← const ${d.predicate_origin.value}`
-        : d.predicate_origin?.kind === "param"
-        ? ` ← param ${d.predicate_origin.register}`
-        : d.predicate_origin?.kind === "composite"
-        ? ` ← composite (${d.predicate_origin.reason})`
-        : "";
-    const flag = lowConf.has(i) ? " [LOW-CONF]" : "";
-    parts.push(
-      `  ${i + 1}. ${_renderMethodRefForChat(d.method)} @${d.instruction_index} ` +
-        `[${d.kind}] ${verdicts}${origin}${flag}`,
-    );
-  });
-  if (anchor.decisions.length > CHAT_TRACE_MAX_DECISIONS) {
-    parts.push(
-      `  + ${anchor.decisions.length - CHAT_TRACE_MAX_DECISIONS} more decision(s) ` +
-        "(truncated for chat budget)",
-    );
-  }
-
-  // Top-N default-tier plans only. Risk taxonomy is locked to
-  // {low, medium, high}; the operator-configurable threshold lives on
-  // the server (DEC-024 / 10.4) and decides the plans/advanced_plans
-  // split — we just take the first N from the default tier.
-  parts.push("");
-  parts.push(`Top ${CHAT_TRACE_TOP_PLANS} bypass plan(s):`);
-  if (anchor.plans.length === 0) {
-    parts.push("  (none synthesised at the configured risk threshold)");
-  } else {
-    anchor.plans.slice(0, CHAT_TRACE_TOP_PLANS).forEach((p, i) => {
-      const target = p.target_method
-        ? _renderMethodRefForChat(p.target_method)
-        : "(no target)";
-      const params = Object.entries(p.params)
-        .map(([k, v]) => `${k}=${v}`)
-        .join(", ");
-      parts.push(
-        `  ${i + 1}. ${p.template_id} risk=${p.risk} → ${target}` +
-          (params ? `\n     params: ${params}` : "") +
-          (p.rationale ? `\n     rationale: ${p.rationale}` : ""),
-      );
-    });
-  }
-
-  let text = parts.join("\n");
-  if (text.length > CHAT_TRACE_BUDGET) {
-    text =
-      text.slice(0, CHAT_TRACE_BUDGET) +
-      `\n/* … truncated; full anchor is ${text.length} chars */`;
-  }
-  return text;
-}
+// Behavior-anchor → ``trace`` attachment renderer + budget constants live
+// in :file:`util/traceChatAttachment.ts` (extracted in v2.1.8 once
+// ``LabTraceMode`` grew its own embedded ``ChatDock``; the renderer
+// originally lived here because Manual Hooks was the only chat-bearing
+// surface). Both modes import the same shared renderer so the LLM sees
+// the identical 6_000-char-capped attachment shape regardless of which
+// mode triggered the chat.
 
 function buildHookChatAttachments({
   appId,
@@ -981,7 +907,7 @@ function buildHookChatAttachments({
         activeAnchor.entry_method.class_name +
         "." +
         activeAnchor.entry_method.method_name,
-      text: _renderTraceAttachment(activeAnchor),
+      text: renderTraceAttachment(activeAnchor),
     });
   }
 

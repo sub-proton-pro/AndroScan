@@ -49,12 +49,24 @@
  * operator clicks Build to fire POST. ``Force re-trace`` always fires
  * POST with ``force=true``.
  *
- * 10.8 chat plumbing: Trace mode itself still has no chat dock of
- * its own — operators who want to ask the LLM about a trace switch
- * to Manual Hooks mode, which carries the ``ChatDock``. The active
- * ``BehaviorAnchor`` is published to the parent ``LabTab`` via the
- * ``onActiveAnchorChange`` callback so the Manual Hooks chat
- * builder can fold it into the new ``trace`` ``ChatAttachment``.
+ * **v2.1.8 — Trace mode now carries its own ``ChatDock``** (right-side
+ * collapsible pane, mirrors the Manual Hooks chat-panel pattern).
+ * Closes the v2.1.4 / 10.8 collision: 10.8 deliberately removed the
+ * chat dock from Trace mode (operators were supposed to switch to
+ * Manual Hooks for chat), but v2.1.4's "Ask AI" button assumed a
+ * ``ChatDock tab="lab"`` was reachable from Trace mode — so clicking
+ * the button silently set ``pendingChatPrefill`` with no consumer
+ * mounted to receive it. v2.1.8 wraps the trace content in a
+ * horizontal :class:`PanelGroup` (``autoSaveId="lab-trace-h"``) with
+ * the existing trace surface on the left and a collapsible
+ * ``ChatDock`` on the right; both Manual Hooks and Trace modes share
+ * ``WorkbenchContext.chats["lab"]`` (they're never co-mounted, so
+ * there's no rendering conflict, and the unified history reads
+ * naturally as one Lab conversation rather than per-mode scratch
+ * surfaces). The ``onActiveAnchorChange`` callback to the parent
+ * ``LabTab`` is preserved so Manual Hooks's chat-attachment builder
+ * still folds the active anchor into its own ``trace`` attachment
+ * when the operator mode-hops over to Manual Hooks.
  *
  * v2.1.1 also bootstraps the decompile status + class-tree fetch
  * lifecycle that ``ClassMethodTree`` needs (mirrors the same pattern
@@ -140,9 +152,18 @@
  *     ``pendingHookPrefill`` re-fire semantics).
  *   * The chat dock observes ``pendingChatPrefill`` and writes the
  *     message into its ``draft`` state + focuses the textarea +
- *     clears the pending state. The parent ``LabTab`` ALSO observes
+ *     clears the pending state. The parent component ALSO observes
  *     it and calls ``chatRef.current?.expand()`` to ensure the dock
  *     is visible (a prefill into a collapsed dock is invisible).
+ *   * **v2.1.8 collision fix:** the ``chatRef.expand()`` consumer
+ *     was originally only wired in ``LabTab.ManualHooksMode``; when
+ *     the operator was on Trace mode, ``ManualHooksMode`` was
+ *     unmounted and the prefill went unconsumed (no chat dock to
+ *     expand, no observable feedback). v2.1.8 ships a parallel
+ *     ``chatRef.expand()`` effect inside ``LabTraceMode`` itself
+ *     (alongside the ``ChatDock`` it now carries) so Ask AI works
+ *     in-place from Trace mode without the operator having to
+ *     mode-hop to Manual Hooks.
  *   * **v2.1.7 patch — free-form prompt template:** the button is
  *     always enabled (originally v2.1.4 disabled it when the Smali
  *     entry field was empty, which collided with v2.1.1's hide-
@@ -166,7 +187,15 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ImperativePanelHandle,
+  Panel,
+  PanelGroup,
+  PanelResizeHandle,
+} from "react-resizable-panels";
 import { IconChevronDown, IconChevronUp } from "../components/Icons";
+import { AppPicker } from "../components/AppPicker";
+import { ChatDock } from "../components/ChatDock";
 import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { DecisionTimeline } from "../components/trace/DecisionTimeline";
@@ -191,8 +220,10 @@ import {
   type TraceAnchorRow,
   type TraceStatusPayload,
 } from "../api/trace";
+import type { ChatAttachment } from "../types";
 import { useWorkbench } from "../context/WorkbenchContext";
 import { javaRelPathToSmaliMethodPrefix } from "../util/smaliClassToFile";
+import { renderTraceAttachment } from "../util/traceChatAttachment";
 
 type Props = {
   appId: string | null;
@@ -297,9 +328,48 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
   const {
     pendingTraceEntry,
     setPendingTraceEntry,
+    pendingChatPrefill,
     setPendingChatPrefill,
     dossier,
   } = useWorkbench();
+
+  // v2.1.8 — chat dock right-pane handle + collapsed state. Mirrors
+  // the Manual Hooks chat-panel pattern; ``react-resizable-panels``
+  // persists the size + collapsed state via the ``autoSaveId`` on
+  // the parent :class:`PanelGroup` so the operator's last layout
+  // survives reloads + mode-hops.
+  const chatRef = useRef<ImperativePanelHandle>(null);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
+
+  // v2.1.8 — expand the chat panel whenever a lab-tab prefill
+  // arrives via ``pendingChatPrefill`` (typically from this mode's
+  // own "Ask AI" button, but also fires for any other surface
+  // writing ``tab: "lab"`` — none today; future-proof). The prefill
+  // ITSELF is consumed inside :class:`ChatDock` (writes the message
+  // into ``draft`` and clears the pending state); this effect owns
+  // the panel-expand half because the imperative
+  // ``chatRef.expand()`` lives in this layer. Both consumers run in
+  // the same commit cycle and close over the original pre-clear
+  // value, so order doesn't matter — see WorkbenchContext.tsx's
+  // ``pendingChatPrefill`` doc-block for the two-consumer rationale.
+  //
+  // Parallel effect lives in ``LabTab.ManualHooksMode`` for the
+  // mode-hopped case (operator clicks Ask AI in Trace, then switches
+  // to Manual Hooks before the prefill is consumed — Manual Hooks's
+  // mount-time effect catches the still-non-null prefill and expands
+  // its own chat panel). The two effects are mutually exclusive
+  // (only one mode is mounted at a time) so they never race.
+  useEffect(() => {
+    if (!pendingChatPrefill) return;
+    if (pendingChatPrefill.tab !== "lab") return;
+    chatRef.current?.expand();
+    // ``setPendingChatPrefill`` is intentionally NOT called here —
+    // ChatDock is the canonical clearer (it owns the textarea +
+    // the consumed state); this effect's job is purely to make
+    // the dock visible. The dep on ``pendingChatPrefill?.ts``
+    // re-fires the expand on every fresh prefill (re-click of
+    // "Ask AI"), which is idempotent on an already-expanded panel.
+  }, [pendingChatPrefill?.ts]);
 
   // ----- form state ------------------------------------------------------
   const [entryDraft, setEntryDraft] = useState("");
@@ -502,6 +572,72 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
     if (state.kind !== "loaded") return new Set<number>();
     return new Set(state.anchor.low_confidence_decision_indices);
   }, [state]);
+
+  // v2.1.8 — chat attachments + "show context" summary for the
+  // embedded :class:`ChatDock`. Smaller surface than Manual Hooks's
+  // builder (no selected method / decompiled source / Frida session
+  // — those are Manual Hooks concerns) — Trace mode contributes the
+  // active app + the active behaviour anchor (when one is loaded).
+  // Re-uses the shared :func:`renderTraceAttachment` so the ``trace``
+  // attachment shape is byte-identical to what Manual Hooks would
+  // surface for the same anchor (LLM sees the same thing regardless
+  // of which mode triggered the chat).
+  const activeAnchorForChat: BehaviorAnchor | null =
+    state.kind === "loaded" ? state.anchor : null;
+
+  const traceChatAttachments = useMemo<ChatAttachment[]>(() => {
+    const out: ChatAttachment[] = [];
+    if (appId) {
+      out.push({ kind: "default", name: "selection", text: `app_id: ${appId}` });
+    }
+    if (activeAnchorForChat) {
+      out.push({
+        kind: "trace",
+        name:
+          activeAnchorForChat.entry_method.class_name +
+          "." +
+          activeAnchorForChat.entry_method.method_name,
+        text: renderTraceAttachment(activeAnchorForChat),
+      });
+    }
+    return out;
+  }, [appId, activeAnchorForChat]);
+
+  const traceChatContextSummary = useMemo<string>(() => {
+    const lines: string[] = [];
+    if (appId) {
+      lines.push(`Active app: ${appId}`);
+    } else {
+      lines.push("Active app: — (pick a project from the dropdown above).");
+    }
+    lines.push("");
+    if (activeAnchorForChat) {
+      const entry = activeAnchorForChat.entry_method;
+      lines.push(
+        `Active behaviour trace: ${entry.class_name}.${entry.method_name} ` +
+          `· hops=${activeAnchorForChat.hops} · ${activeAnchorForChat.decisions.length} ` +
+          `decision(s) · ${activeAnchorForChat.plans.length} plan(s) ` +
+          `(+${activeAnchorForChat.advanced_plans.length} advanced)`,
+      );
+      lines.push(
+        "Trace attachment: included (entry header + decision timeline + " +
+          "top bypass plans, capped at 6,000 chars).",
+      );
+    } else {
+      lines.push(
+        "Active behaviour trace: — (use Browse classes / Advanced / " +
+          "Cached anchors above to load one; the LLM will then see the " +
+          "decision timeline and top plans).",
+      );
+    }
+    lines.push("");
+    lines.push(
+      "Tip: click ✨ Ask AI on the controls row to seed a starter prompt " +
+        "asking about candidate trace entry methods — useful when you " +
+        "don't yet know which class to trace.",
+    );
+    return lines.join("\n");
+  }, [appId, activeAnchorForChat]);
 
   // Method picker — fires when the entry is a class-prefix-only string
   // (``Lcom/.../Foo;->[partial]``). Lets the operator discover available
@@ -776,20 +912,30 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
   };
 
   return (
-    <div className="lab-trace-mode pane-scroll">
-      <header className="pane-head">
-        <h2>Behavior Trace</h2>
-        <span className="muted small">
-          UI element ➜ decision points ➜ bypass plans
-        </span>
-      </header>
+    <PanelGroup direction="horizontal" autoSaveId="lab-trace-h" className="lab-trace-shell">
+      <Panel defaultSize={70} minSize={40} className="panel">
+        <div className="lab-trace-mode pane-scroll">
+          <header className="pane-head">
+            <h2>Behavior Trace</h2>
+            <span className="muted small">
+              UI element ➜ decision points ➜ bypass plans
+            </span>
+            {/* v2.1.8 — local AppPicker mirrors the global one in the
+                top-right header. Both read/write the same
+                ``appId`` via ``WorkbenchContext``, so picking from
+                either surface updates the other in lockstep with no
+                explicit plumbing. */}
+            <span className="pane-head-actions">
+              <AppPicker />
+            </span>
+          </header>
 
-      {!appId && (
-        <p className="muted small">
-          No app selected — pick a project in the Reports tab to start
-          tracing behaviour.
-        </p>
-      )}
+          {!appId && (
+            <p className="muted small">
+              No app selected — pick a project from the dropdown above to start
+              tracing behaviour.
+            </p>
+          )}
 
       {appId && (
         <>
@@ -1008,7 +1154,48 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
           />
         </>
       )}
-    </div>
+        </div>
+      </Panel>
+      <PanelResizeHandle className="resize-h" />
+      {/* v2.1.8 — collapsible chat dock right pane. Mirrors the
+          ``ChatDock`` panel pattern from ``LabTab.ManualHooksMode``;
+          ``react-resizable-panels`` persists size + collapsed state
+          via the parent ``autoSaveId="lab-trace-h"``. When collapsed,
+          renders the same right-rail "Chat" sentinel button operators
+          recognise from the Manual Hooks layout. */}
+      <Panel
+        ref={chatRef}
+        defaultSize={30}
+        minSize={12}
+        collapsible
+        collapsedSize={3}
+        onCollapse={() => setChatCollapsed(true)}
+        onExpand={() => setChatCollapsed(false)}
+        className="panel chat-panel"
+      >
+        {chatCollapsed ? (
+          <button
+            type="button"
+            className="sidebar-rail rail-right"
+            onClick={() => chatRef.current?.expand()}
+            title="Expand chat dock"
+            aria-label="Expand chat dock"
+          >
+            <span className="sidebar-rail-chevron" aria-hidden="true">
+              <IconChevronUp />
+            </span>
+            <span className="sidebar-rail-label">Chat</span>
+          </button>
+        ) : (
+          <ChatDock
+            tab="lab"
+            attachments={traceChatAttachments}
+            contextSummary={traceChatContextSummary}
+            onCollapse={() => chatRef.current?.collapse()}
+          />
+        )}
+      </Panel>
+    </PanelGroup>
   );
 }
 

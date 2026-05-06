@@ -4716,6 +4716,56 @@ code { color: var(--accent); }
   flex-direction: column;
 }
 
+/* v2.1.8 — Manual Hooks mode wrapper. Lifts the existing 3-column
+   PanelGroup under a thin header strip so we can drop a per-mode
+   AppPicker into the top-right of the mode pane. The flex column
+   layout lets the PanelGroup own the remaining vertical space. */
+.lab-manual-hooks-mode {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* v2.1.8 — per-Lab-mode header strip carrying the local AppPicker.
+   Trace mode reuses ``.pane-head`` (it already had a header); Manual
+   Hooks + Graph modes use this dedicated strip because they didn't
+   previously render a header. Visual contract: thin row, mode title
+   on the left, AppPicker pinned to the right (mirrors the global
+   header's [AppPicker | HealthDot] pattern). */
+.lab-mode-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+  flex: 0 0 auto;
+}
+
+.lab-mode-head-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.lab-mode-head .app-picker {
+  margin-left: auto;
+}
+
+/* v2.1.8 — Trace mode root flex shell. Hosts the horizontal
+   PanelGroup (existing trace surface on the left, embedded ChatDock
+   on the right). Mirrors the ``.lab-graph-mode`` flex contract so
+   the PanelGroup stretches to fill the mode pane. */
+.lab-trace-shell {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
 /* Trace mode placeholder (LabTraceMode.tsx). The full BehaviorAnchorCard /
    DecisionTimeline / BypassPlanCard land in 10.7; for 10.6 we just lay out
    the status block + the "10.7 will fill this" notice. */
