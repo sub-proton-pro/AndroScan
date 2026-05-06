@@ -598,3 +598,306 @@ class TestBuildLlamacppMessages:
         assert parts[0] == {"type": "text", "text": "describe"}
         assert parts[1]["type"] == "image_url"
         assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+# ---------------------------------------------------------------------------
+# LCP.6 — local-provider grammar / JSON-schema enforcement
+#
+# These tests cover the wiring added in :mod:`androscan.llm.client` for
+# the LCP.6 grammar follow-up. The grammar itself is exercised by
+# ``tests/test_grammar.py`` — here we verify the CLIENT correctly:
+#
+#   * Sends ``format: <json-schema>`` to Ollama and ``grammar: <gbnf>``
+#     to llama.cpp when ``Config.local_grammar_enabled`` is True (the
+#     default).
+#   * Falls back to the v1-LCP wire shape per-base-url on the first
+#     HTTP 400 that mentions schema / grammar (older runtime path).
+#   * Honours the kill-switch — flipping ``local_grammar_enabled``
+#     False reverts to the v1-LCP wire shape immediately.
+#   * Cloud path is unaffected (the OpenAI-compat ``response_format``
+#     contract enforces validity at the SDK layer).
+# ---------------------------------------------------------------------------
+
+
+from androscan.llm.client import (  # noqa: E402 — import next to its tests
+    _LLAMACPP_GRAMMAR_DISABLED_URLS,
+    _OLLAMA_SCHEMA_DISABLED_URLS,
+    _complete_ollama,
+)
+
+
+@pytest.fixture(autouse=False)
+def _reset_grammar_caches():
+    """Clear the per-base-url disabled-set caches before each test that
+    asks for the fixture so tests don't leak state into each other.
+    The caches are intentionally process-lifetime so production
+    operators don't pay the rejection round-trip on every call, but
+    that means tests must clear them explicitly."""
+    _OLLAMA_SCHEMA_DISABLED_URLS.clear()
+    _LLAMACPP_GRAMMAR_DISABLED_URLS.clear()
+    yield
+    _OLLAMA_SCHEMA_DISABLED_URLS.clear()
+    _LLAMACPP_GRAMMAR_DISABLED_URLS.clear()
+
+
+def _make_ollama_mock_config(local_grammar_enabled: bool = True, **overrides):
+    """Build a MagicMock Config for the Ollama branch of the LCP.6
+    grammar wiring tests. Matches the shape ``_complete_ollama``
+    actually reads — model / temperature / num_predict / num_ctx /
+    base_url + the LCP.6 ``local_grammar_enabled`` knob."""
+    base = dict(
+        ollama_base_url="http://localhost:11434",
+        ollama_model="qwen3.5:35b",
+        ollama_temperature=0.2,
+        ollama_num_predict=8192,
+        ollama_num_ctx=16384,
+        local_grammar_enabled=local_grammar_enabled,
+    )
+    base.update(overrides)
+    cfg = MagicMock(**base)
+    return cfg
+
+
+def _make_ollama_mock_resp(content: str = '{"hypotheses": []}'):
+    """Successful Ollama /api/chat response (non-stream)."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "message": {"role": "assistant", "content": content, "thinking": ""},
+        "done_reason": "stop",
+        "total_duration": 1,
+        "eval_count": 1,
+        "prompt_eval_count": 1,
+    }
+    resp.text = content
+    resp.status_code = 200
+    return resp
+
+
+def _make_400_resp(error_text: str):
+    """An Ollama / llama.cpp HTTP 400 response carrying the given
+    error text in the JSON body. Used to drive the schema- and
+    grammar-fallback codepaths."""
+    resp = MagicMock()
+    resp.status_code = 400
+    err = requests.HTTPError(f"400 Bad Request: {error_text}")
+    err.response = resp
+    resp.raise_for_status.side_effect = err
+    resp.json.return_value = {"error": error_text}
+    resp.text = f'{{"error":{error_text!r}}}'
+    return resp
+
+
+class TestOllamaSchemaFormatMode:
+    """Ollama path — JSON-schema in the ``format`` field when
+    ``local_grammar_enabled`` is True; ``"json"`` string when off
+    or after a 400 fallback."""
+
+    def test_default_config_sends_json_schema_in_format(
+        self, _reset_grammar_caches
+    ) -> None:
+        """Happy path: a fresh Config with the v1-default
+        ``local_grammar_enabled=True`` triggers ``format: <dict>``."""
+        cfg = _make_ollama_mock_config()
+        resp = _make_ollama_mock_resp()
+        with patch("androscan.llm.client.requests.post", return_value=resp) as post_mock:
+            _complete_ollama("test", cfg, stream=False, response_format="json")
+        body = post_mock.call_args.kwargs["json"]
+        # The format value is the schema dict, NOT the string "json".
+        assert isinstance(body["format"], dict)
+        assert body["format"]["type"] == "object"
+        # Sanity: the schema contains the discriminated-union skill enum.
+        sr = body["format"]["properties"]["skill_requests"]["items"]["properties"]
+        assert "enum" in sr["skill"]
+
+    def test_kill_switch_off_sends_string_format(
+        self, _reset_grammar_caches
+    ) -> None:
+        """``local_grammar_enabled=False`` reverts to the v1-LCP wire
+        shape (``format: "json"``)."""
+        cfg = _make_ollama_mock_config(local_grammar_enabled=False)
+        resp = _make_ollama_mock_resp()
+        with patch("androscan.llm.client.requests.post", return_value=resp) as post_mock:
+            _complete_ollama("test", cfg, stream=False, response_format="json")
+        body = post_mock.call_args.kwargs["json"]
+        assert body["format"] == "json"
+
+    def test_400_format_error_falls_back_to_string_format_and_caches(
+        self, _reset_grammar_caches
+    ) -> None:
+        """Older Ollama (< 0.5.0) rejects the dict ``format`` value;
+        the client must catch the 400, cache the base_url in
+        :data:`_OLLAMA_SCHEMA_DISABLED_URLS`, and retry with
+        ``format: "json"``. Both attempts hit the SAME base_url, so
+        the second call sees the cache and doesn't re-attempt the
+        schema mode."""
+        cfg = _make_ollama_mock_config()
+        bad = _make_400_resp("format must be 'json' or empty")
+        good = _make_ollama_mock_resp()
+        with patch(
+            "androscan.llm.client.requests.post",
+            side_effect=[bad, good],
+        ) as post_mock:
+            result = _complete_ollama("test", cfg, stream=False, response_format="json")
+        # Two POSTs total — one rejected, one fallback success.
+        assert post_mock.call_count == 2
+        # First call sent the dict; second sent the string.
+        first_body = post_mock.call_args_list[0].kwargs["json"]
+        second_body = post_mock.call_args_list[1].kwargs["json"]
+        assert isinstance(first_body["format"], dict)
+        assert second_body["format"] == "json"
+        assert result.content == '{"hypotheses": []}'
+        # The base_url is now in the disabled set.
+        assert "http://localhost:11434" in _OLLAMA_SCHEMA_DISABLED_URLS
+
+    def test_400_with_unrelated_error_does_not_trigger_fallback(
+        self, _reset_grammar_caches
+    ) -> None:
+        """A 400 that doesn't look format-related (e.g. malformed
+        messages) flows through the existing error path and the
+        client raises — no silent retry, no schema-disabled caching."""
+        cfg = _make_ollama_mock_config()
+        bad = _make_400_resp("missing required field: messages")
+        with patch(
+            "androscan.llm.client.requests.post", return_value=bad,
+        ) as post_mock:
+            with pytest.raises(RuntimeError):
+                _complete_ollama("test", cfg, stream=False, response_format="json")
+        # Single attempt — no fallback retry.
+        assert post_mock.call_count == 1
+        # Cache is still empty.
+        assert "http://localhost:11434" not in _OLLAMA_SCHEMA_DISABLED_URLS
+
+    def test_subsequent_call_after_fallback_skips_schema_mode(
+        self, _reset_grammar_caches
+    ) -> None:
+        """Process-lifetime cache: once a base_url is in the
+        disabled set, subsequent calls go straight to ``format:
+        "json"`` without paying the rejection round-trip."""
+        cfg = _make_ollama_mock_config()
+        # Pre-seed the cache (simulating a prior call that triggered
+        # the fallback).
+        _OLLAMA_SCHEMA_DISABLED_URLS.add("http://localhost:11434")
+        good = _make_ollama_mock_resp()
+        with patch("androscan.llm.client.requests.post", return_value=good) as post_mock:
+            _complete_ollama("test", cfg, stream=False, response_format="json")
+        # Single POST — no rejection / no retry.
+        assert post_mock.call_count == 1
+        body = post_mock.call_args.kwargs["json"]
+        assert body["format"] == "json"
+
+    def test_response_format_none_omits_format_key_entirely(
+        self, _reset_grammar_caches
+    ) -> None:
+        """Workbench chat path passes ``response_format=None`` for
+        prose replies — no ``format`` key at all on the wire,
+        regardless of the grammar kill-switch."""
+        cfg = _make_ollama_mock_config()
+        resp = _make_ollama_mock_resp(content="prose response text")
+        with patch("androscan.llm.client.requests.post", return_value=resp) as post_mock:
+            _complete_ollama("test", cfg, stream=False, response_format=None)
+        body = post_mock.call_args.kwargs["json"]
+        assert "format" not in body
+
+
+class TestLlamacppGrammarMode:
+    """llama.cpp path — ``grammar: <gbnf>`` field added when
+    ``local_grammar_enabled`` is True; absent when off or after a
+    400 fallback."""
+
+    def test_default_config_attaches_gbnf_grammar_field(
+        self, _reset_grammar_caches
+    ) -> None:
+        cfg = _make_llamacpp_mock_config(local_grammar_enabled=True)
+        with patch(
+            "androscan.llm.client.requests.post",
+            return_value=_make_llamacpp_mock_resp(),
+        ) as post_mock:
+            _complete_llamacpp("test", cfg, stream=False, response_format="json")
+        body = post_mock.call_args.kwargs["json"]
+        assert "grammar" in body
+        assert "root ::=" in body["grammar"]
+        # response_format is also present (belt-and-suspenders).
+        assert body["response_format"] == {"type": "json_object"}
+
+    def test_kill_switch_off_omits_grammar_field(
+        self, _reset_grammar_caches
+    ) -> None:
+        cfg = _make_llamacpp_mock_config(local_grammar_enabled=False)
+        with patch(
+            "androscan.llm.client.requests.post",
+            return_value=_make_llamacpp_mock_resp(),
+        ) as post_mock:
+            _complete_llamacpp("test", cfg, stream=False, response_format="json")
+        body = post_mock.call_args.kwargs["json"]
+        assert "grammar" not in body
+
+    def test_400_grammar_error_falls_back_and_caches(
+        self, _reset_grammar_caches
+    ) -> None:
+        """Older ``llama-server`` builds (no grammar-field support)
+        return a 400 mentioning grammar / unknown field. The client
+        catches it, drops the grammar field, retries once, and
+        caches the base_url in the disabled set.
+
+        The retry path mutates the SAME ``payload`` dict in-place
+        (``payload.pop("grammar", None)``), so a naive
+        ``post_mock.call_args_list[i].kwargs["json"]`` snapshot
+        sees the post-mutation state on both calls. We work around
+        that by side-effect-capturing a deep copy of the body at
+        each call site."""
+        import copy
+
+        cfg = _make_llamacpp_mock_config(local_grammar_enabled=True)
+        bad = _make_400_resp("unknown field: grammar")
+        good = _make_llamacpp_mock_resp()
+        bodies: list[dict] = []
+        responses = iter([bad, good])
+
+        def _capturing_post(url, **kwargs):
+            bodies.append(copy.deepcopy(kwargs.get("json") or {}))
+            return next(responses)
+
+        with patch(
+            "androscan.llm.client.requests.post",
+            side_effect=_capturing_post,
+        ):
+            result = _complete_llamacpp("test", cfg, stream=False, response_format="json")
+        assert len(bodies) == 2
+        assert "grammar" in bodies[0]
+        assert "grammar" not in bodies[1]
+        assert result.content == '{"hypotheses": []}'
+        # Cache populated for the resolved llama.cpp base_url.
+        cached = {url for url in _LLAMACPP_GRAMMAR_DISABLED_URLS}
+        assert any("8033" in u for u in cached) or "http://127.0.0.1:8033/v1" in cached
+
+    def test_400_unrelated_does_not_trigger_grammar_fallback(
+        self, _reset_grammar_caches
+    ) -> None:
+        """A 400 with an unrelated error (e.g. context size exceeded)
+        flows through the existing error path; no silent retry."""
+        cfg = _make_llamacpp_mock_config(local_grammar_enabled=True)
+        bad = _make_400_resp("context size exceeded")
+        with patch(
+            "androscan.llm.client.requests.post", return_value=bad,
+        ) as post_mock:
+            with pytest.raises(RuntimeError):
+                _complete_llamacpp("test", cfg, stream=False, response_format="json")
+        assert post_mock.call_count == 1
+        # Cache still empty.
+        assert not _LLAMACPP_GRAMMAR_DISABLED_URLS
+
+    def test_response_format_none_skips_grammar(
+        self, _reset_grammar_caches
+    ) -> None:
+        """Prose mode (``response_format=None``) is the workbench
+        chat path — no grammar / no JSON enforcement at all."""
+        cfg = _make_llamacpp_mock_config(local_grammar_enabled=True)
+        with patch(
+            "androscan.llm.client.requests.post",
+            return_value=_make_llamacpp_mock_resp(content="prose text here"),
+        ) as post_mock:
+            _complete_llamacpp("test", cfg, stream=False, response_format=None)
+        body = post_mock.call_args.kwargs["json"]
+        assert "grammar" not in body
+        assert "response_format" not in body

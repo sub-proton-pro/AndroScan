@@ -117,6 +117,13 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     "llamacpp_base_url":           ("llamacpp", "base_url",          "ANDROSCAN_LLAMACPP_BASE_URL"),
     "llamacpp_model":              ("llamacpp", "model",             "ANDROSCAN_LLAMACPP_MODEL"),
     "llamacpp_max_tokens":         ("llamacpp", "max_tokens",        "ANDROSCAN_LLAMACPP_MAX_TOKENS"),
+    # LCP.6 / DEC-027 — single kill-switch for the local-provider
+    # grammar / JSON-schema enforcement (Ollama ``format: <schema>`` +
+    # llama.cpp ``grammar:`` field). Default True (the v1 LCP shipped
+    # the GBNF follow-up); operators flip false if their runtime + quant
+    # pairing produces sampling failures (the opportunistic per-base-url
+    # 400-fallback in the LLM client is the auto-recovery path).
+    "local_grammar_enabled":       ("llm",      "local_grammar_enabled", "ANDROSCAN_LOCAL_GRAMMAR_ENABLED"),
     "run_folder_root":             ("paths",    "run_folder_root",   "ANDROSCAN_RUN_FOLDER"),
     "apktool_cmd":                 ("paths",    "apktool_cmd",        None),
     "jadx_cmd":                    ("paths",    "jadx_cmd",           None),
@@ -164,6 +171,10 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
     "llamacpp_base_url",
     "llamacpp_model",
     "llamacpp_max_tokens",
+    # LCP.6 / DEC-027 — read at request time by the LLM client; flipping
+    # this in Settings UI takes effect on the next pipeline / chat call,
+    # no in-flight retry to bounce.
+    "local_grammar_enabled",
     "apktool_cmd",
     "jadx_cmd",
     "max_turns",
@@ -220,6 +231,15 @@ class Config:
     llamacpp_base_url: str   # e.g. "http://127.0.0.1:8033/v1"
     llamacpp_model: str      # operator's GGUF label (free-text; llama-server ignores)
     llamacpp_max_tokens: int # OpenAI-compat /v1/chat/completions max_tokens cap
+    # LCP.6 / DEC-027 — when True, the LLM client sends
+    # ``format: <json-schema>`` to Ollama (>= 0.5.0) and ``grammar: <gbnf>``
+    # to llama.cpp on every JSON-mode call. Closes ISSUE-016 (JSON-validity
+    # drift on aggressive quants). Cloud providers ignore this knob (their
+    # OpenAI-compat ``response_format`` already enforces validity at the
+    # SDK layer). Operators flip ``false`` only if the pairing of their
+    # specific runtime + quant + GGUF triggers sampling failures the
+    # opportunistic 400-fallback can't auto-recover from.
+    local_grammar_enabled: bool
     run_folder_root: str
     max_turns: int
     max_hypotheses_per_report: int
@@ -262,6 +282,12 @@ class Config:
             llamacpp_base_url=LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"],
             llamacpp_model="",
             llamacpp_max_tokens=8192,
+            # LCP.6 / DEC-027 — ships ON by default (Q2 (a) committed
+            # follow-up). Operators flip false on the rare runtime
+            # incompatibility; the per-base-url opportunistic fallback
+            # in the LLM client handles transient failures without
+            # operator action.
+            local_grammar_enabled=True,
             run_folder_root="apps",
             max_turns=constants.MAX_TURNS_DEFAULT,
             max_hypotheses_per_report=constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT,
@@ -425,6 +451,22 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["llamacpp_max_tokens"] = _safe_int(
         llamacpp.get("max_tokens"), 8192, "llamacpp.max_tokens",
     )
+    # LCP.6 / DEC-027 — local grammar / JSON-schema enforcement kill-switch.
+    # Lives under ``llm`` (cross-provider knob) rather than under one of
+    # the per-provider sections. Default True; YAML missing the key falls
+    # through to the True default. Accepts the standard YAML truthy values
+    # (true / false / yes / no / 1 / 0).
+    raw_grammar = llm.get("local_grammar_enabled")
+    if raw_grammar is None:
+        out["local_grammar_enabled"] = True
+    elif isinstance(raw_grammar, bool):
+        out["local_grammar_enabled"] = raw_grammar
+    elif isinstance(raw_grammar, str):
+        out["local_grammar_enabled"] = raw_grammar.strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+    else:
+        out["local_grammar_enabled"] = bool(raw_grammar)
     out["run_folder_root"] = paths.get("run_folder_root") or "apps"
     out["max_turns"] = _safe_int(workflow.get("max_turns"), constants.MAX_TURNS_DEFAULT, "workflow.max_turns")
     out["max_hypotheses_per_report"] = _safe_int(workflow.get("max_hypotheses_per_report"), constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT, "workflow.max_hypotheses_per_report")
@@ -528,6 +570,21 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 "valid integer; using YAML/default.",
                 file=sys.stderr,
             )
+    # LCP.6 / DEC-027 — boolean env override. Accepts the full set of
+    # YAML-style truthy/falsy values so operators can paste either form
+    # without surprises.
+    if os.environ.get("ANDROSCAN_LOCAL_GRAMMAR_ENABLED"):
+        raw = os.environ["ANDROSCAN_LOCAL_GRAMMAR_ENABLED"].strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            merged["local_grammar_enabled"] = True
+        elif raw in ("0", "false", "no", "off"):
+            merged["local_grammar_enabled"] = False
+        else:
+            print(
+                f"Warning: ANDROSCAN_LOCAL_GRAMMAR_ENABLED={raw!r} is not "
+                "a valid boolean; using YAML/default.",
+                file=sys.stderr,
+            )
     if os.environ.get("ANDROSCAN_WEB_HOST"):
         merged["web_host"] = os.environ["ANDROSCAN_WEB_HOST"].strip() or merged.get("web_host", "127.0.0.1")
     if os.environ.get("ANDROSCAN_WEB_PORT"):
@@ -622,6 +679,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         ).strip().rstrip("/"),
         llamacpp_model=str(merged.get("llamacpp_model") or "").strip(),
         llamacpp_max_tokens=max(1, int(merged.get("llamacpp_max_tokens", 8192))),
+        local_grammar_enabled=bool(merged.get("local_grammar_enabled", True)),
         run_folder_root=merged["run_folder_root"],
         max_turns=max(1, merged["max_turns"]),
         max_hypotheses_per_report=max(0, merged["max_hypotheses_per_report"]),
@@ -752,6 +810,20 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
         ).strip().rstrip("/"),
         llamacpp_model=str(flat.get("llamacpp_model") or "").strip(),
         llamacpp_max_tokens=max(1, int(flat.get("llamacpp_max_tokens") or 8192)),
+        # LCP.6 — coerce truthy/falsy strings so a Settings UI checkbox
+        # save (which arrives as a Python bool) and a YAML round-trip
+        # (which may arrive as the string "true" / "false") produce the
+        # same Config.
+        local_grammar_enabled=(
+            flat.get("local_grammar_enabled")
+            if isinstance(flat.get("local_grammar_enabled"), bool)
+            else (
+                str(flat.get("local_grammar_enabled") or "").strip().lower()
+                in ("1", "true", "yes", "on")
+                if flat.get("local_grammar_enabled") is not None
+                else True
+            )
+        ),
         run_folder_root=str(flat["run_folder_root"] or "apps"),
         max_turns=max(1, int(flat["max_turns"])),
         max_hypotheses_per_report=max(0, int(flat["max_hypotheses_per_report"])),
@@ -794,7 +866,7 @@ def coerce_yaml_value(field: str, raw: Any) -> Any:
         "trace_max_slice_depth",
     }
     float_fields = {"ollama_temperature", "cloud_temperature"}
-    bool_fields = {"per_component_analysis"}
+    bool_fields = {"per_component_analysis", "local_grammar_enabled"}
     str_fields = {
         "ollama_base_url", "ollama_model",
         "llm_provider", "cloud_model", "cloud_api_key",

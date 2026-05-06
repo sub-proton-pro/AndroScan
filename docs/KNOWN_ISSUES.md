@@ -443,29 +443,7 @@ Use the following format for new entries:
 
 ---
 
-### ISSUE-016: JSON-validity drift on aggressive quants under v1 LCP local providers (Q4_K_M / IQ4_XS)
-- status: Open (LCP.6 planned — GBNF grammar enforcement; benefits both local providers)
-- impact: Low–Medium (depends on operator's quant choice; fail-soft per existing parser convention)
-- area: llm / local-provider transport / JSON-mode parity / `skill_requests` + `hypotheses` schema enforcement
-- introduced / observed: 2026-05-06 (LCP.5 — surfaced as a documented gap at v1 LCP ship; the underlying JSON-mode-only strictness is the same as the pre-LCP Ollama-only baseline, but LCP makes the gap operator-relevant by widening the practical quant-choice space — operators previously had limited control over Ollama's per-model quant; with `llama-server` they can opt into IQ4_XS / Q4_K_M for memory-budget reasons and feel the JSON-validity drift sooner)
-- summary:
-  AndroScan v1 LCP ships `response_format: {"type": "json_object"}` JSON-mode parity for both local providers (Ollama's `format: "json"` and llama.cpp's `/v1/chat/completions` `response_format` field). Strictness is **"output is a syntactically valid JSON object"** — NOT "output matches the `skill_requests` / `hypotheses` schema." A quantization-induced token slip on aggressive quants (e.g. Q4_K_M, IQ4_XS, sub-Q4 anything) can produce JSON that's *syntactically* valid but *schematically* wrong: a missing required field on a `SkillRequest`, a `null` where a tuple was expected on a `SkillWidget` (post-v2.1.5 `widgets[]` schema), an off-vocabulary skill name in `skill_requests[*].skill`, or a hypothesis with an `evidence_refs` value that's a string instead of a list. The existing parser in `androscan/llm/parser.py` rejects these post-hoc and the workflow loop fails-soft per established convention (`androscan/llm/parser.py` returns a structured error → `androscan/internal/workflow.py` retries up to `MAX_TURNS_DEFAULT` with the parser error fed back into the prompt). On Q5_K_M / UD-Q5_K_XL / Q6_K and above, schema-drift drops to negligible levels in observed dogfood-app traces; on Q4_K_M and below, drift becomes operator-visible (parser errors in `run.log`, retries adding turns, occasional turn-budget exhaustion on long agentic chains).
-- why it matters:
-  Operators on tight memory budgets (M-series with ≤ 36 GB unified memory, the LCP track's primary motivating hardware reality per DEC-027 context) are exactly the population most likely to pick aggressive quants — UD-Q5_K_XL is the planning-recommended sweet spot for AndroScan's structured-JSON workload on a 36 GB M3 Pro, but operators with 24 GB or 16 GB M3 / M4 hardware will land on Q4_K_M or IQ4_XS to fit. The fail-soft posture is correct in the sense that AndroScan doesn't crash, but the symptom (parser error + retry + occasionally exhausted turn budget) is operator-visible and harder to diagnose than a hard fail (the operator sees "the LLM is acting weird today" rather than "Q4_K_M is below the schema-drift threshold for this workload"). The post-LCP-v1 transport swap doesn't widen the gap by itself — the same drift happens on the same model+quant under Ollama — but the LCP track makes the quant choice operator-controllable in a way it wasn't before, so the gap surfaces sooner in practice.
-- current workaround:
-  Two options:
-  (1) **Operator-side: pick a less-aggressive quant.** Q5_K_M / UD-Q5_K_XL / Q6_K all show negligible schema-drift on observed dogfood-app traces. The memory cost vs. schema-validity trade-off is operator-controllable via the `llama-server -m <gguf>` flag (or Ollama's per-model `ollama pull qwen3:14b-q5km` selector). The recommended baseline in DEC-027 is UD-Q5_K_XL (~20 GB on Qwen3-27B-class models) — sweet spot for 36 GB M3 hardware.
-  (2) **AndroScan-side fail-soft (already in place):** the workflow loop retries on parser errors, the chat agentic loop has a `MAX_SKILLS_PER_TURN = 3` + per-skill output budget cap (DEC-022), and the `MAX_TURNS_DEFAULT = 5` ceiling caps the worst-case retry blast radius. Operators see the symptom in `run.log` but the system continues to make progress.
-- recommended fix:
-  **LCP.6 — GBNF grammar enforcement.** Per DEC-027 Q2 (a) lock-in, this is a **committed** follow-up (NOT operator-demand-gated). Emit GBNF grammar from the existing JSON schema for `skill_requests` (discriminated union over registered skill names, each with their own `params` shape) + `hypotheses` (with optional `widgets[]` post-v2.1.5). Emitter lives in a new `androscan/llm/grammar.py` module (~+200 LOC including emitter + per-skill schema introspection + tests). Forwarded as a per-request `grammar` field to llama.cpp's `/v1/chat/completions` (llama.cpp-specific extension to the OpenAI-compat shim) and as a `format: <json-schema>` payload to Ollama (newer builds supporting JSON-schema mode; fall back to `format: "json"` on older builds — version detection in `health_probes.probe_ollama`). With GBNF, the schema is enforced at the model's logits-sampling level rather than rejected post-hoc by the parser — Q4_K_M / IQ4_XS regain operator-usability for AndroScan's structured-JSON workload because the model literally cannot emit off-schema tokens. **Single LCP.6 vs. LCP.6a + LCP.6b split decision** lives in the LCP.6 planning checkpoint sub-bullet of `docs/STATE.md` based on the JSON-schema → GBNF emitter scope at that point. Closes this issue when LCP.6 ships.
-- related tasks:
-  - `docs/TASKS.md` § **LCP — llama.cpp local provider — sub-step backlog** row LCP.6 (committed follow-up; benefits both local providers).
-- related docs:
-  - `docs/DECISIONS.md` **DEC-027** Q2 (a) lock-in (LCP.6 promoted from operator-demand-gated → committed) + LCP.5 closing note.
-  - `androscan/llm/parser.py` (post-hoc schema validation; fail-soft path that surfaces drift today).
-  - `androscan/internal/workflow.py` (`MAX_TURNS_DEFAULT = 5` retry ceiling that absorbs drift-induced retries).
-  - `androscan/llm/client.py` (`_complete_llamacpp` + `_complete_ollama` JSON-mode dispatch — GBNF lands here in LCP.6).
-  - `androscan/web/health_probes.py` (`probe_ollama` version detection — gates JSON-schema mode in LCP.6 for older Ollama builds).
+_(See § 8 Resolved issues — `ISSUE-016` was closed by **LCP.6 (2026-05-06)**: GBNF grammar enforcement for llama.cpp + JSON-schema mode for Ollama 0.5.0+ now constrain the response envelope at the model's logits-sampling level. The fail-soft retry path in `androscan/internal/workflow.py` is still in place but is no longer the primary defense; operators on Q4_K_M / IQ4_XS quants regain reliable structured-JSON output.)_
 
 ---
 
@@ -498,6 +476,28 @@ Format:
 - resolved date:
 - resolution summary:
 - related tasks/docs:
+
+### ISSUE-016: JSON-validity drift on aggressive quants under v1 LCP local providers (Q4_K_M / IQ4_XS)
+- status: Resolved
+- resolved date: 2026-05-06 (LCP.6 — GBNF grammar enforcement + Ollama JSON-schema mode landed; closes the JSON-validity-drift gap from the LCP.5 ship)
+- resolution summary:
+  Single LCP.6 commit (no 6a/6b split needed — the planning checkpoint surveyed `SkillMeta.params_schema` and confirmed the per-skill `params` shape is **operator-prose, not typed JSON Schema**, so the LCP.0 estimate of "+200 LOC including per-skill schema introspection" was over-scoped; the actual emitter is ~95 LOC of pure-Python in `androscan/llm/grammar.py`). The grammar / JSON-schema constrains the response envelope at the model's logits-sampling level, replacing the fail-soft post-hoc parser-rejection path as the primary defense.
+
+  **As-built shape:**
+  - **`androscan/llm/grammar.py`** (NEW, ~+330 LOC including doc-blocks): emits two parallel constraint shapes from a shared registry-driven skill-name discovery — `build_response_json_schema(skill_names)` (Ollama's `format: <schema>` payload, supported since Ollama 0.5.0 / Dec 2024) + `build_response_gbnf(skill_names)` (llama.cpp's `grammar:` field on `/v1/chat/completions`). Per-key shape: `summary` (optional string), `skill_requests[*].skill` (discriminated-union enum over the 9 LLM-tier skills from `list_llm_skills()`), `skill_requests[*].params` (permissive object), `hypotheses[*]` (permissive object — the parser default-fills missing fields, over-constraining would trigger spurious sampling rejections). `top-level additionalProperties: False` is the strongest constraint that doesn't break real LLM output. `is_grammar_enabled(config)` is the single feature-flag helper read by both client branches.
+  - **`androscan/llm/client.py`** wiring: pre-computes the schema / GBNF outside the retry loop (cheap), attaches it to the request payload when `Config.local_grammar_enabled` is True (default) AND the base_url isn't in the per-process disabled-set cache. On HTTP 400 with body matching the narrow heuristic `_looks_like_schema_error` (Ollama) / `_looks_like_grammar_error` (llama.cpp), the base_url is added to the cache and the request is retried once with the v1-LCP wire shape (Ollama: `format: "json"` string; llama.cpp: drop the `grammar` field, keep `response_format: {"type": "json_object"}`). Cache is process-lifetime — operators upgrading their runtime get a clean slate on next AndroScan restart. Cloud path is unchanged (the OpenAI-compat `response_format` contract enforces validity at the SDK layer).
+  - **`Config.local_grammar_enabled`** (NEW, defaults `True`): single kill-switch under YAML `llm.local_grammar_enabled`, env `ANDROSCAN_LOCAL_GRAMMAR_ENABLED` (accepts the standard truthy/falsy aliases). Live-reloadable. Surfaced in the Settings UI under both the "Local (Ollama)" and "Local (llama.cpp)" provider subsections (cross-provider local knob; never under Cloud).
+  - **Tests**: 38 new in `tests/test_grammar.py` (skill discovery, JSON-schema shape, GBNF well-formedness + per-skill alternative coverage, parser-invariance) + 11 new in `tests/test_llm_client.py` (Ollama schema-mode happy / 400-fallback / kill-switch off / unrelated-400 unaffected; llama.cpp grammar-mode happy / 400-fallback / kill-switch off / unrelated-400 unaffected) + 13 new in `tests/test_config.py` (`TestLocalGrammarEnabled`: default, YAML + env round-trip, env truthy/falsy alias coverage, `with_overrides` coercion, `global_view_from_config` round-trip). Total: 1092 tests pass post-LCP.6 (up from 1030 at LCP.5; +62 new tests as planned).
+- related tasks/docs:
+  - `docs/TASKS.md` § **LCP — llama.cpp local provider — sub-step backlog** row LCP.6 (marked complete 2026-05-06).
+  - `docs/DECISIONS.md` **DEC-027** LCP.6 closing note (final closing note for the LCP track).
+  - `docs/STATE.md` (LCP.6 entry under "Recent completed work" + "What currently exists" updates for `androscan/llm/grammar.py` + the kill-switch knob).
+  - `docs/DESIGN_DOC.md` (LCP track promoted to fully-complete).
+  - `androscan/llm/grammar.py` (new module — emitter + skill-name discovery + feature-flag helper).
+  - `androscan/llm/client.py` (`_complete_ollama` + `_complete_llamacpp` — grammar-mode wiring + opportunistic 400-fallback + per-base-url disabled-set cache).
+  - `androscan/config/loader.py` (`Config.local_grammar_enabled` + `LIVE_RELOADABLE_FIELDS` + `CONFIG_FIELD_MAP` + `_merge_from_yaml` + env override + `with_overrides` coercion).
+  - `androscan/web/frontend/src/tabs/SettingsTab.tsx` (`LlmProviderRadio` — renders the new field under both local provider subsections).
+  - `global_config.yaml` (`llm.local_grammar_enabled` doc comment block).
 
 ### LIMIT-002: No static call graph or Frida in-repo yet
 - status: Resolved

@@ -1,12 +1,22 @@
 """LLM client: Ollama / llama.cpp (local) and cloud providers.
 
 Ollama:    HTTP POST /api/chat with JSONL streaming, native ``thinking``
-           channel, ``format: json`` mode.
+           channel. JSON mode: ``format: <json-schema>`` when
+           ``Config.local_grammar_enabled`` (default True; closes
+           ISSUE-016 — see LCP.6) and Ollama >= 0.5.0; falls back to
+           ``format: "json"`` opportunistically on the first HTTP 400
+           that mentions ``format`` / ``schema``.
 llama.cpp: HTTP POST /v1/chat/completions (OpenAI-compat shim from
            ``llama-server``), SSE streaming, ``response_format: {"type":
-           "json_object"}`` mode, defensive ``<think>`` strip.
+           "json_object"}`` mode, defensive ``<think>`` strip. Grammar
+           mode: an additional ``grammar`` field with the GBNF emitted
+           by :mod:`androscan.llm.grammar` is sent alongside
+           ``response_format``; the per-base-url disabled-set caches
+           400 fallbacks the same way the Ollama path does.
 Cloud:     OpenAI SDK pointed at provider-specific base URLs (Gemini,
-           OpenAI, Groq, Deepseek, Together, Mistral).
+           OpenAI, Groq, Deepseek, Together, Mistral). Ignores
+           ``local_grammar_enabled`` — the OpenAI ``response_format``
+           contract already enforces validity at the SDK layer.
 
 Routing happens in :func:`complete` via :meth:`Config.provider_kind`
 (``local-ollama`` / ``local-openai-compat`` / ``cloud``).
@@ -73,6 +83,64 @@ def _strip_think_blocks(text: str) -> tuple[str, str]:
     cleaned = _THINK_BLOCK_RE.sub("", text).strip()
     extracted = "\n".join(c.strip() for c in captures if c and c.strip())
     return cleaned, extracted
+
+
+# ---------------------------------------------------------------------------
+# LCP.6 / DEC-027 — local-provider grammar / JSON-schema fallback caches
+#
+# When ``Config.local_grammar_enabled`` is True (default), the LLM client
+# sends a grammar / JSON-schema constraint to the local provider. If the
+# provider rejects it with HTTP 400 (older Ollama < 0.5.0; older
+# ``llama-server`` builds without grammar field support), we cache the
+# base_url in the matching set and fall back to the previous request
+# shape for the lifetime of the process. This avoids paying the rejection
+# round-trip on every subsequent call.
+#
+# Both sets are keyed by base_url (lowercased + trailing-slash-stripped)
+# so the operator can flip providers in Settings UI mid-session and the
+# new base_url starts fresh — only the URL the operator actually saw
+# fail keeps its fallback. Process restart clears both sets; that's the
+# intended cure if the operator upgrades their runtime.
+# ---------------------------------------------------------------------------
+
+_OLLAMA_SCHEMA_DISABLED_URLS: set[str] = set()
+_LLAMACPP_GRAMMAR_DISABLED_URLS: set[str] = set()
+
+
+def _normalise_base_url(url: str) -> str:
+    return (url or "").strip().rstrip("/").lower()
+
+
+def _looks_like_schema_error(detail: str) -> bool:
+    """Heuristic: does this Ollama 400 error look like ``format: <schema>``
+    rejection (so we can fall back to ``format: "json"``)?
+
+    Ollama < 0.5.0 returns errors like "format must be 'json' or empty"
+    or "invalid format value"; v0.5.0+ accepts the schema mode. The
+    heuristic stays narrow so unrelated 400s (model-not-loaded, etc.)
+    DON'T trigger the fallback.
+    """
+    if not detail:
+        return False
+    d = detail.lower()
+    return any(
+        kw in d
+        for kw in ("format", "schema", "json schema", "structured output")
+    )
+
+
+def _looks_like_grammar_error(detail: str) -> bool:
+    """Heuristic: does this llama.cpp 400 error look like ``grammar``
+    field rejection?
+
+    Older ``llama-server`` builds either error out with "unknown field"
+    or "grammar parse error". Same narrow heuristic posture as the
+    Ollama equivalent.
+    """
+    if not detail:
+        return False
+    d = detail.lower()
+    return any(kw in d for kw in ("grammar", "gbnf", "unknown field"))
 
 
 def is_ollama_available(base_url: str, timeout: int = 5) -> tuple[bool, str]:
@@ -320,6 +388,31 @@ def _complete_ollama(
     num_predict_idx = 0
     msgs = messages if messages is not None else _build_messages(system_content, prompt, images=images)
 
+    # LCP.6 / DEC-027 — pre-compute the grammar-mode payload. Captured
+    # once outside the retry loop so the schema dict is shared across
+    # timeout / num_predict retries, and the in-loop branch is cheap.
+    from androscan.llm.grammar import (
+        build_response_json_schema,
+        is_grammar_enabled,
+    )
+    base_url_norm = _normalise_base_url(base_url)
+    use_schema_format = (
+        response_format == "json"
+        and is_grammar_enabled(config)
+        and base_url_norm not in _OLLAMA_SCHEMA_DISABLED_URLS
+    )
+    schema_payload: Optional[dict[str, Any]] = None
+    if use_schema_format:
+        try:
+            schema_payload = build_response_json_schema()
+        except Exception as exc:
+            _log.warning(
+                "LCP.6 grammar build failed (%s); falling back to "
+                "format: \"json\". Investigate androscan.llm.grammar.",
+                exc,
+            )
+            use_schema_format = False
+
     while True:
         timeout = OLLAMA_TIMEOUT_TIERS[timeout_idx]
         current_num_predict = OLLAMA_NUM_PREDICT_TIERS[min(num_predict_idx, len(OLLAMA_NUM_PREDICT_TIERS) - 1)]
@@ -334,7 +427,13 @@ def _complete_ollama(
             },
         }
         if response_format:
-            payload["format"] = response_format
+            # LCP.6 — JSON-schema mode for Ollama >= 0.5.0; older builds
+            # reject the dict-shaped ``format`` value with HTTP 400 and
+            # the catch block below caches the fallback per base_url.
+            if use_schema_format and schema_payload is not None:
+                payload["format"] = schema_payload
+            else:
+                payload["format"] = response_format
 
         try:
             result = _do_request(url, payload, timeout, stream, on_token, on_thinking)
@@ -353,6 +452,39 @@ def _complete_ollama(
                 f"Ollama request timed out after {timeout}s. {OLLAMA_SETUP_TIP}"
             ) from None
         except requests.HTTPError as e:
+            # LCP.6 — opportunistic fallback: if the daemon rejected the
+            # JSON-schema ``format`` payload, drop it for this base_url
+            # for the rest of the process and retry the same request
+            # with ``format: "json"``. The ``_parse_http_error`` helper
+            # only raises on non-recoverable shapes; we intercept BEFORE
+            # it fires, so the retry path stays inside this loop.
+            resp = e.response if hasattr(e, "response") else None
+            if (
+                use_schema_format
+                and resp is not None
+                and resp.status_code == 400
+            ):
+                detail_400 = ""
+                try:
+                    body = resp.json()
+                    detail_400 = (body.get("error") or "").strip() if isinstance(body, dict) else ""
+                except Exception:
+                    detail_400 = (resp.text or "")[:300].strip()
+                if _looks_like_schema_error(detail_400):
+                    _OLLAMA_SCHEMA_DISABLED_URLS.add(base_url_norm)
+                    use_schema_format = False
+                    if run_logger:
+                        run_logger.log_retry(
+                            "ollama_schema_fallback",
+                            "Ollama rejected format: <schema>; falling "
+                            "back to format: \"json\" for this base_url.",
+                        )
+                    _log.info(
+                        "LCP.6: Ollama at %s rejected JSON-schema mode "
+                        "(%s); falling back to format: \"json\".",
+                        base_url, detail_400[:200],
+                    )
+                    continue
             _parse_http_error(e, base_url, payload)
 
         done_reason = result.metadata.get("done_reason")
@@ -764,6 +896,36 @@ def _complete_llamacpp(
     if response_format == "json":
         payload["response_format"] = {"type": "json_object"}
 
+    # LCP.6 / DEC-027 — opportunistically attach a GBNF grammar that
+    # constrains the response to the AndroScan envelope (skill_requests
+    # discriminated union over the registered skill names + permissive
+    # hypothesis shape). Sent ALONGSIDE the existing
+    # ``response_format`` so a llama-server build that ignores the
+    # ``grammar`` field still gets the JSON-mode fallback. On HTTP 400
+    # mentioning grammar / GBNF, we cache the base_url in
+    # ``_LLAMACPP_GRAMMAR_DISABLED_URLS`` and retry once without the
+    # field for the lifetime of the process.
+    from androscan.llm.grammar import (
+        build_response_gbnf,
+        is_grammar_enabled,
+    )
+    base_url_norm = _normalise_base_url(base_url)
+    use_grammar = (
+        response_format == "json"
+        and is_grammar_enabled(config)
+        and base_url_norm not in _LLAMACPP_GRAMMAR_DISABLED_URLS
+    )
+    if use_grammar:
+        try:
+            payload["grammar"] = build_response_gbnf()
+        except Exception as exc:
+            _log.warning(
+                "LCP.6 grammar build failed (%s); proceeding without "
+                "grammar field. Investigate androscan.llm.grammar.",
+                exc,
+            )
+            use_grammar = False
+
     timeout_idx = 0
     retry_idx = 0
     while True:
@@ -823,6 +985,37 @@ def _complete_llamacpp(
             ) from None
         except requests.HTTPError as e:
             resp = e.response if hasattr(e, "response") else None
+            # LCP.6 — opportunistic grammar fallback. Only triggers for
+            # 400s whose body looks grammar-related; unrelated 400s
+            # (model not loaded, malformed messages) flow through the
+            # existing error path so the operator gets the real diagnostic.
+            if (
+                use_grammar
+                and resp is not None
+                and resp.status_code == 400
+            ):
+                detail_400 = ""
+                try:
+                    body = resp.json()
+                    detail_400 = (body.get("error") or "").strip() if isinstance(body, dict) else ""
+                except Exception:
+                    detail_400 = (resp.text or "")[:300].strip()
+                if _looks_like_grammar_error(detail_400):
+                    _LLAMACPP_GRAMMAR_DISABLED_URLS.add(base_url_norm)
+                    use_grammar = False
+                    payload.pop("grammar", None)
+                    if run_logger:
+                        run_logger.log_retry(
+                            "llamacpp_grammar_fallback",
+                            "llama.cpp rejected grammar field; falling "
+                            "back to response_format-only for this base_url.",
+                        )
+                    _log.info(
+                        "LCP.6: llama.cpp at %s rejected grammar field "
+                        "(%s); falling back to response_format only.",
+                        base_url, detail_400[:200],
+                    )
+                    continue
             if _llamacpp_status_is_retryable(resp) and retry_idx < 2:
                 retry_idx += 1
                 if run_logger:

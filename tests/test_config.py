@@ -611,3 +611,141 @@ class TestLlamacppRoundTrip:
             Config.default(), llm_provider="llamacpp", llamacpp_model="",
         )
         assert cfg.active_model == "(not set)"
+
+
+class TestLocalGrammarEnabled:
+    """``llm.local_grammar_enabled`` — LCP.6 / DEC-027 single
+    kill-switch for the local-provider grammar / JSON-schema
+    enforcement. Default True (the v1 LCP shipped the GBNF
+    follow-up); operators flip false in rare runtime
+    incompatibilities."""
+
+    def test_default_is_true(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Per Q2 (a) lock-in — committed follow-up ships ON."""
+        monkeypatch.chdir(tmp_path)
+        assert load_config().local_grammar_enabled is True
+
+    def test_default_helper_returns_true(self) -> None:
+        assert Config.default().local_grammar_enabled is True
+
+    def test_parses_false_from_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llm": {"local_grammar_enabled": False}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        assert load_config().local_grammar_enabled is False
+
+    def test_parses_string_truthy_from_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """YAML round-trips can produce string ``"true"`` (unusual but
+        possible after a hand-edit). The merge accepts the standard
+        truthy values."""
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            'llm:\n  local_grammar_enabled: "yes"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        assert load_config().local_grammar_enabled is True
+
+    def test_env_overrides_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Env var wins over YAML, mirroring the established loader
+        precedence (``defaults < yaml < env``)."""
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llm": {"local_grammar_enabled": True}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANDROSCAN_LOCAL_GRAMMAR_ENABLED", "false")
+        assert load_config().local_grammar_enabled is False
+
+    def test_env_invalid_value_warns_and_falls_back(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Mirrors the established loader posture: bad env input warns
+        on stderr and falls back to YAML/default rather than
+        crashing config load."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANDROSCAN_LOCAL_GRAMMAR_ENABLED", "maybe")
+        cfg = load_config()
+        assert cfg.local_grammar_enabled is True
+        assert "ANDROSCAN_LOCAL_GRAMMAR_ENABLED" in capsys.readouterr().err
+
+    def test_env_truthy_aliases_all_resolve_to_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for value in ("true", "1", "yes", "on"):
+            monkeypatch.chdir(tmp_path)
+            monkeypatch.setenv("ANDROSCAN_LOCAL_GRAMMAR_ENABLED", value)
+            assert load_config().local_grammar_enabled is True, f"failed for {value!r}"
+
+    def test_env_falsy_aliases_all_resolve_to_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for value in ("false", "0", "no", "off"):
+            monkeypatch.chdir(tmp_path)
+            monkeypatch.setenv("ANDROSCAN_LOCAL_GRAMMAR_ENABLED", value)
+            assert load_config().local_grammar_enabled is False, f"failed for {value!r}"
+
+    def test_field_is_live_reloadable(self) -> None:
+        from androscan.config.loader import LIVE_RELOADABLE_FIELDS
+        assert "local_grammar_enabled" in LIVE_RELOADABLE_FIELDS
+
+    def test_field_is_in_field_map(self) -> None:
+        from androscan.config.loader import CONFIG_FIELD_MAP
+        section, key, env = CONFIG_FIELD_MAP["local_grammar_enabled"]
+        assert (section, key, env) == (
+            "llm",
+            "local_grammar_enabled",
+            "ANDROSCAN_LOCAL_GRAMMAR_ENABLED",
+        )
+
+    def test_with_overrides_round_trips_bool(self) -> None:
+        """``with_overrides`` is the live-reload path — passing a bool
+        directly preserves the value."""
+        from androscan.config.loader import with_overrides
+        cfg = with_overrides(Config.default(), local_grammar_enabled=False)
+        assert cfg.local_grammar_enabled is False
+        cfg2 = with_overrides(Config.default(), local_grammar_enabled=True)
+        assert cfg2.local_grammar_enabled is True
+
+    def test_with_overrides_coerces_string_truthy(self) -> None:
+        """A YAML round-trip + Settings UI save can deliver the value
+        as a string; ``with_overrides`` coerces."""
+        from androscan.config.loader import with_overrides
+        for s in ("true", "1", "yes", "on"):
+            cfg = with_overrides(Config.default(), local_grammar_enabled=s)
+            assert cfg.local_grammar_enabled is True, f"failed for {s!r}"
+        for s in ("false", "0", "no", "off", ""):
+            cfg = with_overrides(Config.default(), local_grammar_enabled=s)
+            assert cfg.local_grammar_enabled is False, f"failed for {s!r}"
+
+    def test_round_trip_through_global_view(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The Settings UI "save form -> rewrite YAML -> reload Config"
+        loop must preserve operator-set boolean values without
+        drift. ``False`` is the value that matters most (default is
+        True, so a False save is the only operator-visible change)."""
+        from androscan.config.loader import (
+            _merge_from_yaml,
+            global_view_from_config,
+        )
+        original = dataclasses.replace(
+            Config.default(), local_grammar_enabled=False,
+        )
+        view = global_view_from_config(original)
+        assert view["llm"]["local_grammar_enabled"] is False
+        flat = _merge_from_yaml(view)
+        assert flat["local_grammar_enabled"] is False

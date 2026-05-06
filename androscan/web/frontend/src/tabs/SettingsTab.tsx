@@ -437,9 +437,19 @@ function LlmProviderRadio({
   // cloud_* ones (cloud_model / cloud_api_key / cloud_temperature).
   // The bare ``llm_provider`` field is intentionally not rendered
   // anywhere — the radio + dropdown is the only chooser.
-  const llmCloudFields = (grouped["llm"] ?? []).filter((f) => f !== "llm_provider");
+  // LCP.6 — ``local_grammar_enabled`` lives under the ``llm`` YAML
+  // section (cross-provider local knob) but only meaningfully applies
+  // to local providers; rendered separately under the Ollama +
+  // llama.cpp subsections, never under Cloud.
+  const llmCloudFields = (grouped["llm"] ?? []).filter(
+    (f) => f !== "llm_provider" && f !== "local_grammar_enabled",
+  );
   const ollamaFields = grouped["ollama"] ?? [];
   const llamacppFields = grouped["llamacpp"] ?? [];
+  const localGrammarField =
+    "local_grammar_enabled" in (data.field_map ?? {})
+      ? "local_grammar_enabled"
+      : null;
 
   return (
     <fieldset className="settings-section settings-llm-provider">
@@ -496,6 +506,26 @@ function LlmProviderRadio({
               onChange={(v) => onChange(f, v, data.flat[f])}
             />
           ))}
+          {localGrammarField && (
+            <SettingsField
+              key={localGrammarField}
+              field={localGrammarField}
+              meta={data.field_map[localGrammarField]}
+              value={dirty[localGrammarField] ?? data.flat[localGrammarField]}
+              originalValue={data.flat[localGrammarField]}
+              source={data.sources[localGrammarField]}
+              envLock={
+                data.field_map[localGrammarField].env_var
+                  ? data.env_locks[data.field_map[localGrammarField].env_var as string]
+                  : undefined
+              }
+              liveReloadable={data.live_reloadable.includes(localGrammarField)}
+              isDirty={localGrammarField in dirty}
+              onChange={(v) =>
+                onChange(localGrammarField, v, data.flat[localGrammarField])
+              }
+            />
+          )}
         </div>
       )}
       {radio === "llamacpp" && (
@@ -523,6 +553,26 @@ function LlmProviderRadio({
               onChange={(v) => onChange(f, v, data.flat[f])}
             />
           ))}
+          {localGrammarField && (
+            <SettingsField
+              key={localGrammarField}
+              field={localGrammarField}
+              meta={data.field_map[localGrammarField]}
+              value={dirty[localGrammarField] ?? data.flat[localGrammarField]}
+              originalValue={data.flat[localGrammarField]}
+              source={data.sources[localGrammarField]}
+              envLock={
+                data.field_map[localGrammarField].env_var
+                  ? data.env_locks[data.field_map[localGrammarField].env_var as string]
+                  : undefined
+              }
+              liveReloadable={data.live_reloadable.includes(localGrammarField)}
+              isDirty={localGrammarField in dirty}
+              onChange={(v) =>
+                onChange(localGrammarField, v, data.flat[localGrammarField])
+              }
+            />
+          )}
         </div>
       )}
       {radio === "cloud" && (

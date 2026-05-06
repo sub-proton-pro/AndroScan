@@ -35,6 +35,20 @@ llamacpp:
   model: ""
   max_tokens: 8192
 
+# LCP.6 / DEC-027 — local-LLM grammar / JSON-schema enforcement.
+# Closes ISSUE-016 (JSON-validity drift on aggressive quants like Q4_K_M
+# / IQ4_XS). When ``true`` (default), AndroScan sends:
+#   * Ollama  → ``format: <json-schema>``  (requires Ollama >= 0.5.0)
+#   * llama.cpp → ``grammar: <gbnf>`` on /v1/chat/completions
+# Cloud providers ignore this knob (their OpenAI-compat ``response_format``
+# already enforces validity at the SDK layer).
+# The LLM client also auto-falls-back per base_url on the first 400
+# response that mentions schema / grammar, so old runtimes keep working
+# without operator action; flipping false here is the kill-switch for
+# cases the auto-fallback can't recover from.
+# llm:
+#   local_grammar_enabled: true
+
 paths:
   run_folder_root: "apps"
   apktool_cmd: "apktool"
