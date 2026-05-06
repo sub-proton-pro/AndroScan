@@ -48,25 +48,29 @@ Dev mode (Vite proxy to API): run `python androscan.py --serve`, then `cd andros
 
 AndroScan supports two local LLM runtimes; pick one in **Settings → Global → LLM provider** (or set `llm.provider` in `global_config.yaml`).
 
-- **Ollama** (default; install via [https://ollama.com](https://ollama.com)): `ollama pull qwen3.5:35b` then `ollama serve`. Knobs live under the `ollama:` section of `global_config.yaml` (`base_url`, `model`, `temperature`, `num_predict`, `num_ctx`).
-- **llama.cpp** (recommended for tight memory budgets — ~10–30% faster on M-series via Metal offload + flash attention): build / install per [https://github.com/ggerganov/llama.cpp](https://github.com/ggerganov/llama.cpp), then run `llama-server` against a Q5_K_M / UD-Q5_K_XL Qwen3-family GGUF:
+- **Ollama** (default; install via [https://ollama.com](https://ollama.com)): `ollama pull qwen3.6:27b` then `ollama serve`. Knobs live under the `llm.ollama:` section of `global_config.yaml` (`base_url`, `default_model`, `temperature`, `num_predict`, `num_ctx`).
+- **llama.cpp** (recommended for tight memory budgets — ~10–30% faster on M-series via Metal offload + flash attention): build / install per [https://github.com/ggerganov/llama.cpp](https://github.com/ggerganov/llama.cpp), then run `llama-server` against a Q5_K_M / UD-Q5_K_XL / Q8_K_XL GGUF (Qwen3-family or Unsloth Gemma-4):
 
     ```bash
     llama-server \
-      -m <path-to-your.gguf> \
-      -c 16384 \           # context window — set at server start (NOT a request-level param)
-      -ngl 99 \            # offload all layers to GPU (Metal on M-series; one-shot speedup)
-      -fa \                # flash attention — additive 10–15% on long contexts
-      --port 8033 \        # AndroScan default; non-conflicting with llama.cpp's upstream 8080
-      --host 127.0.0.1 \   # loopback-only per AndroScan's safety posture
-      --jinja              # chat-template parity (required for Qwen3-family <think> tags)
+      -hf unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL \   # or -m <path-to-your.gguf>
+      -c 16384 \                # context window — set at server start (NOT a request-level param)
+      -ngl 99 \                 # offload all layers to GPU (Metal on M-series; one-shot speedup)
+      -fa on \                  # flash attention — recent builds require an explicit on/off/auto
+      --port 8033 \             # AndroScan default; non-conflicting with llama.cpp's upstream 8080
+      --host 127.0.0.1 \        # loopback-only per AndroScan's safety posture
+      --jinja \                 # chat-template parity (required for Qwen3-family <think> tags)
+      --no-webui \              # disable llama-server's bundled web UI (AndroScan doesn't use it)
+      --cache-reuse 256         # KV-cache prefix reuse — free perf win on AndroScan's stable system-prompt prefix
     ```
 
-    Knobs live under the `llamacpp:` section of `global_config.yaml` (`base_url`, `model` — free-text label; `llama-server` ignores the request-body model field, the actual GGUF is the one loaded at startup; `max_tokens`). Default `base_url` is `http://127.0.0.1:8033/v1` (the OpenAI-compat `/v1` suffix is required).
+    Knobs live under the `llm.llamacpp:` section of `global_config.yaml` (`base_url`, `default_model` — free-text label; `llama-server` ignores the request-body model field, the actual GGUF is the one loaded at startup; `max_tokens`). Default `base_url` is `http://127.0.0.1:8033/v1` (the OpenAI-compat `/v1` suffix is required). Default `default_model` ships as `unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL` to match the recommended `-hf` arg above; change it (in Settings UI or YAML) to whatever you actually loaded.
 
-For the full set of supported quantization levels and per-quant memory tradeoffs, see the upstream `llama.cpp` documentation. **Aggressive quants (Q4_K_M / IQ4_XS) may produce occasional schema drift on AndroScan's structured-JSON workload** — see `docs/KNOWN_ISSUES.md` ISSUE-016 for the workaround (pick a less-aggressive quant, or wait for the LCP.6 GBNF grammar enforcement follow-up).
+    Three model-sourcing options: (1) the HuggingFace cache (run `llama-server -cl 2>/dev/null` to list cached models), (2) the HuggingFace Hub via `-hf <repo>:<quant>` which downloads on first run (private repos require an `HF_TOKEN`), or (3) a local filesystem path via `-m /absolute/path/to/foo.gguf`. A future LCP.7 follow-up will surface a 3-way model picker in the Settings UI.
 
-A third option is a **cloud LLM** (OpenAI / Gemini / Groq / DeepSeek / Together / Mistral) under the same Settings UI radio — useful for spot-checking against a frontier model. Cloud paths require an API key (`llm.cloud_api_key` in `global_config.yaml` or the vendor-specific `*_API_KEY` env var).
+For the full set of supported quantization levels and per-quant memory tradeoffs, see the upstream `llama.cpp` documentation. **Aggressive quants (Q4_K_M / IQ4_XS) may produce occasional schema drift on AndroScan's structured-JSON workload** — closed at LCP.6 / DEC-027 by the per-request GBNF grammar enforcement; see `docs/KNOWN_ISSUES.md` ISSUE-016 for the kill-switch (`llm.local_grammar_enabled: false`) on the rare runtime that doesn't honour grammars.
+
+A third option is a **cloud LLM** (OpenAI / Gemini / Groq / DeepSeek / Together / Mistral) under the same Settings UI radio — useful for spot-checking against a frontier model. Cloud paths require an API key (`llm.cloud.api_key` in `global_config.yaml` or the vendor-specific `*_API_KEY` env var).
 
 ## Skills
 

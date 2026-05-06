@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -942,60 +942,130 @@ def _force_urllib_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("asyncio.to_thread", to_thread)
 
 
+# DEC-028 (2026-05-06) — :func:`probe_llamacpp` now makes TWO HTTP calls
+# (``/health`` for liveness, then ``/v1/models`` for the model list).
+# These helpers wire up a URL-routing fake-urlopen so tests can return
+# different bodies per endpoint without intermixing fixture state.
+def _route_urlopen(
+    monkeypatch: pytest.MonkeyPatch,
+    routes: dict[str, bytes],
+    *,
+    raises: Optional[dict[str, BaseException]] = None,
+) -> None:
+    """Install a fake urlopen that dispatches by request URL substring.
+
+    ``routes`` maps a substring (e.g. ``"/health"`` or ``"/v1/models"``)
+    to the response body. ``raises`` (optional) maps a substring to an
+    exception to raise instead. The first matching key wins (insertion
+    order); a request whose URL matches none surfaces an explicit test
+    failure so the operator notices a missing route stub.
+    """
+    raises = raises or {}
+
+    def fake_urlopen(req, timeout=0):
+        url = getattr(req, "full_url", None) or str(req)
+        for needle, exc in raises.items():
+            if needle in url:
+                raise exc
+        for needle, body in routes.items():
+            if needle in url:
+                return _FakeUrlopenResp(body)
+        raise AssertionError(
+            f"Test mock missing route for {url!r}; "
+            f"add a key to routes / raises (current keys: "
+            f"{list(routes.keys()) + list(raises.keys())})"
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+
+# /health body shapes for liveness classification (DEC-028).
+_HEALTH_OK = b'{"status": "ok"}'
+_HEALTH_LOADING = b'{"status": "loading model"}'
+
+
 def test_probe_llamacpp_up_with_models(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``_UP`` — server live, model loaded. ``ok`` flips green."""
+    """``_UP`` — /health says ok AND /v1/models has loaded models.
+    ``ok`` flips green."""
     _force_urllib_fallback(monkeypatch)
     import json as _json
 
-    body = _json.dumps({
+    models_body = _json.dumps({
         "object": "list",
         "data": [{"id": "qwen3-27b-q5km", "object": "model", "owned_by": "llamacpp"}],
     }).encode()
 
-    def fake_urlopen(req, timeout=0):
-        return _FakeUrlopenResp(body)
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    _route_urlopen(monkeypatch, {
+        "/health": _HEALTH_OK,
+        "/v1/models": models_body,
+    })
 
     out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
     assert out["ok"] is True
     assert out["reachable"] is True
     assert out["models"] == ["qwen3-27b-q5km"]
     assert out["error"] is None
+    # ``url`` preserved as the /v1/models endpoint so the status-card
+    # "open in browser" link still points at a useful place.
     assert out["url"].endswith("/models")
+
+
+def test_probe_llamacpp_partial_up_health_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_PARTIAL_UP`` — /health returns ``{"status": "loading model"}``
+    during cold-start mmap. The probe SKIPS the /v1/models call
+    because we already know enough to render the yellow card and
+    /v1/models would just return an empty list anyway. New in
+    DEC-028 — the previous /v1/models-only probe couldn't
+    distinguish "loading" from "no model configured at boot"."""
+    _force_urllib_fallback(monkeypatch)
+
+    # Only /health is routed; if the probe wrongly fires /v1/models
+    # the route mock raises AssertionError to surface the bug.
+    _route_urlopen(monkeypatch, {"/health": _HEALTH_LOADING})
+
+    out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
+    assert out["ok"] is False
+    assert out["reachable"] is True
+    assert out["models"] == []
+    assert out["error"] and "loading model" in out["error"]
 
 
 def test_probe_llamacpp_partial_up_no_models_loaded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_PARTIAL_UP`` — server live (HTTP 200 with empty data list)
-    but model still mmap'ing. Operator sees a yellow card with a
-    "wait for cold-start" hint rather than a misleading red."""
+    """``_PARTIAL_UP`` — /health says ok but /v1/models has an empty
+    ``data`` list (operator booted llama-server without ``-hf`` /
+    ``-m``). Surfaces as the same yellow card as the loading case
+    so the operator notices the misconfiguration."""
     _force_urllib_fallback(monkeypatch)
     import json as _json
 
-    body = _json.dumps({"object": "list", "data": []}).encode()
-    monkeypatch.setattr(
-        "urllib.request.urlopen", lambda req, timeout=0: _FakeUrlopenResp(body),
-    )
+    empty_models = _json.dumps({"object": "list", "data": []}).encode()
+    _route_urlopen(monkeypatch, {
+        "/health": _HEALTH_OK,
+        "/v1/models": empty_models,
+    })
 
     out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
     assert out["ok"] is False
     assert out["reachable"] is True   # server is up …
-    assert out["models"] == []        # … but model not loaded yet
+    assert out["models"] == []        # … but no models exposed
     assert out["error"] and "no models loaded" in out["error"]
 
 
 def test_probe_llamacpp_down_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``_DOWN`` — server unreachable. ``urlopen`` raises URLError;
-    the probe surfaces the error string in ``error`` (truncated)."""
+    """``_DOWN`` — /health raises URLError (server not listening).
+    The probe surfaces the error string in ``error`` (truncated)."""
     _force_urllib_fallback(monkeypatch)
     from urllib.error import URLError
 
-    def fake_urlopen(req, timeout=0):
-        raise URLError("connection refused")
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    _route_urlopen(
+        monkeypatch,
+        routes={},
+        raises={"/health": URLError("connection refused")},
+    )
 
     out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
     assert out["ok"] is False
@@ -1005,21 +1075,26 @@ def test_probe_llamacpp_down_unreachable(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_probe_llamacpp_unparsable_response(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Server reachable but body isn't JSON — surface the parser
-    error rather than crashing the status aggregator."""
+    """Server returns non-JSON for /health — degrades gracefully.
+    Some llama-server builds return non-JSON for /health (rare); the
+    probe falls back to a substring check for ``ok`` in the body and
+    proceeds to /v1/models. Here the response doesn't contain ``ok``
+    so we treat it as PARTIAL_UP and still try /v1/models, which
+    also returns garbage and produces an unparsable error.
+    """
     _force_urllib_fallback(monkeypatch)
 
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda req, timeout=0: _FakeUrlopenResp(b"<html>nginx error</html>"),
-    )
+    _route_urlopen(monkeypatch, {
+        "/health": b"<html>nginx error</html>",
+        "/v1/models": b"<html>nginx error</html>",
+    })
 
     out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
     assert out["ok"] is False
-    # urllib path returns the error from JSON parse failure under
-    # `_sync`; either the parsed-failure label or "JSONDecodeError"
-    # is acceptable, but the card MUST surface *something* rather
-    # than silently flipping green.
+    # The error message MUST be set (operator-readable) — the test
+    # tolerates either a /health-derived "loading"-style hint or a
+    # /v1/models-derived parse-failure message; the card MUST NOT
+    # silently flip green.
     assert out["error"]
 
 

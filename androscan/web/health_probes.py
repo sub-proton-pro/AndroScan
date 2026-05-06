@@ -863,121 +863,187 @@ async def probe_llamacpp(
     base_url: str,
     timeout: float = HTTP_TIMEOUT_SEC,
 ) -> dict[str, Any]:
-    """``GET {base_url}/models`` to verify ``llama-server`` is reachable.
+    """Liveness + model-list probe for ``llama-server`` (LCP.3, DEC-028).
 
-    The configured ``base_url`` already includes the OpenAI-compat
-    ``/v1`` suffix (e.g. ``http://127.0.0.1:8033/v1``) so the path
-    appended here is just ``/models`` — no double-``/v1``. The
-    response shape on a successful probe is:
+    Two-step probe so the Settings-tab status card can distinguish
+    ``_DOWN`` / ``_PARTIAL_UP`` / ``_UP`` cleanly:
 
-        {"object": "list", "data": [{"id": "<model-id>", ...}]}
+    1. **Liveness.** ``GET {base_origin}/health`` — purpose-built
+       liveness endpoint that returns ``{"status": "ok"}`` when the
+       server is fully up, ``{"status": "loading model"}`` (HTTP 503)
+       during the cold-start mmap window, or fails entirely when the
+       process isn't listening. DEC-028 (LCP.6 follow-up) switched
+       from probing ``/v1/models`` for liveness because ``/health`` is
+       smaller, semantically correct, and surfaces the "loading"
+       transient state explicitly rather than leaving operators to
+       infer it from an empty ``data: []`` list.
+    2. **Model list.** ``GET {base_url}/models`` — only fired when the
+       liveness step succeeded, populates the ``models`` field used
+       by :func:`llamacpp_model_present` to verify the operator's
+       configured ``llamacpp_model`` label matches the GGUF actually
+       loaded at server startup.
+
+    The ``base_url`` already includes the OpenAI-compat ``/v1`` suffix
+    (e.g. ``http://127.0.0.1:8033/v1``) so ``/models`` is appended
+    directly, while ``/health`` is a server-root endpoint at
+    ``http://127.0.0.1:8033/health`` (one level above ``/v1``).
 
     Returns a dict structurally parallel to :func:`probe_ollama_tags`
-    so the Settings tab status-card renderer can stay generic
-    (``StatusCardView`` doesn't need a per-provider variant):
+    so the Settings tab's status-card renderer stays generic:
 
         {
-            "ok":         bool,   # server reachable AND >=1 model loaded
-            "reachable":  bool,   # server reachable (HTTP 200 from /models)
-            "url":        str,
-            "ping_ms":    int,
-            "models":     list[str],   # model ids extracted from data[]
-            "error":      str | None,  # operator-readable; truncated to 300
+            "ok":         bool,   # server fully up AND >=1 model loaded
+            "reachable":  bool,   # server reachable (any /health response)
+            "url":        str,    # /v1/models URL (preserved for back-compat
+                                  # with status-card "open in browser" links)
+            "ping_ms":    int,    # total elapsed across both steps
+            "models":     list[str],   # model ids from /v1/models
+            "error":      str | None,
         }
 
     Three-state classification matters for the operator UX:
 
     * ``_DOWN``       — ``ok=False, reachable=False`` — server isn't
-      running. Operator's first move is ``llama-server -c 16384
-      -ngl 99 -fa --port 8033 --host 127.0.0.1 --jinja``.
+      running. Operator's first move is the recommended startup line
+      from ``global_config.yaml`` / ``README.md``.
     * ``_PARTIAL_UP`` — ``ok=False, reachable=True, models=[]`` —
-      common during model-load lag on cold starts (large GGUF files
-      can take 10-30s to mmap into RAM). Operator just needs to
-      wait; the next probe (Settings tab polls every 15s) will flip
-      to ``_UP``.
+      common during model-load lag on cold starts (large GGUFs can
+      take 10-30s to mmap into RAM). Operator just needs to wait;
+      the next probe (Settings polls every 15s) flips to ``_UP``.
     * ``_UP``         — ``ok=True, reachable=True, models=[<id>]`` —
       ready to serve requests.
-
-    Mirrors :func:`probe_ollama_tags`'s curl-first / urllib-fallback
-    pattern so the Settings-tab status loop never blocks the event
-    loop on a stuck probe.
     """
     base = (base_url or "").strip().rstrip("/")
-    url = f"{base}/models"
+    # /v1/models is the configured-suffix path; /health lives at the
+    # server root one level above /v1. Strip a trailing /v1 (if any)
+    # to derive the health URL — operators sometimes paste base_url
+    # without the /v1, in which case base IS the root and we use it.
+    health_root = base[:-3] if base.endswith("/v1") else base
+    health_url = f"{health_root}/health"
+    models_url = f"{base}/models"
     started = time.perf_counter()
 
-    def _classify(parsed: dict[str, Any], elapsed_ms: int) -> dict[str, Any]:
-        """Map a parsed /v1/models response onto the structured probe shape."""
-        data = parsed.get("data") if isinstance(parsed, dict) else None
-        if not isinstance(data, list):
-            return {
-                "ok": False, "reachable": True, "url": url, "ping_ms": elapsed_ms,
-                "models": [],
-                "error": "unexpected /v1/models shape (no 'data' list)",
-            }
-        models = [
-            str(m.get("id"))
-            for m in data
-            if isinstance(m, dict) and m.get("id")
-        ]
-        if not models:
-            # _PARTIAL_UP — server up but no model loaded yet.
-            return {
-                "ok": False, "reachable": True, "url": url, "ping_ms": elapsed_ms,
-                "models": [],
-                "error": "llama-server reachable but no models loaded yet "
-                         "(cold-start mmap can take 10-30s for large GGUFs)",
-            }
-        return {
-            "ok": True, "reachable": True, "url": url, "ping_ms": elapsed_ms,
-            "models": models, "error": None,
-        }
+    async def _http_get(url: str) -> tuple[bool, str, Optional[str]]:
+        """``GET url`` returning ``(ok, body_text, error_or_None)``.
 
-    if shutil.which("curl"):
-        rc, out, err = await _run(
-            "curl", "-fsS", "-m", str(int(max(1, timeout))), url,
-            timeout=timeout + 0.5,
-        )
-        ms = int((time.perf_counter() - started) * 1000)
-        if rc != 0:
-            return {
-                "ok": False, "reachable": False, "url": url, "ping_ms": ms,
-                "models": [], "error": (err or out or f"curl rc={rc}").strip()[:300],
-            }
-        try:
-            import json as _json
-            return _classify(_json.loads(out), ms)
-        except Exception as e:
-            return {
-                "ok": False, "reachable": True, "url": url, "ping_ms": ms,
-                "models": [], "error": f"unparsable response: {e}",
-            }
+        Mirrors :func:`probe_ollama_tags`'s curl-first / urllib-fallback
+        pattern so we never block the event loop on a stuck socket.
+        Both /health (small JSON) and /models (small JSON) are loopback
+        calls; total wall-clock budget across both steps stays under
+        the single ``timeout`` ceiling because the urllib socket-level
+        timeout is enforced per-call.
+        """
+        if shutil.which("curl"):
+            rc, out, err = await _run(
+                "curl", "-fsS", "-m", str(int(max(1, timeout))), url,
+                timeout=timeout + 0.5,
+            )
+            if rc != 0:
+                return False, "", (err or out or f"curl rc={rc}").strip()[:300]
+            return True, out, None
 
-    def _sync() -> tuple[bool, dict[str, Any], Optional[str]]:
-        """urllib fallback for hosts without curl on PATH."""
-        import json as _json
-        from urllib.error import URLError
-        from urllib.request import Request, urlopen
-        try:
-            with urlopen(
-                Request(url, headers={"Accept": "application/json"}),
-                timeout=timeout,
-            ) as resp:
-                body = resp.read().decode(errors="replace")
-            return True, _json.loads(body), None
-        except URLError as e:
-            return False, {}, f"urlopen: {e}"
-        except Exception as e:
-            return False, {}, f"{type(e).__name__}: {e}"
+        def _sync() -> tuple[bool, str, Optional[str]]:
+            from urllib.error import URLError
+            from urllib.request import Request, urlopen
+            try:
+                with urlopen(
+                    Request(url, headers={"Accept": "application/json"}),
+                    timeout=timeout,
+                ) as resp:
+                    body = resp.read().decode(errors="replace")
+                return True, body, None
+            except URLError as e:
+                return False, "", f"urlopen: {e}"
+            except Exception as e:
+                return False, "", f"{type(e).__name__}: {e}"
 
-    ok, parsed, err = await asyncio.to_thread(_sync)
-    ms = int((time.perf_counter() - started) * 1000)
+        return await asyncio.to_thread(_sync)
+
+    # Step 1 — liveness via /health.
+    ok, health_body, err = await _http_get(health_url)
     if not ok:
+        ms = int((time.perf_counter() - started) * 1000)
         return {
-            "ok": False, "reachable": False, "url": url, "ping_ms": ms,
+            "ok": False, "reachable": False, "url": models_url, "ping_ms": ms,
             "models": [], "error": err,
         }
-    return _classify(parsed, ms)
+
+    # Parse /health body (small, pure-string-search is fine on the
+    # body's "status" field — but JSON is the contract so prefer it).
+    health_status: Optional[str] = None
+    try:
+        import json as _json
+        parsed_health = _json.loads(health_body)
+        if isinstance(parsed_health, dict):
+            health_status = str(parsed_health.get("status") or "").strip().lower()
+    except Exception:
+        # Some llama-server builds return non-JSON for /health (rare).
+        # Treat presence of "ok" in the body as a soft signal.
+        if "ok" in health_body.lower():
+            health_status = "ok"
+
+    if health_status and health_status != "ok":
+        # _PARTIAL_UP — server is up but model is still mmapping (or
+        # the slot pool is exhausted). Skip the /v1/models fetch — its
+        # ``data`` list will be empty during model load anyway, and we
+        # already know enough to render the yellow card.
+        ms = int((time.perf_counter() - started) * 1000)
+        return {
+            "ok": False, "reachable": True, "url": models_url, "ping_ms": ms,
+            "models": [],
+            "error": f"llama-server reachable but {health_status!r} "
+                     "(cold-start mmap can take 10-30s for large GGUFs)",
+        }
+
+    # Step 2 — model list via /v1/models. Only meaningful when /health
+    # said "ok"; an empty data list at this point is the unusual case
+    # of a server that booted without ``-hf`` / ``-m`` (operator typo)
+    # and it should still surface as _PARTIAL_UP rather than green.
+    ok2, models_body, err2 = await _http_get(models_url)
+    ms = int((time.perf_counter() - started) * 1000)
+    if not ok2:
+        # /health said ok but /v1/models is unreachable — odd but real
+        # (e.g. operator pointed base_url at the wrong port). Surface
+        # the /v1/models error to make the misconfiguration obvious.
+        return {
+            "ok": False, "reachable": True, "url": models_url, "ping_ms": ms,
+            "models": [], "error": err2,
+        }
+
+    try:
+        import json as _json
+        parsed = _json.loads(models_body)
+    except Exception as e:
+        return {
+            "ok": False, "reachable": True, "url": models_url, "ping_ms": ms,
+            "models": [], "error": f"unparsable response: {e}",
+        }
+
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, list):
+        return {
+            "ok": False, "reachable": True, "url": models_url, "ping_ms": ms,
+            "models": [],
+            "error": "unexpected /v1/models shape (no 'data' list)",
+        }
+    models = [
+        str(m.get("id"))
+        for m in data
+        if isinstance(m, dict) and m.get("id")
+    ]
+    if not models:
+        # _PARTIAL_UP — /health said ok but no model labels exposed.
+        # Rare but possible (server booted without a model arg).
+        return {
+            "ok": False, "reachable": True, "url": models_url, "ping_ms": ms,
+            "models": [],
+            "error": "llama-server reachable but no models loaded yet "
+                     "(cold-start mmap can take 10-30s for large GGUFs)",
+        }
+    return {
+        "ok": True, "reachable": True, "url": models_url, "ping_ms": ms,
+        "models": models, "error": None,
+    }
 
 
 def llamacpp_model_present(tags: dict[str, Any], model: str) -> bool:

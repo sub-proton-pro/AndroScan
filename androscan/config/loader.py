@@ -99,10 +99,24 @@ CLOUD_PROVIDERS = LLM_PROVIDERS["cloud"]
 # without disturbing keys it doesn't recognise.
 #
 # Each entry: ``field -> (yaml_section, yaml_key, env_var | None)``.
+#
+# DEC-028 (LCP.6 follow-up, 2026-05-06) — the ``yaml_section`` value is a
+# logical UI label (used by the Settings tab's section grouping); the
+# **on-disk** YAML path is computed via :func:`_yaml_path_for_section` so
+# the LLM-related sections (``ollama`` / ``llamacpp`` / ``cloud``) all
+# nest under a top-level ``llm:`` parent, mirroring the
+# :data:`LLM_PROVIDERS` registry shape introduced at LCP.1. The flat
+# section labels here remain stable so the frontend's grouping logic
+# (``data.field_map[field].section``) doesn't need to know about the
+# new YAML structure.
 CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     "ollama_base_url":             ("ollama",   "base_url",          "ANDROSCAN_OLLAMA_URL"),
     "ollama_timeout_sec":          ("ollama",   "timeout_sec",       "ANDROSCAN_OLLAMA_TIMEOUT"),
-    "ollama_model":                ("ollama",   "model",             "ANDROSCAN_OLLAMA_MODEL"),
+    # DEC-028 — YAML key renamed ``model`` -> ``default_model`` to match
+    # the operator-facing label "default chat / analysis model" in
+    # Settings UI; flat field name preserved for backwards-compat with
+    # in-process consumers.
+    "ollama_model":                ("ollama",   "default_model",     "ANDROSCAN_OLLAMA_MODEL"),
     "ollama_temperature":          ("ollama",   "temperature",        None),
     "ollama_num_predict":          ("ollama",   "num_predict",        None),
     # Phase 11 sub-step 11.6 / DEC-025 — Ollama context window.
@@ -110,12 +124,15 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     # inter-procedural slicer's ~2× input prompt growth.
     "ollama_num_ctx":              ("ollama",   "num_ctx",           "ANDROSCAN_OLLAMA_NUM_CTX"),
     "llm_provider":                ("llm",      "provider",          "ANDROSCAN_LLM_PROVIDER"),
-    "cloud_model":                 ("llm",      "cloud_model",       "ANDROSCAN_CLOUD_MODEL"),
-    "cloud_api_key":               ("llm",      "cloud_api_key",      None),
-    "cloud_temperature":           ("llm",      "cloud_temperature",  None),
+    # DEC-028 — cloud knobs moved under their own ``cloud`` sub-section
+    # (was flat under ``llm.cloud_*``); on-disk YAML path is
+    # ``llm.cloud.<key>`` per :func:`_yaml_path_for_section`.
+    "cloud_model":                 ("cloud",    "model",             "ANDROSCAN_CLOUD_MODEL"),
+    "cloud_api_key":               ("cloud",    "api_key",            None),
+    "cloud_temperature":           ("cloud",    "temperature",        None),
     # LCP.4 / DEC-027 — llama.cpp ``llama-server`` knobs.
     "llamacpp_base_url":           ("llamacpp", "base_url",          "ANDROSCAN_LLAMACPP_BASE_URL"),
-    "llamacpp_model":              ("llamacpp", "model",             "ANDROSCAN_LLAMACPP_MODEL"),
+    "llamacpp_model":              ("llamacpp", "default_model",     "ANDROSCAN_LLAMACPP_MODEL"),
     "llamacpp_max_tokens":         ("llamacpp", "max_tokens",        "ANDROSCAN_LLAMACPP_MAX_TOKENS"),
     # LCP.6 / DEC-027 — single kill-switch for the local-provider
     # grammar / JSON-schema enforcement (Ollama ``format: <schema>`` +
@@ -206,6 +223,60 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
 })
 
 
+# DEC-028 (LCP.6 follow-up, 2026-05-06) — single seam where the flat
+# UI-grouping section labels in :data:`CONFIG_FIELD_MAP` translate to
+# their nested on-disk YAML path. The LLM-related sections nest under
+# ``llm:`` so the YAML mirrors :data:`LLM_PROVIDERS` (LCP.1) and the
+# Settings UI's "Local (Ollama) / Local (llama.cpp) / Cloud" radio.
+# Everything else stays flat.
+_LLM_NESTED_SECTIONS = frozenset({"ollama", "llamacpp", "cloud"})
+
+
+def _yaml_path_for_section(section: str) -> list[str]:
+    """Return the on-disk YAML path for a :data:`CONFIG_FIELD_MAP` section label.
+
+    DEC-028 — ``ollama`` / ``llamacpp`` / ``cloud`` all live under the
+    top-level ``llm:`` parent; the rest are flat top-level keys. Used by
+    :func:`_merge_from_yaml`, :func:`effective_sources`, and
+    :func:`dump_to_yaml` so the YAML restructure is centralised in one
+    helper rather than scattered across the four call sites.
+    """
+    if section in _LLM_NESTED_SECTIONS:
+        return ["llm", section]
+    return [section]
+
+
+def _walk_yaml_path(yaml_data: dict[str, Any], path: list[str]) -> dict[str, Any]:
+    """Walk ``path`` into ``yaml_data`` and return the leaf dict (or empty).
+
+    Returns an empty dict on any missing / non-dict intermediate so
+    callers can do ``.get(key)`` without checking shape at every step.
+    """
+    cur: Any = yaml_data
+    for part in path:
+        if not isinstance(cur, dict):
+            return {}
+        cur = cur.get(part)
+        if cur is None:
+            return {}
+    return cur if isinstance(cur, dict) else {}
+
+
+def _ensure_yaml_path(yaml_data: dict[str, Any], path: list[str]) -> dict[str, Any]:
+    """Walk ``path`` into ``yaml_data``, creating empty dicts as needed.
+
+    Used by :func:`dump_to_yaml` to create the nested ``llm.ollama`` /
+    ``llm.llamacpp`` / ``llm.cloud`` parents on a first save.
+    """
+    cur = yaml_data
+    for part in path:
+        sub = cur.get(part)
+        if not isinstance(sub, dict):
+            sub = {}
+            cur[part] = sub
+        cur = sub
+    return cur
+
 
 @dataclass(frozen=True)
 class Config:
@@ -265,7 +336,13 @@ class Config:
         return cls(
             ollama_base_url="http://localhost:11434",
             ollama_timeout_sec=150,
-            ollama_model="qwen3.5:35b",
+            # DEC-028 (2026-05-06) — bumped from ``qwen3.5:35b`` to
+            # ``qwen3.6:27b``. Smaller working set + Q-level fits a
+            # 36 GB M3 unified-memory budget without thrashing while
+            # delivering comparable structured-JSON quality on the
+            # AndroScan workload (per the operator's 2026-05-05 status
+            # share that motivated the LCP track in the first place).
+            ollama_model="qwen3.6:27b",
             ollama_temperature=0.2,
             ollama_num_predict=constants.OLLAMA_NUM_PREDICT_DEFAULT,
             ollama_num_ctx=constants.OLLAMA_NUM_CTX_DEFAULT,
@@ -279,8 +356,18 @@ class Config:
             # duplicate string literal to drift between layers). Default
             # max_tokens=8192 is conservative — operators with larger
             # ``--ctx-size`` should bump it via Settings UI / YAML.
+            #
+            # DEC-028 — default ``llamacpp_model`` label flipped from
+            # empty string to ``unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL``,
+            # the operator's known-good GGUF spec (matches the ``-hf``
+            # arg in ``global_config.yaml``'s recommended startup line).
+            # ``llama-server`` ignores the request-body ``model`` field
+            # so this is purely a cosmetic label that surfaces in
+            # ``Settings → Status`` + run logs; it has zero effect on
+            # which GGUF actually serves traffic (whatever ``-hf`` /
+            # ``-m`` the operator passed at server startup wins).
             llamacpp_base_url=LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"],
-            llamacpp_model="",
+            llamacpp_model="unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL",
             llamacpp_max_tokens=8192,
             # LCP.6 / DEC-027 — ships ON by default (Q2 (a) committed
             # follow-up). Operators flip false on the rare runtime
@@ -424,39 +511,58 @@ def _safe_float(value: Any, default: float, name: str) -> float:
 
 
 def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
-    """Extract flat keys from nested YAML for Config. Uses constants as defaults."""
+    """Extract flat keys from nested YAML for Config. Uses constants as defaults.
+
+    DEC-028 (2026-05-06) — LLM-related sections (``ollama`` /
+    ``llamacpp`` / ``cloud``) all read from under a top-level ``llm:``
+    parent. The ``Config`` field-name shape (``ollama_*`` / ``cloud_*`` /
+    ``llamacpp_*``) is unchanged so every consumer downstream of the
+    loader stays oblivious to the YAML restructure.
+    """
     out: dict[str, Any] = {}
-    ollama = config_dict.get("ollama") or {}
     llm = config_dict.get("llm") or {}
+    # DEC-028 — Ollama / llama.cpp / cloud sub-sections all nest under
+    # ``llm:`` so the shape mirrors :data:`LLM_PROVIDERS` (LCP.1).
+    ollama = (llm.get("ollama") or {}) if isinstance(llm, dict) else {}
+    llamacpp = (llm.get("llamacpp") or {}) if isinstance(llm, dict) else {}
+    cloud = (llm.get("cloud") or {}) if isinstance(llm, dict) else {}
     paths = config_dict.get("paths") or {}
     workflow = config_dict.get("workflow") or {}
     output = config_dict.get("output") or {}
     out["ollama_base_url"] = (ollama.get("base_url") or "").strip().rstrip("/") or "http://localhost:11434"
-    out["ollama_timeout_sec"] = _safe_int(ollama.get("timeout_sec"), 150, "ollama.timeout_sec")
-    out["ollama_model"] = ollama.get("model") or "qwen3.5:35b"
-    out["ollama_temperature"] = _safe_float(ollama.get("temperature"), 0.2, "ollama.temperature")
-    out["ollama_num_predict"] = _safe_int(ollama.get("num_predict"), constants.OLLAMA_NUM_PREDICT_DEFAULT, "ollama.num_predict")
-    out["ollama_num_ctx"] = _safe_int(ollama.get("num_ctx"), constants.OLLAMA_NUM_CTX_DEFAULT, "ollama.num_ctx")
-    out["llm_provider"] = (llm.get("provider") or "ollama").strip().lower()
-    out["cloud_model"] = (llm.get("cloud_model") or "").strip()
-    out["cloud_api_key"] = (llm.get("cloud_api_key") or "").strip()
-    out["cloud_temperature"] = _safe_float(llm.get("cloud_temperature"), 0.2, "llm.cloud_temperature")
+    out["ollama_timeout_sec"] = _safe_int(ollama.get("timeout_sec"), 150, "llm.ollama.timeout_sec")
+    # DEC-028 — YAML key ``default_model`` (was ``model``).
+    out["ollama_model"] = ollama.get("default_model") or "qwen3.6:27b"
+    out["ollama_temperature"] = _safe_float(ollama.get("temperature"), 0.2, "llm.ollama.temperature")
+    out["ollama_num_predict"] = _safe_int(ollama.get("num_predict"), constants.OLLAMA_NUM_PREDICT_DEFAULT, "llm.ollama.num_predict")
+    out["ollama_num_ctx"] = _safe_int(ollama.get("num_ctx"), constants.OLLAMA_NUM_CTX_DEFAULT, "llm.ollama.num_ctx")
+    out["llm_provider"] = (llm.get("provider") or "ollama").strip().lower() if isinstance(llm, dict) else "ollama"
+    # DEC-028 — cloud knobs read from ``llm.cloud.*`` (was the flat
+    # ``llm.cloud_*``). Defaults preserve pre-DEC-028 semantics on a
+    # missing section.
+    out["cloud_model"] = (cloud.get("model") or "").strip()
+    out["cloud_api_key"] = (cloud.get("api_key") or "").strip()
+    out["cloud_temperature"] = _safe_float(cloud.get("temperature"), 0.2, "llm.cloud.temperature")
     # LCP.4 / DEC-027 — llama.cpp ``llama-server`` knobs.
-    llamacpp = config_dict.get("llamacpp") or {}
     llamacpp_default_url = LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"]
     out["llamacpp_base_url"] = (
         (llamacpp.get("base_url") or "").strip().rstrip("/") or llamacpp_default_url
     )
-    out["llamacpp_model"] = (llamacpp.get("model") or "").strip()
+    # DEC-028 — YAML key ``default_model`` (was ``model``); default
+    # value flipped from empty string to the operator's known-good
+    # Unsloth Gemma-4 GGUF spec, matching :meth:`Config.default`.
+    out["llamacpp_model"] = (
+        llamacpp.get("default_model") or "unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL"
+    ).strip()
     out["llamacpp_max_tokens"] = _safe_int(
-        llamacpp.get("max_tokens"), 8192, "llamacpp.max_tokens",
+        llamacpp.get("max_tokens"), 8192, "llm.llamacpp.max_tokens",
     )
     # LCP.6 / DEC-027 — local grammar / JSON-schema enforcement kill-switch.
     # Lives under ``llm`` (cross-provider knob) rather than under one of
     # the per-provider sections. Default True; YAML missing the key falls
     # through to the True default. Accepts the standard YAML truthy values
     # (true / false / yes / no / 1 / 0).
-    raw_grammar = llm.get("local_grammar_enabled")
+    raw_grammar = llm.get("local_grammar_enabled") if isinstance(llm, dict) else None
     if raw_grammar is None:
         out["local_grammar_enabled"] = True
     elif isinstance(raw_grammar, bool):
@@ -712,21 +818,33 @@ def config_as_flat_dict(config: Config) -> dict[str, Any]:
     return dataclasses.asdict(config)
 
 
-def global_view_from_config(config: Config) -> dict[str, dict[str, Any]]:
+def global_view_from_config(config: Config) -> dict[str, Any]:
     """Return the YAML-shaped nested view of ``config``.
 
-    Mirrors :func:`_merge_from_yaml` in reverse: every flat field is grouped
-    by the section it lives under in ``global_config.yaml``. Used by the
-    Settings tab and by :func:`androscan.web.per_app_settings.effective_settings`
-    to overlay per-app overrides without each consumer hand-rolling the
-    section grouping.
+    Mirrors :func:`_merge_from_yaml` in reverse: every flat field is
+    grouped by the section it lives under in ``global_config.yaml``.
+    Used by the Settings tab and by
+    :func:`androscan.web.per_app_settings.effective_settings` to overlay
+    per-app overrides without each consumer hand-rolling the section
+    grouping.
+
+    DEC-028 (2026-05-06) — return shape is now a *deep* dict because the
+    LLM-related sub-sections (``ollama`` / ``llamacpp`` / ``cloud``) nest
+    under a top-level ``llm:`` parent. The non-LLM sections stay flat at
+    the root, preserving the existing 2-level shape for ``rag`` /
+    ``trace`` / ``web`` / etc. so the per-app overlay code in
+    :mod:`androscan.web.per_app_settings` keeps working unchanged for
+    those.
     """
     flat = config_as_flat_dict(config)
-    out: dict[str, dict[str, Any]] = {}
+    out: dict[str, Any] = {}
     for field, (section, key, _env) in CONFIG_FIELD_MAP.items():
         if field not in flat:
             continue
-        out.setdefault(section, {})[key] = flat[field]
+        # Walk / create the on-disk YAML path; for LLM-nested sections
+        # this drops one level under ``llm:``.
+        sec = _ensure_yaml_path(out, _yaml_path_for_section(section))
+        sec[key] = flat[field]
     # Convenience mirrors so per-app sections can inherit from a clean
     # root even when they have no equivalent global key (e.g. inspect).
     out.setdefault("inspect", {})
@@ -744,6 +862,11 @@ def effective_sources(
     The Settings UI uses this to disable inputs whose value comes from an
     environment variable (since saving the YAML wouldn't take effect) and
     to badge "default" entries the user hasn't customised.
+
+    DEC-028 — walks the on-disk YAML path via
+    :func:`_yaml_path_for_section` so the LLM-related sections nested
+    under ``llm:`` resolve correctly without each consumer re-deriving
+    the new structure.
     """
     yaml_data: dict[str, Any] = {}
     if config_path and config_path.is_file():
@@ -753,8 +876,8 @@ def effective_sources(
         if env_var and os.environ.get(env_var):
             sources[field] = "env"
             continue
-        sec = yaml_data.get(section) or {}
-        if isinstance(sec, dict) and key in sec and sec[key] is not None and sec[key] != "":
+        sec = _walk_yaml_path(yaml_data, _yaml_path_for_section(section))
+        if key in sec and sec[key] is not None and sec[key] != "":
             sources[field] = "yaml"
             continue
         sources[field] = "default"
@@ -792,7 +915,9 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
     return Config(
         ollama_base_url=str(flat["ollama_base_url"]).strip().rstrip("/") or "http://localhost:11434",
         ollama_timeout_sec=max(1, int(flat["ollama_timeout_sec"])),
-        ollama_model=str(flat["ollama_model"] or "qwen3.5:35b"),
+        # DEC-028 — default flipped to qwen3.6:27b to fit a 36 GB M3
+        # unified-memory budget; mirrors :meth:`Config.default`.
+        ollama_model=str(flat["ollama_model"] or "qwen3.6:27b"),
         ollama_temperature=float(flat["ollama_temperature"]),
         ollama_num_predict=max(1, int(flat["ollama_num_predict"])),
         ollama_num_ctx=max(1, int(flat["ollama_num_ctx"])),
@@ -912,12 +1037,12 @@ def dump_to_yaml(config_path: Path, partial: dict[str, Any]) -> dict[str, Any]:
         if field not in CONFIG_FIELD_MAP:
             raise ValueError(f"Unknown Config field: {field!r}")
         section, key, _env = CONFIG_FIELD_MAP[field]
-        sec = existing.get(section)
-        if not isinstance(sec, dict):
-            sec = {}
+        # DEC-028 — walk into the (possibly nested) YAML path; creates
+        # ``llm:`` parent + ``ollama:`` / ``llamacpp:`` / ``cloud:`` child
+        # sections on a first-save.
+        sec = _ensure_yaml_path(existing, _yaml_path_for_section(section))
         coerced = coerce_yaml_value(field, value)
         sec[key] = coerced
-        existing[section] = sec
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_name = tempfile.mkstemp(

@@ -1,106 +1,192 @@
 # AndroScan global config. Optional; env vars override these values.
-# Pass path via --config or place at repo root / config/global_config.yaml
+# Pass path via --config or place at repo root / config/global_config.yaml.
+#
+# Section ordering below mirrors operator workflow: pick an LLM provider
+# first (it dominates everything else), then point the tool at the
+# system binaries it needs, then tune the analysis workflow + report
+# rendering, then the local web UI, then the per-feature knobs (RAG /
+# Frida / Behavior Trace).
 
-ollama:
-  base_url: "http://localhost:11434"
-  timeout_sec: 150
-  model: "qwen3.5:35b"
-  temperature: 0.2
-  # Phase 11 sub-step 11.6 / DEC-025 — bumped from 8192 to absorb the
-  # v2 inter-procedural slicer's ~1.5x response payload growth.
-  num_predict: 12288
-  # Phase 11 sub-step 11.6 / DEC-025 — Ollama's default context window
-  # is 8192 tokens; v2's ~2x input prompt growth (deeper PredicateOrigin
-  # chains in the per-anchor closure) can squeeze it. 16384 preserves
-  # headroom; live-reloadable.
-  num_ctx: 16384
+# =============================================================================
+# LLM — local + cloud provider configuration (DEC-028)
+# =============================================================================
+# Activate a provider by setting ``llm.provider`` (or the
+# ``ANDROSCAN_LLM_PROVIDER`` env var):
+#   - "ollama"   → local Ollama daemon          (uses llm.ollama.* knobs)
+#   - "llamacpp" → local llama.cpp llama-server (uses llm.llamacpp.* knobs)
+#   - "openai" | "gemini" | "groq" | "deepseek" | "together" | "mistral"
+#                → cloud (uses llm.cloud.* knobs; API key via env var)
+#
+# All LLM-related knobs live under this single ``llm:`` parent so the
+# YAML structure mirrors :data:`androscan.config.loader.LLM_PROVIDERS`
+# (DEC-027 LCP.1) and the Settings UI's "Local (Ollama) / Local
+# (llama.cpp) / Cloud" radio. DEC-028 (LCP.6 follow-up) consolidated the
+# previously-flat top-level ``ollama:`` / ``llamacpp:`` / commented
+# ``llm:`` sections; if you're upgrading from a pre-DEC-028 config, the
+# loader ONLY reads from this nested shape (hard-break migration — the
+# ``Settings → Global → Reset to defaults`` button writes the new shape
+# in one click).
+llm:
+  provider: "ollama"
 
-# LCP.4 / DEC-027 — llama.cpp ``llama-server`` local LLM provider.
-# Activate by setting ``llm.provider`` (or the ``ANDROSCAN_LLM_PROVIDER``
-# env var) to ``"llamacpp"``. Operator must run ``llama-server`` on the
-# configured port (default 8033 — chosen to avoid the upstream default
-# 8080 collision class). Recommended startup line:
-#   llama-server -c 16384 -ngl 99 -fa --port 8033 \
-#                --host 127.0.0.1 --jinja -m <path-to-gguf>
-# - ``base_url`` includes the OpenAI-compat ``/v1`` suffix.
-# - ``model``     is a free-text label (llama-server ignores the
-#                  request-body ``model`` field; the actual GGUF is
-#                  loaded at server startup). Useful for log readability.
-# - ``max_tokens`` is the OpenAI-compat ``/v1/chat/completions`` cap.
-#                  Mirrors the role of ``ollama.num_predict`` for the
-#                  llama.cpp dispatch path. Bump this above 8192 if
-#                  your server-side ``--ctx-size`` budget allows.
-llamacpp:
-  base_url: "http://127.0.0.1:8033/v1"
-  model: ""
-  max_tokens: 8192
+  # LCP.6 / DEC-027 — local-LLM grammar / JSON-schema enforcement.
+  # Closes ISSUE-016 (JSON-validity drift on aggressive quants like
+  # Q4_K_M / IQ4_XS). When ``true`` (default), AndroScan sends:
+  #   * Ollama  → ``format: <json-schema>``  (requires Ollama >= 0.5.0)
+  #   * llama.cpp → ``grammar: <gbnf>`` on /v1/chat/completions
+  # Cloud providers ignore this knob (their OpenAI-compat
+  # ``response_format`` already enforces validity at the SDK layer).
+  # The LLM client also auto-falls-back per base_url on the first 400
+  # response that mentions schema / grammar, so old runtimes keep
+  # working without operator action; flipping false here is the
+  # kill-switch for cases the auto-fallback can't recover from.
+  local_grammar_enabled: true
 
-# LCP.6 / DEC-027 — local-LLM grammar / JSON-schema enforcement.
-# Closes ISSUE-016 (JSON-validity drift on aggressive quants like Q4_K_M
-# / IQ4_XS). When ``true`` (default), AndroScan sends:
-#   * Ollama  → ``format: <json-schema>``  (requires Ollama >= 0.5.0)
-#   * llama.cpp → ``grammar: <gbnf>`` on /v1/chat/completions
-# Cloud providers ignore this knob (their OpenAI-compat ``response_format``
-# already enforces validity at the SDK layer).
-# The LLM client also auto-falls-back per base_url on the first 400
-# response that mentions schema / grammar, so old runtimes keep working
-# without operator action; flipping false here is the kill-switch for
-# cases the auto-fallback can't recover from.
-# llm:
-#   local_grammar_enabled: true
+  ollama:
+    base_url: "http://localhost:11434"
+    timeout_sec: 150
+    # Default chat / analysis model. Operators bump this to whatever
+    # ``ollama pull <name>`` produced on their machine — see
+    # ``Settings → Status`` to verify the chosen model is loaded.
+    default_model: "qwen3.6:27b"
+    temperature: 0.2
+    # Phase 11 11.6 / DEC-025 — bumped from 8192 to absorb v2 slicer
+    # response payload growth (~1.5×) on deep PredicateOrigin chains.
+    num_predict: 12288
+    # Phase 11 11.6 / DEC-025 — Ollama's default 8192-token context can
+    # squeeze v2's ~2× input prompt growth. Live-reloadable.
+    num_ctx: 16384
 
+  # LCP.4 / DEC-027 — llama.cpp ``llama-server`` local LLM provider.
+  # Recommended startup line:
+  #   llama-server -hf <hf-repo>:<quant> \
+  #                -c 16384 -ngl 99 -fa on \
+  #                --port 8033 --host 127.0.0.1 \
+  #                --jinja --no-webui --cache-reuse 256
+  #
+  # Flag rationale:
+  #   * -hf / -m       — model source (see "Picking a model" below)
+  #   * -c 16384       — context size (matches llm.ollama.num_ctx)
+  #   * -ngl 99        — offload all layers to Metal on M-series
+  #   * -fa on         — flash attention (recent builds require an
+  #                      explicit on/off/auto value; bare ``-fa`` errors
+  #                      out because the parser tries to consume the
+  #                      next arg as the flash-attn value)
+  #   * --port 8033    — non-default to avoid llama.cpp's upstream
+  #                      8080 collision class
+  #   * --host 127.0.0.1 — loopback only (DEC-006 / DEC-021 lineage)
+  #   * --jinja        — required for Qwen3-family chat templates
+  #   * --no-webui     — disable llama-server's bundled web UI
+  #                      (AndroScan doesn't use it; reduces surface)
+  #   * --cache-reuse 256 — KV-cache prefix reuse (free perf win on
+  #                         AndroScan's stable system-prompt prefix)
+  #
+  # Picking a model — three orthogonal sources (see DEC-028):
+  #   1. HuggingFace cache  → llama-server -cl                lists
+  #      cached models; pass via ``-hf <repo>:<quant>``.
+  #   2. HuggingFace Hub    → ``-hf <repo>:<quant>`` downloads on
+  #      first run. Private repos require ``HF_TOKEN`` in env.
+  #   3. Local filesystem   → ``-m /absolute/path/to/foo.gguf``.
+  # The ``default_model`` knob below is a free-text label that
+  # surfaces in ``Settings → Status`` and run logs; ``llama-server``
+  # ignores the request-body ``model`` field entirely (it serves
+  # whichever GGUF was loaded at startup), so changing this knob does
+  # NOT change which model is actually used. Keep it in sync with
+  # your ``-hf`` / ``-m`` arg for log readability. A future LCP.7
+  # follow-up will surface a 3-way model picker in Settings UI.
+  #
+  # Per-request grammar enforcement is the right layer (see LCP.6 in
+  # ``docs/DECISIONS.md``); ``llama-server`` also has server-startup
+  # ``--grammar`` / ``--json-schema`` flags but using them would force
+  # the structured-JSON grammar onto chat / prose / report-rendering
+  # paths. Don't move grammar enforcement server-side.
+  llamacpp:
+    base_url: "http://127.0.0.1:8033/v1"
+    default_model: "unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL"
+    # OpenAI-compat ``/v1/chat/completions`` cap. Mirrors the role of
+    # ``llm.ollama.num_predict``. Bump above 8192 if your server-side
+    # ``--ctx-size`` budget allows.
+    max_tokens: 8192
+
+  # Cloud knobs — only consumed when ``llm.provider`` is one of the
+  # cloud vendor names. API key resolution falls through to the
+  # vendor-specific env var (``OPENAI_API_KEY`` / ``GEMINI_API_KEY`` /
+  # ``GROQ_API_KEY`` / ``DEEPSEEK_API_KEY`` / ``TOGETHERAI_API_KEY`` /
+  # ``MISTRAL_API_KEY``) when ``api_key`` is empty.
+  cloud:
+    model: ""
+    api_key: ""
+    temperature: 0.2
+
+# =============================================================================
+# Tool paths
+# =============================================================================
 paths:
   run_folder_root: "apps"
   apktool_cmd: "apktool"
   jadx_cmd: "jadx"
 
+# =============================================================================
+# Analysis workflow
+# =============================================================================
 workflow:
   max_turns: 5
   max_hypotheses_per_report: 10
   per_component_analysis: true
 
+# =============================================================================
+# Report rendering
+# =============================================================================
 output:
   section_rule_char: "─"
   section_rule_length: 60
 
-# Local RE Workbench (Phase 6): bind loopback by default; see docs/SAFETY_AND_SECURITY.md
+# =============================================================================
+# Local RE Workbench (Phase 6) — bind loopback by default
+# See ``docs/SAFETY_AND_SECURITY.md``
+# =============================================================================
 web:
   host: "127.0.0.1"
   port: 8420
   screencap_interval_ms: 500
 
-# Lane-1 RAG over decompiled sources (Phase 6 step 3).
-# Provider can be: fastembed (default, local ONNX) | ollama (re-uses base_url above)
-# Model: leave empty for the provider's recommended default
-#   fastembed -> BAAI/bge-small-en-v1.5
-#   ollama    -> nomic-embed-text  (run: ollama pull nomic-embed-text)
+# =============================================================================
+# Lane-1 RAG over decompiled sources (Phase 6 step 3)
+# =============================================================================
+# embed_provider: "fastembed" (default, local ONNX) | "ollama"
+# (re-uses ``llm.ollama.base_url``).
+# embed_model: leave empty for the provider's recommended default —
+#   fastembed → BAAI/bge-small-en-v1.5
+#   ollama    → nomic-embed-text  (run: ollama pull nomic-embed-text)
 rag:
   embed_provider: "fastembed"
   embed_model: ""
   top_k_default: 8
 
-# Hook Lab dynamic instrumentation (Phase 6 step 4 / DEC-023).
-# trace_ring_buffer_size caps the in-memory live-trace buffer per Frida session.
-# Persistent traces will land at apps/<app_id>/<run_ts>/frida/<session>.jsonl
-# (sub-step 4.5). Min clamp = 100 events.
+# =============================================================================
+# Hook Lab dynamic instrumentation (Phase 6 step 4 / DEC-023)
+# =============================================================================
+# trace_ring_buffer_size caps the in-memory live-trace buffer per
+# Frida session (min clamp = 100 events). Persistent traces land at
+# ``apps/<app_id>/<run_ts>/frida/<session>.jsonl``.
 frida:
   trace_ring_buffer_size: 5000
 
-# Behavior Trace v1 — Lab tab gate-identification + bypass-planning mode (Phase 10 / DEC-024).
-# bypass_risk_max: maximum risk level the planner will emit into the default
-# bypass-plan list. One of "low" | "medium" | "high"; plans whose risk exceeds
-# this threshold are surfaced behind an "Advanced" expander in the UI rather
-# than mixed with the defaults. Invalid values fail-soft to "medium".
-# max_hops_default: closure depth used by trace_behavior when the operator
-# (or a calling skill) doesn't supply an explicit hops arg. Higher values
-# expand the gate pool but cost LLM tokens + per-method static analysis.
-# max_hops_hard_cap: absolute ceiling on closure depth — even an explicit
-# hops arg is clamped to this value. Bounds the worst-case per-anchor cost.
-# max_slice_depth: Phase 11 sub-step 11.6 / DEC-025 — bounded inter-
-# procedural slicer descent depth. Per-decision; the v2 slicer descends
-# past method-call / field-read terminals up to this many hops. Hard
-# cap of 4 enforced in slicing._DescentBudget.fresh() regardless of
-# the YAML value. Live-reloadable.
+# =============================================================================
+# Behavior Trace (Phase 10 / DEC-024 + Phase 11 v2 / DEC-025)
+# =============================================================================
+# bypass_risk_max:   "low" | "medium" | "high"; plans above this
+#                    surface behind an "Advanced" expander (invalid
+#                    → fail-soft "medium").
+# max_hops_default:  closure depth used when the operator/skill
+#                    omits an explicit hops arg. Higher = larger
+#                    gate pool, more LLM tokens.
+# max_hops_hard_cap: absolute ceiling on closure depth (clamps
+#                    explicit hops).
+# max_slice_depth:   Phase 11 11.6 / DEC-025 — bounded inter-
+#                    procedural slicer descent depth. Hard cap of 4
+#                    enforced in ``slicing._DescentBudget`` regardless
+#                    of YAML value. Live-reloadable.
 trace:
   bypass_risk_max: "medium"
   max_hops_default: 3

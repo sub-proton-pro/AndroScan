@@ -362,7 +362,9 @@ function FormGlobal({
 
   // LCP.4 — sections owned by the LlmProviderRadio block. The
   // auto-grouper below skips these so they render exactly once.
-  const LLM_OWNED_SECTIONS = new Set(["ollama", "llamacpp", "llm"]);
+  // DEC-028 — added "cloud" because cloud_* fields now group under
+  // their own "cloud" section label (was filtered out of "llm").
+  const LLM_OWNED_SECTIONS = new Set(["ollama", "llamacpp", "llm", "cloud"]);
 
   return (
     <div className="settings-form">
@@ -433,17 +435,16 @@ function LlmProviderRadio({
     // else current value already a cloud vendor — leave the dropdown alone.
   };
 
-  // Filter the auto-grouped llm section's fields down to the
-  // cloud_* ones (cloud_model / cloud_api_key / cloud_temperature).
-  // The bare ``llm_provider`` field is intentionally not rendered
-  // anywhere — the radio + dropdown is the only chooser.
-  // LCP.6 — ``local_grammar_enabled`` lives under the ``llm`` YAML
+  // DEC-028 — cloud_* fields now group under their own "cloud"
+  // section label (was a flat ``llm.cloud_*`` shape, now nests under
+  // ``llm.cloud:`` per the YAML restructure). The bare ``llm_provider``
+  // field is intentionally not rendered as a row anywhere — the radio
+  // + dropdown is the only chooser.
+  // LCP.6 — ``local_grammar_enabled`` lives under the ``llm`` UI
   // section (cross-provider local knob) but only meaningfully applies
   // to local providers; rendered separately under the Ollama +
   // llama.cpp subsections, never under Cloud.
-  const llmCloudFields = (grouped["llm"] ?? []).filter(
-    (f) => f !== "llm_provider" && f !== "local_grammar_enabled",
-  );
+  const llmCloudFields = grouped["cloud"] ?? [];
   const ollamaFields = grouped["ollama"] ?? [];
   const llamacppFields = grouped["llamacpp"] ?? [];
   const localGrammarField =

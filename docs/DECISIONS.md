@@ -1069,7 +1069,84 @@ Use the following structure for new entries:
     - **Frontend touch was unplanned but trivial.** LCP.6's planning checkpoint didn't anticipate the Settings UI tweak; the auto-grouped `FormGlobal` would have hidden the new `local_grammar_enabled` field under the Cloud subsection (its YAML home is `llm.*`). The fix was ~30 lines of TypeScript splitting the field out of the cloud filter and rendering it under both local subsections — within LCP.0's bundle ceilings.
   - **Operator-visible behaviour change.** Pre-LCP.6: a Q4_K_M Qwen3 instance running through llama.cpp could emit a syntactically-valid JSON object whose `skill_requests[0].skill` contained a typo'd name like `"query_calligraph"` or whose `hypotheses[0].exploitability` was `7` (out of 1-5 range); the parser would fail-soft, the workflow loop would retry, and the operator would see "the LLM is acting weird today" in `run.log`. Post-LCP.6: the model's logits-sampler can ONLY emit one of the 9 registered skill names + integers in 1-5 — typos / off-range values are impossible at the sampling level. Q4_K_M / IQ4_XS regain operator-usability.
   - **No `docs/LLAMACPP.md` per Q5 (C) lock-in.** The README.md's "Local LLM" section + this DEC + the inline doc-blocks in `androscan/llm/grammar.py` collectively cover the operator-side setup story. No standalone doc — the LCP.0 plan's rationale held: a one-page MD would duplicate `llama.cpp/README.md` upstream content or rapidly stale.
-  - **What landed; what didn't:** ✅ GBNF emitter for llama.cpp (per Q2 (a)). ✅ JSON-schema mode for Ollama (per Q2 (a) cross-provider benefit). ✅ Single-commit ship (no 6a/6b split). ✅ `ISSUE-016` closed — moved to Resolved section. ❌ Nothing skipped or deferred — LCP.6 is the **terminal sub-step of the LCP track**. Future LLM-related work that emerges from operator dogfooding will be captured as new issues / new tracks, not as additional LCP.x sub-steps.
+  - **What landed; what didn't:** ✅ GBNF emitter for llama.cpp (per Q2 (a)). ✅ JSON-schema mode for Ollama (per Q2 (a) cross-provider benefit). ✅ Single-commit ship (no 6a/6b split). ✅ `ISSUE-016` closed — moved to Resolved section. ❌ Nothing skipped or deferred — LCP.6 was the **terminal sub-step of the LCP track as originally scoped**. Subsequent operator dogfooding produced two follow-ups: a YAML-schema cleanup commit (DEC-028) and an LCP.7 model-sourcing UX sub-step opened separately.
+
+---
+
+### DEC-028: LCP follow-up — `global_config.yaml` restructure (consolidate LLM config under `llm:`, rename `model` → `default_model`, hard-break migration)
+
+- status: **Active** (landed 2026-05-06, post-LCP.6)
+- context:
+
+  Operator dogfooding the day after LCP.6 landed produced three orthogonal pieces of feedback that bundled cleanly into a single ship vehicle:
+
+  1. **`global_config.yaml` had grown disjointed.** Three top-level LLM-related sections (`ollama:`, `llamacpp:`, the implicit `llm:` parent for `provider` / `cloud_*` / `local_grammar_enabled`) lived as siblings of each other and of unrelated subsystems (`paths:`, `workflow:`, `output:`, `web:`, `rag:`, `frida:`, `trace:`). The sibling-fanout violated the conceptual unity introduced by LCP.1's `LLM_PROVIDERS` registry — operators reading the YAML end-to-end couldn't see "all the LLM knobs are this nest" at a glance. Operator quote: "looks disjointed and all over the place."
+  2. **`model:` key was ambiguous.** Both `ollama.model` and `llamacpp.model` carried the operator-facing meaning "the default chat / analysis model used unless a per-app override fires." The bare `model:` label didn't communicate the "default" semantics, which mattered more once Phase 8 per-app `chat.model_override` made overriding routine. Operator request: rename `model` → `default_model` in both provider sections.
+  3. **The `llama-server` startup line in `global_config.yaml` and `README.md` was wrong.** The recommended invocation included a bare `-fa` flag, but recent `llama-server` builds require an explicit `on` / `off` / `auto` value for `-fa`; bare `-fa` causes the parser to consume the next CLI arg (`--port`) as the flash-attn value and crash with `unknown value for --flash-attn: '--port'`. Operator hit this verbatim and shared a screenshot.
+
+  Bundling all three into a single commit was the right call because the YAML restructure is a hard-break migration (the loader stops reading the old shape), and shipping the rename + `-fa on` correctness fix in the same commit means operators only restart their workflow once.
+
+- decision:
+
+  Three structural changes plus three "cheap wins" the operator dropped in flight:
+
+  - **Y1. Consolidate LLM config under a single `llm:` parent (Option B in operator triage; the alternative was a flat sibling-fanout retained as-is).** Final shape:
+    ```yaml
+    llm:
+      provider: "ollama"
+      local_grammar_enabled: true
+      ollama:
+        base_url: "http://localhost:11434"
+        default_model: "qwen3.6:27b"
+        ...
+      llamacpp:
+        base_url: "http://127.0.0.1:8033/v1"
+        default_model: "unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL"
+        ...
+      cloud:
+        model: ""
+        api_key: ""
+        temperature: 0.2
+    ```
+    Mirrors the LCP.1 `LLM_PROVIDERS` registry shape (`local.{ollama, llamacpp}` + `cloud.{...}`); operators now have a single visual anchor for all LLM-related knobs.
+
+  - **Y2. Rename YAML keys `model` → `default_model` in both `llm.ollama:` and `llm.llamacpp:` sub-sections.** Flat `Config.ollama_model` / `Config.llamacpp_model` field names preserved unchanged (no churn in the in-process consumer surface — every analysis / chat / pipeline call continues to read `cfg.ollama_model` regardless of the YAML key it came from). Cloud key `cloud_model` similarly maps to `llm.cloud.model` on disk.
+
+  - **Y3. Hard-break migration (no backwards-compat read for the pre-DEC-028 flat shape).** Operator preference, ratified explicitly: "Agreed to all you recommendations." Justified by single-operator context — there's no fleet of installs to coordinate, and the Settings UI's "Reset to defaults" path writes the new shape in one click. A backwards-compat reader would have doubled `_merge_from_yaml`'s surface area for ~zero ongoing benefit. Operators upgrading mid-LCP simply hit Reset once or hand-edit the YAML.
+
+  - **Y4. Default model bumps:** `Config.default().ollama_model` flipped from `qwen3.5:35b` → `qwen3.6:27b` (smaller working set fits a 36 GB M3 unified-memory budget without thrashing — same hardware constraint that motivated the LCP track in the first place). `Config.default().llamacpp_model` flipped from empty string → `unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL` (the operator's known-good GGUF spec; matches the recommended `-hf` arg in the new YAML's startup line). Both are pure-default changes — the YAML / env override paths still take precedence per the established loader posture.
+
+  - **Y5. `llama-server` recommended invocation update (correctness + cheap perf wins, both in `global_config.yaml` doc-comments and `README.md`):**
+    - `-fa` → `-fa on` (correctness fix — the operator-reported crash).
+    - `+ --no-webui` (disable llama-server's bundled web UI; AndroScan doesn't use it; reduces process surface).
+    - `+ --cache-reuse 256` (KV-cache prefix reuse — free perf win on AndroScan's stable system-prompt prefix; AndroScan re-sends the same skill-catalog system message on every turn).
+
+  - **Y6. `probe_llamacpp` switched from `GET /v1/models` to a two-step probe — `GET {server}/health` for liveness, then `GET {base}/models` for the model list on success.** `/health` is purpose-built for liveness, returns smaller responses, and explicitly surfaces the "loading model" cold-start state (`{"status": "loading model"}`, HTTP 503) which the previous `/v1/models`-only probe could only infer from an empty `data: []` list. The Settings UI's three-state classification (`_DOWN` / `_PARTIAL_UP` / `_UP`) gets cleaner inputs.
+
+  - **LCP.7 deferred (operator agreed).** A 3-way model-sourcing UX in Settings UI (HuggingFace cache via `llama-server -cl` / HuggingFace Hub via `-hf <repo>:<quant>` — needs `HF_TOKEN` for private repos / Local filesystem via `-m <path>`) is a meaningful LOC investment that doesn't fit DEC-028's hygiene-and-correctness scope. Opened as LCP.7 in `TASKS.md` as a planning-checkpoint-pending stub; HF Hub auth dependency noted operator-side.
+
+- alternatives considered:
+
+  - **Alt-A: keep flat siblings but tighten doc-comments.** Rejected — operator explicitly asked for restructure; doc-only fix would have left the underlying disjoint shape that motivated the request.
+  - **Alt-B: nest under `llm:` AND keep a backwards-compat reader for the old flat shape.** Rejected — single-operator context means the migration cost is one click + one line edit; the doubled surface area in `_merge_from_yaml` (and the parallel double-sourced behaviour in `effective_sources` / `dump_to_yaml`) outweighs the benefit. Hard-break is simpler and stays simpler over time.
+  - **Alt-C: rename `model` → `default_model` only in operator-facing UX (Settings UI label) without changing the YAML key.** Rejected — keeps the on-disk YAML out of sync with the UI label, and operators frequently hand-edit the YAML; the rename has to land at the same time on both surfaces or it's a pointless half-step.
+  - **Alt-D: keep `-fa` (no value) in the recommended startup line and document the version-pinning requirement.** Rejected — the version-pinning would silently rot as `llama.cpp` upstream evolves; explicit `-fa on` is correct against the current parser and forward-compatible.
+
+- consequences:
+
+  - **Hard-break for any pre-DEC-028 `global_config.yaml` on disk.** Operators upgrading past commit `<hash>` hit either a "Reset to defaults" click or a one-paragraph hand-edit (the rename is mechanical: `ollama:` → `llm.ollama:` + `model:` → `default_model:`; same for `llamacpp:` and `cloud_*`). Acceptable in the single-operator context; would be a real migration cost in a fleet deployment.
+  - **`CONFIG_FIELD_MAP` `section` field is now a logical UI label, not a YAML path.** A new helper `_yaml_path_for_section()` translates the flat label to the on-disk nested path. The Settings UI's grouping logic (`data.field_map[field].section`) stays oblivious to the YAML shape change — `meta.section === "ollama"` still works for the Ollama subsection.
+  - **`global_view_from_config` return shape widened to a deep dict.** The frontend `GlobalSettingsResponse.global` type widened from `Record<string, Record<string, unknown>>` to `Record<string, unknown>` to accommodate the nested `llm.ollama` / `llm.llamacpp` / `llm.cloud` sub-sections. Form-mode rendering doesn't read from this field (it uses `flat` / `field_map`), so the type widening is cosmetic; the DiagnosticsPanel still JSON-stringifies the full shape unchanged.
+  - **`probe_llamacpp` now makes two HTTP calls on the happy path (`/health` then `/v1/models`).** Both are loopback, sub-millisecond; no operator-visible latency regression. The probe's URL field still reports the `/v1/models` endpoint so the status-card "open in browser" link stays useful.
+  - **Test surface impact: ~20 fixture rewrites + 2 new probe tests + 1 new default-value assertion.** All landed inside the same atomic commit. Total test count: 1093 (was 1092 pre-DEC-028; +1 net because the new partial-up `/health` loading test added a state the old single-call probe couldn't distinguish).
+  - **`ISSUE-016` reference in `README.md` updated** — was "wait for the LCP.6 GBNF grammar enforcement follow-up"; now references the resolved state with `llm.local_grammar_enabled: false` as the kill-switch for the rare runtime that doesn't honour grammars.
+
+- as-built notes (post-ratification, single-commit ship):
+
+  - **Bundle delta: JS effectively unchanged** (within rounding; the Settings UI changes were ~10 LOC of TypeScript that don't introduce new components). CSS unchanged.
+  - **Test count: 1092 → 1093** (+1 net; +2 new probe tests for the `/health` loading state and the `/health`-ok-but-`/v1/models`-empty edge case; -1 because the previous `_partial_up` test split into the two new ones; +1 for the new default-model assertion in `TestLlamacppModel`).
+  - **Frontend touch trivial.** `LLM_OWNED_SECTIONS` set extended with `"cloud"`; `LlmProviderRadio`'s `llmCloudFields` resolution flipped from filtering `grouped["llm"]` to reading `grouped["cloud"]` directly. The `GlobalSettingsResponse.global` type widened. `tsc --noEmit` clean.
+  - **No deviation from the agreed scope.** Every Y1-Y6 lock-in landed exactly as ratified above; LCP.7 stays an opened-but-unplanned sub-step in `TASKS.md`.
 
 ---
 

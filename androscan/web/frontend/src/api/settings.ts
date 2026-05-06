@@ -34,8 +34,17 @@ export type GlobalSettingsResponse = {
   ts: number;
   config_path: string;
   config_path_exists: boolean;
-  /** YAML-shaped (section -> {key: value}). Mirrors ``global_config.yaml``. */
-  global: Record<string, Record<string, unknown>>;
+  /**
+   * YAML-shaped view, mirrors ``global_config.yaml`` on disk. DEC-028
+   * (LCP.6 follow-up, 2026-05-06) — the LLM-related sub-sections
+   * (``ollama`` / ``llamacpp`` / ``cloud``) nest under a top-level
+   * ``llm:`` parent, so this field is now a deep dict (was a 2-level
+   * ``Record<string, Record<string, unknown>>``). Form-mode rendering
+   * doesn't read from here — it uses ``flat`` / ``field_map`` instead —
+   * so the type is widened to ``unknown`` rather than re-derived
+   * structurally.
+   */
+  global: Record<string, unknown>;
   /** Flat ``Config`` field map. */
   flat: Record<string, unknown>;
   /** Raw text of ``global_config.yaml`` (empty string if missing). */
@@ -58,8 +67,12 @@ export type AppSettingsResponse = {
   per_app: Record<string, unknown>;
   /** Merged effective view (per_app overlaid on global_view). */
   effective: EffectiveSettings;
-  /** Snapshot of the global view used in the merge. */
-  global_view: Record<string, Record<string, unknown>>;
+  /**
+   * Snapshot of the global view used in the merge. DEC-028 — widened
+   * to a deep dict to accommodate the nested ``llm.ollama`` /
+   * ``llm.llamacpp`` / ``llm.cloud`` sub-sections.
+   */
+  global_view: Record<string, unknown>;
 };
 
 export type WriteResult<T> =

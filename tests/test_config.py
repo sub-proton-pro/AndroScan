@@ -134,7 +134,7 @@ class TestOllamaNumCtx:
     def test_parses_from_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"ollama": {"num_ctx": 32768}}),
+            yaml.safe_dump({"llm": {"ollama": {"num_ctx": 32768}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -145,7 +145,7 @@ class TestOllamaNumCtx:
     ) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"ollama": {"num_ctx": 8192}}),
+            yaml.safe_dump({"llm": {"ollama": {"num_ctx": 8192}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -160,7 +160,7 @@ class TestOllamaNumCtx:
     ) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"ollama": {"num_ctx": 24576}}),
+            yaml.safe_dump({"llm": {"ollama": {"num_ctx": 24576}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -427,7 +427,7 @@ class TestLlamacppBaseUrl:
     def test_parses_from_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"llamacpp": {"base_url": "http://192.168.1.50:8033/v1"}}),
+            yaml.safe_dump({"llm": {"llamacpp": {"base_url": "http://192.168.1.50:8033/v1"}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -439,7 +439,7 @@ class TestLlamacppBaseUrl:
         loader should tolerate both."""
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"llamacpp": {"base_url": "http://127.0.0.1:8033/v1/"}}),
+            yaml.safe_dump({"llm": {"llamacpp": {"base_url": "http://127.0.0.1:8033/v1/"}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -450,7 +450,7 @@ class TestLlamacppBaseUrl:
     ) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"llamacpp": {"base_url": "http://yaml-host:8033/v1"}}),
+            yaml.safe_dump({"llm": {"llamacpp": {"base_url": "http://yaml-host:8033/v1"}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -468,19 +468,27 @@ class TestLlamacppBaseUrl:
 
 
 class TestLlamacppModel:
-    """``llamacpp.model`` — operator-supplied label for the GGUF loaded
-    at ``llama-server`` startup. ``llama-server`` ignores the
-    request-body ``model`` field; the Config knob is for log /
-    Settings UI readability only."""
+    """``llamacpp.default_model`` — operator-supplied label for the
+    GGUF loaded at ``llama-server`` startup. ``llama-server`` ignores
+    the request-body ``model`` field; the Config knob is for log /
+    Settings UI readability only.
 
-    def test_default_is_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    DEC-028 (2026-05-06) — YAML key renamed ``model`` →
+    ``default_model``. Flat ``Config.llamacpp_model`` field name kept
+    for backwards-compat with in-process consumers.
+    """
+
+    def test_default_is_unsloth_q8_xl(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DEC-028 — default flipped from empty string to the
+        operator's known-good Unsloth Gemma-4 GGUF spec, matching the
+        recommended ``-hf`` arg in ``global_config.yaml``."""
         monkeypatch.chdir(tmp_path)
-        assert load_config().llamacpp_model == ""
+        assert load_config().llamacpp_model == "unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL"
 
     def test_parses_from_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"llamacpp": {"model": "qwen3-27b-q5km"}}),
+            yaml.safe_dump({"llm": {"llamacpp": {"default_model": "qwen3-27b-q5km"}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -491,7 +499,7 @@ class TestLlamacppModel:
     ) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"llamacpp": {"model": "yaml-label"}}),
+            yaml.safe_dump({"llm": {"llamacpp": {"default_model": "yaml-label"}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -505,7 +513,8 @@ class TestLlamacppModel:
     def test_field_is_in_field_map(self) -> None:
         from androscan.config.loader import CONFIG_FIELD_MAP
         section, key, env = CONFIG_FIELD_MAP["llamacpp_model"]
-        assert (section, key, env) == ("llamacpp", "model", "ANDROSCAN_LLAMACPP_MODEL")
+        # DEC-028 — YAML key renamed ``model`` → ``default_model``.
+        assert (section, key, env) == ("llamacpp", "default_model", "ANDROSCAN_LLAMACPP_MODEL")
 
 
 class TestLlamacppMaxTokens:
@@ -520,7 +529,7 @@ class TestLlamacppMaxTokens:
     def test_parses_from_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"llamacpp": {"max_tokens": 4096}}),
+            yaml.safe_dump({"llm": {"llamacpp": {"max_tokens": 4096}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -531,7 +540,7 @@ class TestLlamacppMaxTokens:
     ) -> None:
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"llamacpp": {"max_tokens": 2048}}),
+            yaml.safe_dump({"llm": {"llamacpp": {"max_tokens": 2048}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -549,7 +558,7 @@ class TestLlamacppMaxTokens:
         than crashing config load."""
         cfg_path = tmp_path / "global_config.yaml"
         cfg_path.write_text(
-            yaml.safe_dump({"llamacpp": {"max_tokens": 4096}}),
+            yaml.safe_dump({"llm": {"llamacpp": {"max_tokens": 4096}}}),
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
@@ -575,6 +584,9 @@ class TestLlamacppRoundTrip:
     preserves operator-set values without drift."""
 
     def test_round_trip_through_global_view(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DEC-028 — nested under ``view["llm"]["llamacpp"]`` (was a
+        flat top-level ``view["llamacpp"]``); YAML key renamed
+        ``model`` → ``default_model``."""
         from androscan.config.loader import (
             _merge_from_yaml,
             global_view_from_config,
@@ -586,9 +598,9 @@ class TestLlamacppRoundTrip:
             llamacpp_max_tokens=12288,
         )
         view = global_view_from_config(original)
-        assert view["llamacpp"] == {
+        assert view["llm"]["llamacpp"] == {
             "base_url": "http://10.0.0.5:8033/v1",
-            "model": "qwen3-30b",
+            "default_model": "qwen3-30b",
             "max_tokens": 12288,
         }
         flat = _merge_from_yaml(view)

@@ -156,7 +156,14 @@ def test_put_global_settings_env_locked_rejected(
 
 
 def test_put_global_raw_yaml_replaces_file(client: TestClient, tmp_path: Path) -> None:
-    raw = "ollama:\n  model: qwen2:7b\n  base_url: http://1.2.3.4:11434\n"
+    # DEC-028 — YAML restructure: Ollama knobs nest under ``llm.ollama``
+    # with the ``model`` key renamed to ``default_model``.
+    raw = (
+        "llm:\n"
+        "  ollama:\n"
+        "    default_model: qwen2:7b\n"
+        "    base_url: http://1.2.3.4:11434\n"
+    )
     r = client.put("/api/settings/global/raw", json={"raw_yaml": raw})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -181,10 +188,15 @@ def test_post_global_reset_writes_defaults(client: TestClient, tmp_path: Path) -
 
 
 def test_post_reload_after_external_edit(client: TestClient, tmp_path: Path) -> None:
-    """User edits global_config.yaml outside the UI; reload should pick it up."""
+    """User edits global_config.yaml outside the UI; reload should pick it up.
+
+    DEC-028 — fixture uses the new nested shape: ``llm.ollama.default_model``
+    (was the flat top-level ``ollama.model``).
+    """
     cfg_path = tmp_path / "global_config.yaml"
     cfg_path.write_text(
-        yaml.safe_dump({"ollama": {"model": "external-edit:7b"}}), encoding="utf-8"
+        yaml.safe_dump({"llm": {"ollama": {"default_model": "external-edit:7b"}}}),
+        encoding="utf-8",
     )
     r = client.post("/api/settings/reload")
     assert r.status_code == 200
@@ -327,9 +339,17 @@ def test_get_global_status_llamacpp_provider_routes_to_llamacpp_probe(
                 "ping_ms": 0, "models": [], "error": "should-never-render"}
     async def _spy_llamacpp(*a, **kw):
         llamacpp_calls.append((a, kw))
+        # DEC-028 — Config.default().llamacpp_model now ships as the
+        # operator's known-good Unsloth Gemma-4 GGUF spec (was empty
+        # string). Mirror that label here so ``model_present`` flips
+        # the LLM card green; the alternative would be setting
+        # ``llamacpp_model=""`` on the cfg below, which would no
+        # longer reflect default config semantics.
         return {"ok": True, "reachable": True,
                 "url": "http://127.0.0.1:8033/v1/models",
-                "ping_ms": 2, "models": ["qwen3-27b-q5km"], "error": None}
+                "ping_ms": 2,
+                "models": ["unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL"],
+                "error": None}
 
     # Stub all the other probes the fixture would normally stub.
     async def _missing(*a, **kw):
@@ -368,9 +388,9 @@ def test_get_global_status_llamacpp_provider_routes_to_llamacpp_probe(
     assert body["llm"]["provider"] == "llamacpp"
     assert body["llm"]["label"] == "LLM (llama.cpp)"
     assert body["llm"]["base_url"] == "http://127.0.0.1:8033/v1/models"
-    assert body["llm"]["models_available"] == ["qwen3-27b-q5km"]
-    # No llamacpp_model field on Config until LCP.4 — the helper
-    # accepts any loaded model so the card flips green.
+    assert body["llm"]["models_available"] == ["unsloth/gemma-4-E4B-it-GGUF:Q8_K_XL"]
+    # DEC-028 — default llamacpp_model now matches the loaded model
+    # label so the card flips green out of the box.
     assert body["llm"]["ok"] is True
     assert body["llm"]["model_present"] is True
     assert len(llamacpp_calls) == 1
