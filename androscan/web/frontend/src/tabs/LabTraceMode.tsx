@@ -128,14 +128,14 @@
  *     candidate list from a previous typo doesn't linger after the
  *     operator types something new).
  *
- * **v2.1.4 — Tier-2(a) "Ask AI" button + chat-dock prefill**:
+ * **v2.1.4 — Tier-2(a) "Ask AI" button + chat-dock prefill**
+ * (with **v2.1.7 patch** for the empty-entry case — see end of section):
  *
  *   * A small "Ask AI" button lives in the inline-row form alongside
  *     the Hops field and Advanced toggle (always visible — works
  *     regardless of whether Advanced is expanded).
  *   * Click → writes ``pendingChatPrefill = {tab: "lab", message:
- *     "I want to trace ` + "`<entry>`" + `. What entry methods should I
- *     consider?"}`` to ``WorkbenchContext`` (timestamp-stamped via the
+ *     <prompt>}`` to ``WorkbenchContext`` (timestamp-stamped via the
  *     setter, mirrors the existing ``pendingTraceEntry`` /
  *     ``pendingHookPrefill`` re-fire semantics).
  *   * The chat dock observes ``pendingChatPrefill`` and writes the
@@ -143,15 +143,24 @@
  *     clears the pending state. The parent ``LabTab`` ALSO observes
  *     it and calls ``chatRef.current?.expand()`` to ensure the dock
  *     is visible (a prefill into a collapsed dock is invisible).
- *   * Disabled when ``entryDraft.trim()`` is empty — the prompt
- *     template substitutes the operator's typed entry, so an empty
- *     entry would produce a meaningless "I want to trace ``" prompt.
- *   * NO new skill ships in v2.1.4. The pre-filled prompt
+ *   * **v2.1.7 patch — free-form prompt template:** the button is
+ *     always enabled (originally v2.1.4 disabled it when the Smali
+ *     entry field was empty, which collided with v2.1.1's hide-
+ *     Smali-by-default decision and made the rescue rope unreachable
+ *     for the operators who most needed it). Two prompt templates:
+ *     - non-empty entry: ``I want to trace `<entry>`. What entry
+ *       methods should I consider?`` (original v2.1.4 template).
+ *     - empty entry: ``I'm looking for a trace entry method in this
+ *       app. `` (open invitation — operator continues typing in the
+ *       chat textarea before sending).
+ *   * NO new skill ships in v2.1.4 / v2.1.7. The pre-filled prompt
  *     leverages the existing tier-3 skills
  *     (``search_decompiled_sources`` for RAG over decompiled
- *     sources + ``query_call_graph`` for call-graph context) which
- *     are already registered in the chat skill table — the LLM
- *     picks them up automatically based on the prompt's intent.
+ *     sources + ``query_call_graph`` for call-graph context + the
+ *     v2.1.5 ``suggest_trace_entry`` skill which surfaces top-3
+ *     candidates as ``<TraceEntryCandidateWidget>`` cards via the
+ *     chat-widget pattern) — the LLM agentic loop picks them up
+ *     automatically based on the prompt's intent.
  *     v2.1.5 adds a dedicated ``suggest_trace_entry`` skill, but
  *     v2.1.4 ships chat-only ahead of that.
  */
@@ -668,15 +677,29 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
   // v2.1.4 — Tier-2(a) "Ask AI" handler. Writes a pre-filled prompt
   // to ``pendingChatPrefill`` so the chat dock pops open (LabTab
   // expands the panel) with a textarea seeded with a natural-
-  // language question containing the operator's typed entry.
-  // Disabled when ``trimmedEntry`` is empty (the prompt template
-  // substitutes the typed entry — an empty entry would produce a
-  // degenerate "I want to trace ``" prompt).
+  // language starter the operator can edit / extend before sending.
+  //
+  // **v2.1.7 patch:** the handler now produces a free-form prompt
+  // that works with OR without text in the (hidden-by-default per
+  // v2.1.1) Smali entry field. The original v2.1.4 implementation
+  // gated the button on ``trimmedEntry`` being non-empty, which
+  // collided with v2.1.1's hide-Smali-by-default decision: the
+  // operators who most need Ask AI (the ones who don't know the
+  // class) couldn't reach it because the entry field they were
+  // supposed to type into was hidden behind the Advanced toggle.
+  // The fix aligns the button's behaviour with its stated purpose
+  // (Tier-2(a) rescue rope for "I don't know what class this lives
+  // in"). When ``trimmedEntry`` is empty, the prefill is an open
+  // invitation ("I'm looking for a trace entry method. ") that the
+  // operator continues typing in the chat textarea — same UX as
+  // typing into the chat dock directly, just one click closer.
   const onAskAI = useCallback(() => {
-    if (!trimmedEntry) return;
+    const message = trimmedEntry
+      ? `I want to trace \`${trimmedEntry}\`. What entry methods should I consider?`
+      : `I'm looking for a trace entry method in this app. `;
     setPendingChatPrefill({
       tab: "lab",
-      message: `I want to trace \`${trimmedEntry}\`. What entry methods should I consider?`,
+      message,
       sourceLabel: "Trace mode → entry suggestions",
     });
   }, [trimmedEntry, setPendingChatPrefill]);
@@ -861,24 +884,25 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
               </span>
             </button>
             {/* v2.1.4 — Tier-2(a) "Ask AI" button. Pre-fills the chat
-                dock with a natural-language question seeded with the
-                operator's typed entry, then expands the dock (parent
-                LabTab observes ``pendingChatPrefill`` and calls
-                ``chatRef.current?.expand()``). Disabled when the entry
-                is empty — the prompt template substitutes the typed
-                value, so an empty entry would produce a degenerate
-                "I want to trace ``" prompt. */}
+                dock with a natural-language starter the operator can
+                edit / extend, then expands the dock (parent LabTab
+                observes ``pendingChatPrefill`` and calls
+                ``chatRef.current?.expand()``). v2.1.7 patch: always
+                enabled — when the entry is empty the prefill is an
+                open invitation ("I'm looking for a trace entry
+                method.") rather than a degenerate "I want to trace
+                ``" template. See ``onAskAI`` handler comment for the
+                v2.1.1 / v2.1.4 collision the patch resolves. */}
             <button
               type="button"
               className="trace-ask-ai-button"
               onClick={onAskAI}
-              disabled={!trimmedEntry}
               title={
                 trimmedEntry
                   ? "Open the chat dock with a pre-filled prompt asking about entry methods related to your typed input"
-                  : "Type something into the entry field first — Ask AI uses your input as the prompt seed"
+                  : "Open the chat dock to describe what you want to trace — the LLM will suggest candidate entry methods"
               }
-              aria-label="Ask AI for entry-method suggestions related to the current input"
+              aria-label="Ask AI for entry-method suggestions"
             >
               <span className="trace-ask-ai-icon" aria-hidden="true">✨</span>
               <span className="trace-ask-ai-label">Ask AI</span>
