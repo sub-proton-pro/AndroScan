@@ -446,9 +446,10 @@ def build_consolidation_prompt(hypotheses: list[dict[str, Any]]) -> str:
         "Tasks:",
         "1. Deduplicate: merge findings that describe the same or overlapping issue (especially same evidence_ref / component).",
         "2. For merged findings: write one clear title and one clear description that captures the issue.",
-        "3. Keep evidence_refs, exploitability (1-5), and confidence (1-5). Use the highest exploitability when merging.",
-        "4. Return valid JSON only, with a single key \"hypotheses\" and an array of finding objects.",
-        "5. Each object must have: id, component_type, component_name, title, description, evidence_refs (array of strings), exploitability, confidence, remediation_hint. Preserve exploit_params if present.",
+        "3. PRESERVE evidence_refs EXACTLY as given. Do NOT rewrite, paraphrase, summarise, or change them. Format MUST be one of: exported_activities[N], exported_services[N], exported_receivers[N], exported_providers[N], deep_links[N]. NEVER substitute file names (e.g. SecretActivity.kt), helper class names (e.g. WeakBankLab), or free-form prose. When merging, take the union of the input evidence_refs.",
+        "4. Use the highest exploitability when merging. Keep confidence as the highest of the merged findings.",
+        "5. Return valid JSON only, with a single key \"hypotheses\" and an array of finding objects.",
+        "6. Each object must have: id, component_type, component_name, title, description, evidence_refs (array of strings), exploitability, confidence, remediation_hint. Preserve exploit_params if present.",
         "",
         "## Findings (JSON)",
         json.dumps(hypotheses, indent=2),
@@ -464,5 +465,7 @@ def build_consolidation_system_content() -> str:
         "You are a security report editor. Merge duplicate or overlapping findings into a single, clear finding. "
         "Return only valid JSON with key \"hypotheses\" and an array of objects. "
         "Each object: id (string), component_type, component_name, title, description, evidence_refs (array of strings), "
-        "exploitability (integer 1-5), confidence (integer 1-5), remediation_hint (string). Preserve exploit_params if present."
+        "exploitability (integer 1-5), confidence (integer 1-5), remediation_hint (string). Preserve exploit_params if present. "
+        "CRITICAL: evidence_refs must be preserved exactly in the format exported_activities[N] / exported_services[N] / "
+        "exported_receivers[N] / exported_providers[N] / deep_links[N]. Never replace them with file names, class names, or prose."
     )
