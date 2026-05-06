@@ -1,11 +1,13 @@
 """Tests for config loading."""
 
+import dataclasses
 from pathlib import Path
 
 import pytest
 import yaml
 
-from androscan.config import Config, load_config
+from androscan.config import CLOUD_PROVIDERS, Config, load_config
+from androscan.config.loader import LLM_PROVIDERS
 
 
 def test_default_config_has_expected_attributes():
@@ -255,3 +257,149 @@ class TestTraceMaxSliceDepth:
         from androscan.analysis import slicing
         budget = slicing._DescentBudget.fresh(max_depth=999)
         assert budget.remaining_depth == slicing.HARD_CAP_DEPTH
+
+
+# ---------------------------------------------------------------------------
+# DEC-027 / LCP.1 — LLM_PROVIDERS table refactor + Config.provider_kind()
+# ---------------------------------------------------------------------------
+
+
+class TestLlmProvidersTable:
+    """Structural tests for the new ``LLM_PROVIDERS`` two-section table
+    introduced in LCP.1. These guard the shape of the registry against
+    accidental edits — every entry needs the fields the LCP.2 dispatch
+    code will rely on."""
+
+    def test_top_level_has_local_and_cloud_sections(self) -> None:
+        assert set(LLM_PROVIDERS.keys()) == {"local", "cloud"}
+
+    def test_local_section_holds_ollama_and_llamacpp(self) -> None:
+        assert set(LLM_PROVIDERS["local"].keys()) == {"ollama", "llamacpp"}
+
+    def test_cloud_section_holds_six_existing_vendors(self) -> None:
+        assert set(LLM_PROVIDERS["cloud"].keys()) == {
+            "gemini", "openai", "groq", "deepseek", "together", "mistral",
+        }
+
+    def test_ollama_entry_has_local_ollama_kind(self) -> None:
+        entry = LLM_PROVIDERS["local"]["ollama"]
+        assert entry["kind"] == "local-ollama"
+        assert entry["base_url_default"] == "http://localhost:11434"
+        assert entry["key_env"] is None
+
+    def test_llamacpp_entry_has_local_openai_compat_kind_and_port_8033(self) -> None:
+        """LCP.0 / DEC-027 Q4 locked in port 8033 for the llama.cpp
+        ``llama-server`` default. The ``/v1`` suffix is part of the
+        OpenAI-compat path so the LCP.2 dispatcher can hand the URL
+        straight to the openai SDK."""
+        entry = LLM_PROVIDERS["local"]["llamacpp"]
+        assert entry["kind"] == "local-openai-compat"
+        assert entry["base_url_default"] == "http://127.0.0.1:8033/v1"
+        assert entry["key_env"] is None
+
+    def test_every_cloud_entry_carries_kind_cloud(self) -> None:
+        for name, entry in LLM_PROVIDERS["cloud"].items():
+            assert entry["kind"] == "cloud", f"{name} missing kind=cloud"
+            assert entry["key_env"], f"{name} missing key_env"
+            assert entry["base_url"], f"{name} missing base_url"
+
+    def test_cloud_providers_alias_is_same_object(self) -> None:
+        """``CLOUD_PROVIDERS`` MUST be an alias to
+        ``LLM_PROVIDERS['cloud']`` — not a copy. This keeps existing
+        importers (`from androscan.config import CLOUD_PROVIDERS`)
+        seeing the same dict in memory after any future hot-reload of
+        the registry."""
+        assert CLOUD_PROVIDERS is LLM_PROVIDERS["cloud"]
+
+
+class TestProviderKind:
+    """``Config.provider_kind()`` reverse-lookup on the new table."""
+
+    @staticmethod
+    def _cfg_with_provider(name: str) -> Config:
+        return dataclasses.replace(Config.default(), llm_provider=name)
+
+    def test_ollama_resolves_to_local_ollama(self) -> None:
+        assert self._cfg_with_provider("ollama").provider_kind() == "local-ollama"
+
+    def test_llamacpp_resolves_to_local_openai_compat(self) -> None:
+        assert self._cfg_with_provider("llamacpp").provider_kind() == "local-openai-compat"
+
+    @pytest.mark.parametrize(
+        "name", ["gemini", "openai", "groq", "deepseek", "together", "mistral"],
+    )
+    def test_each_cloud_provider_resolves_to_cloud(self, name: str) -> None:
+        assert self._cfg_with_provider(name).provider_kind() == "cloud"
+
+    def test_unknown_provider_falls_back_to_cloud(self) -> None:
+        """Defensive — a typo or stray YAML value should surface as
+        the existing "no API key configured" error from
+        ``resolve_cloud_api_key`` rather than a silent local dispatch."""
+        assert self._cfg_with_provider("does-not-exist").provider_kind() == "cloud"
+
+    def test_provider_name_is_case_insensitive_and_stripped(self) -> None:
+        """Settings UI radio writes the canonical lowercase name, but a
+        hand-edited YAML might surface mixed-case or padded values; the
+        reverse-lookup tolerates both rather than dispatching to cloud
+        on a near-miss."""
+        assert self._cfg_with_provider("  Ollama  ").provider_kind() == "local-ollama"
+        assert self._cfg_with_provider("LlamaCpp").provider_kind() == "local-openai-compat"
+
+
+class TestIsCloudShim:
+    """``Config.is_cloud`` is now a thin shim over ``provider_kind()``.
+    Behaviour for the six existing reachable values (ollama + 6 cloud
+    vendors) is unchanged from pre-DEC-027; the only new value
+    ``llamacpp`` becomes False (correctly local) instead of True."""
+
+    @staticmethod
+    def _cfg_with_provider(name: str) -> Config:
+        return dataclasses.replace(Config.default(), llm_provider=name)
+
+    def test_ollama_is_not_cloud(self) -> None:
+        assert self._cfg_with_provider("ollama").is_cloud is False
+
+    def test_llamacpp_is_not_cloud(self) -> None:
+        """Pre-DEC-027 ``llm_provider != "ollama"`` would have flagged
+        llama.cpp as cloud — that bug is now fixed at the table-lookup
+        level, ahead of LCP.2 wiring up the actual dispatch path."""
+        assert self._cfg_with_provider("llamacpp").is_cloud is False
+
+    @pytest.mark.parametrize(
+        "name", ["gemini", "openai", "groq", "deepseek", "together", "mistral"],
+    )
+    def test_each_cloud_vendor_is_cloud(self, name: str) -> None:
+        assert self._cfg_with_provider(name).is_cloud is True
+
+
+class TestResolveCloudApiKeyForLocalProviders:
+    """``resolve_cloud_api_key()`` already degraded to ``""`` for any
+    name not in ``CLOUD_PROVIDERS`` (via ``.get(..., {})``); this test
+    locks that contract in for the new ``llamacpp`` value so a future
+    refactor doesn't accidentally start raising or hitting an env var."""
+
+    def test_returns_empty_for_ollama(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        cfg = dataclasses.replace(
+            Config.default(), llm_provider="ollama", cloud_api_key="",
+        )
+        assert cfg.resolve_cloud_api_key() == ""
+
+    def test_returns_empty_for_llamacpp(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """llama.cpp's ``llama-server`` doesn't take an API key; the
+        operator should never see a "set OPENAI_API_KEY" prompt for
+        the local llama.cpp path."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        cfg = dataclasses.replace(
+            Config.default(), llm_provider="llamacpp", cloud_api_key="",
+        )
+        assert cfg.resolve_cloud_api_key() == ""
+
+    def test_returns_empty_base_url_for_local_providers(self) -> None:
+        for name in ("ollama", "llamacpp"):
+            cfg = dataclasses.replace(Config.default(), llm_provider=name)
+            assert cfg.resolve_cloud_base_url() == ""

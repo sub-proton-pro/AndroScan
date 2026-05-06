@@ -17,32 +17,79 @@ import yaml
 from androscan import constants
 
 
-CLOUD_PROVIDERS = {
-    "gemini": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "key_env": "GEMINI_API_KEY",
+# LLM provider registry — top-level table with two sub-sections splitting
+# providers by transport story:
+#
+#   * ``LLM_PROVIDERS["local"]``: providers running on the operator's
+#     own machine. Reached over loopback HTTP without an API key. Each
+#     entry has its own request-shape (Ollama's ``/api/chat`` vs
+#     llama.cpp's OpenAI-compat ``/v1/chat/completions``); the ``kind``
+#     tag tells the LLM client which dispatch path to take.
+#
+#   * ``LLM_PROVIDERS["cloud"]``: hosted vendors reached via the OpenAI
+#     Python SDK against provider-specific base URLs. Each entry has a
+#     ``key_env`` pointing at the env var that supplies the API key.
+#
+# DEC-027 (LCP track) introduced this structure as a refactor of the
+# previously-flat ``CLOUD_PROVIDERS`` dict. ``CLOUD_PROVIDERS`` is
+# preserved below as a backwards-compat alias so existing imports
+# (``from androscan.config import CLOUD_PROVIDERS``) keep resolving to
+# the same six-entry mapping they did pre-DEC-027 — no per-call edits
+# needed at LCP.1, the dispatch-side rewrite is deferred to LCP.2.
+LLM_PROVIDERS: dict[str, dict[str, dict[str, Any]]] = {
+    "local": {
+        "ollama": {
+            "base_url_default": "http://localhost:11434",
+            "kind": "local-ollama",
+            "key_env": None,
+        },
+        "llamacpp": {
+            "base_url_default": "http://127.0.0.1:8033/v1",
+            "kind": "local-openai-compat",
+            "key_env": None,
+        },
     },
-    "openai": {
-        "base_url": "https://api.openai.com/v1",
-        "key_env": "OPENAI_API_KEY",
-    },
-    "groq": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "key_env": "GROQ_API_KEY",
-    },
-    "deepseek": {
-        "base_url": "https://api.deepseek.com",
-        "key_env": "DEEPSEEK_API_KEY",
-    },
-    "together": {
-        "base_url": "https://api.together.xyz/v1",
-        "key_env": "TOGETHERAI_API_KEY",
-    },
-    "mistral": {
-        "base_url": "https://api.mistral.ai/v1",
-        "key_env": "MISTRAL_API_KEY",
+    "cloud": {
+        "gemini": {
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "key_env": "GEMINI_API_KEY",
+            "kind": "cloud",
+        },
+        "openai": {
+            "base_url": "https://api.openai.com/v1",
+            "key_env": "OPENAI_API_KEY",
+            "kind": "cloud",
+        },
+        "groq": {
+            "base_url": "https://api.groq.com/openai/v1",
+            "key_env": "GROQ_API_KEY",
+            "kind": "cloud",
+        },
+        "deepseek": {
+            "base_url": "https://api.deepseek.com",
+            "key_env": "DEEPSEEK_API_KEY",
+            "kind": "cloud",
+        },
+        "together": {
+            "base_url": "https://api.together.xyz/v1",
+            "key_env": "TOGETHERAI_API_KEY",
+            "kind": "cloud",
+        },
+        "mistral": {
+            "base_url": "https://api.mistral.ai/v1",
+            "key_env": "MISTRAL_API_KEY",
+            "kind": "cloud",
+        },
     },
 }
+
+
+# Backwards-compat alias — points at the cloud sub-section so existing
+# callers (``androscan/llm/client.py``, ``androscan.py``, ``androscan/
+# config/__init__.py``, ``tests/test_llm.py``) keep working unchanged.
+# The ``kind: "cloud"`` field added per-entry above is a harmless extra
+# key for the .get()/.keys() patterns those callers use.
+CLOUD_PROVIDERS = LLM_PROVIDERS["cloud"]
 
 
 # Mapping from flat ``Config`` field name to its YAML location and the env
@@ -147,7 +194,9 @@ class Config:
     ollama_temperature: float
     ollama_num_predict: int
     ollama_num_ctx: int  # Phase 11 sub-step 11.6 / DEC-025
-    llm_provider: str  # "ollama" or cloud provider name from CLOUD_PROVIDERS
+    # "ollama" / "llamacpp" (local) or any key in LLM_PROVIDERS["cloud"]
+    # (gemini / openai / groq / deepseek / together / mistral).
+    llm_provider: str
     cloud_model: str
     cloud_api_key: str
     cloud_temperature: float
@@ -205,9 +254,43 @@ class Config:
             trace_max_slice_depth=constants.TRACE_MAX_SLICE_DEPTH_DEFAULT,
         )
 
+    def provider_kind(self) -> str:
+        """Return the dispatch kind for the configured LLM provider.
+
+        Reverse-lookup on :data:`LLM_PROVIDERS`. Returns one of:
+
+        * ``"local-ollama"`` — Ollama HTTP ``/api/chat`` (existing path)
+        * ``"local-openai-compat"`` — llama.cpp ``llama-server``
+          OpenAI-compat ``/v1/chat/completions`` (added in LCP.2)
+        * ``"cloud"`` — hosted vendor reached via the OpenAI Python SDK
+
+        Falls back to ``"cloud"`` for unrecognised provider names so
+        that a typo in ``llm_provider`` surfaces as the existing "no
+        API key configured" error from :meth:`resolve_cloud_api_key`
+        rather than a silent local dispatch.
+        """
+        name = (self.llm_provider or "").strip().lower()
+        local_entry = LLM_PROVIDERS["local"].get(name)
+        if local_entry is not None:
+            return local_entry["kind"]
+        cloud_entry = LLM_PROVIDERS["cloud"].get(name)
+        if cloud_entry is not None:
+            return cloud_entry["kind"]
+        return "cloud"
+
     @property
     def is_cloud(self) -> bool:
-        return self.llm_provider != "ollama"
+        """True iff the configured provider is a hosted cloud vendor.
+
+        Backwards-compat shim — pre-DEC-027 this returned
+        ``llm_provider != "ollama"``, which would have wrongly
+        classified llama.cpp (a new local provider) as cloud the
+        moment LCP.4 lets the operator select it. Post-DEC-027
+        delegates to :meth:`provider_kind` so both Ollama and
+        llama.cpp resolve to ``False``; the six existing cloud
+        provider names continue to resolve to ``True``.
+        """
+        return self.provider_kind() == "cloud"
 
     @property
     def active_model(self) -> str:
