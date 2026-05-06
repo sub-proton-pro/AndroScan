@@ -2771,6 +2771,17 @@ code { color: var(--accent); }
   border-top: 1px dashed var(--border);
 }
 
+/* LCP.3 / DEC-027 — provider-namespace hooks for the LLM status card.
+ * The generic .status-card shape stays primary; these classes give a
+ * thin accent border so operators can pick out the LLM card from a
+ * grid of ten otherwise-identical cards. Both providers get the same
+ * accent style today; LCP.4 may differentiate (e.g. a small inline
+ * icon or vendor color) once the radio sub-knobs land. */
+.status-card.ollama-status,
+.status-card.llamacpp-status {
+  border-left: 3px solid var(--accent, #6f7cff);
+}
+
 .status-card-btn {
   font-size: 0.72rem;
   padding: 3px 10px;

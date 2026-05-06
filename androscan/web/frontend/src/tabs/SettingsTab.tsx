@@ -707,11 +707,29 @@ function StatusPanel() {
               `${globalStatus.process.host}:${globalStatus.process.port}`,
               `python ${globalStatus.process.python.python_version}`,
             ]}/>
-            <StatusCardView card={globalStatus.llm} extras={[
-              globalStatus.llm.model,
-              globalStatus.llm.ping_ms !== null ? `${globalStatus.llm.ping_ms}ms` : "",
-              `${globalStatus.llm.models_available.length} model(s) available`,
-            ]}/>
+            <StatusCardView
+              card={globalStatus.llm}
+              extras={[
+                globalStatus.llm.model,
+                /* LCP.3 / DEC-027 — the LLM card can be sourced from
+                 * either the Ollama probe or the llama.cpp probe
+                 * depending on Config.provider_kind(). The backend
+                 * sets `provider`; we surface it as a small "via X"
+                 * extras line so operators can tell at a glance
+                 * which local LLM is being probed without opening
+                 * the Settings sub-section. */
+                globalStatus.llm.provider === "llamacpp"
+                  ? "via llama.cpp"
+                  : "via Ollama",
+                globalStatus.llm.ping_ms !== null ? `${globalStatus.llm.ping_ms}ms` : "",
+                `${globalStatus.llm.models_available.length} model(s) available`,
+              ]}
+              extraClassName={
+                globalStatus.llm.provider === "llamacpp"
+                  ? "llamacpp-status"
+                  : "ollama-status"
+              }
+            />
             <StatusCardView card={globalStatus.rag_provider} />
             <StatusCardView card={globalStatus.tools.adb} />
             <StatusCardView card={globalStatus.tools.jadx} />
@@ -793,18 +811,27 @@ function StatusCardView({
   card,
   extras,
   actions,
+  extraClassName,
 }: {
   card: StatusCard;
   extras?: (string | undefined)[];
   actions?: ReactNode;
+  /** Optional CSS class appended to the outer status-card div. LCP.3 /
+   *  DEC-027 uses this to tag the LLM card with ``ollama-status`` /
+   *  ``llamacpp-status`` so the App.css namespace can render
+   *  per-provider badges or accent colors without touching the
+   *  generic StatusCardView shape. */
+  extraClassName?: string;
 }) {
   // ``skipped`` cards (e.g. per-app device probes when no device is
   // attached) are not real failures — render them as warn (yellow) so the
   // panel doesn't scream red the moment the emulator isn't booted.
   const skipped = Boolean((card as { skipped?: boolean }).skipped);
   const dot = card.ok ? "ok" : skipped ? "warn" : card.error ? "fail" : "warn";
+  const classNames = ["status-card", `status-${dot}`];
+  if (extraClassName) classNames.push(extraClassName);
   return (
-    <div className={`status-card status-${dot}`}>
+    <div className={classNames.join(" ")}>
       <div className="status-card-header">
         <span className={`status-card-dot status-card-dot-${dot}`} />
         <strong>{card.label}</strong>

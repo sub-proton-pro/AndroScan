@@ -30,6 +30,15 @@ def client(cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Test
     async def _ok_tags(*a, **kw):
         return {"ok": True, "reachable": True, "url": "http://localhost:11434/api/tags",
                 "ping_ms": 1, "models": [cfg.ollama_model, "nomic-embed-text"], "error": None}
+    async def _ok_llamacpp(*a, **kw):
+        # Default fixture stub for the LCP.3 llama.cpp probe — never
+        # exercised by the default Ollama provider_kind path, but
+        # tests that flip the provider via .config swap rely on this
+        # stub being in place so the request doesn't fall through to
+        # a real network call against 127.0.0.1:8033.
+        return {"ok": True, "reachable": True,
+                "url": "http://127.0.0.1:8033/v1/models",
+                "ping_ms": 1, "models": ["local-llamacpp"], "error": None}
     async def _missing(*a, **kw):
         return {"ok": False, "found": False, "cmd": "x", "path": None,
                 "version": None, "error": "stubbed"}
@@ -77,6 +86,7 @@ def client(cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Test
     # import time, so patching the producer module wouldn't take effect.
     from androscan.web import status_routes as sr
     monkeypatch.setattr(sr, "probe_ollama_tags", _ok_tags)
+    monkeypatch.setattr(sr, "probe_llamacpp", _ok_llamacpp)
     monkeypatch.setattr(sr, "probe_adb_version", _missing)
     monkeypatch.setattr(sr, "probe_jadx_version", _missing)
     monkeypatch.setattr(sr, "probe_apktool_version", _missing)
@@ -256,6 +266,115 @@ def test_get_global_status(client: TestClient) -> None:
     assert body["device"]["connected"] is True
     assert body["device"]["state"] == "device"
     assert body["device"]["label"] == "Android device / emulator"
+
+
+def test_get_global_status_default_provider_routes_to_ollama_probe(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LCP.3: with the default ``llm_provider="ollama"`` the LLM
+    card carries the ``provider: "ollama"`` discriminator and is
+    sourced from :func:`probe_ollama_tags` only — the llama.cpp
+    probe MUST NOT have been called."""
+    from androscan.web import status_routes as sr
+    from androscan.web.status_routes import invalidate_status_cache
+
+    ollama_calls: list[tuple] = []
+    llamacpp_calls: list[tuple] = []
+
+    async def _spy_ollama(*a, **kw):
+        ollama_calls.append((a, kw))
+        return {"ok": True, "reachable": True, "url": "http://localhost:11434/api/tags",
+                "ping_ms": 1, "models": ["qwen3.5:35b", "nomic-embed-text"], "error": None}
+    async def _spy_llamacpp(*a, **kw):
+        llamacpp_calls.append((a, kw))
+        return {"ok": True, "reachable": True, "url": "http://127.0.0.1:8033/v1/models",
+                "ping_ms": 1, "models": ["should-never-be-seen"], "error": None}
+
+    monkeypatch.setattr(sr, "probe_ollama_tags", _spy_ollama)
+    monkeypatch.setattr(sr, "probe_llamacpp", _spy_llamacpp)
+    invalidate_status_cache()
+
+    body = client.get("/api/status/global").json()
+    assert body["llm"]["provider"] == "ollama"
+    assert body["llm"]["label"] == "LLM (Ollama)"
+    assert body["llm"]["base_url"] == "http://localhost:11434/api/tags"
+    assert len(ollama_calls) == 1
+    assert len(llamacpp_calls) == 0  # mutual exclusion guard
+
+
+def test_get_global_status_llamacpp_provider_routes_to_llamacpp_probe(
+    cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LCP.3: with ``llm_provider="llamacpp"`` the LLM card carries
+    the ``provider: "llamacpp"`` discriminator and is sourced from
+    :func:`probe_llamacpp`. The Ollama probe MUST NOT have been
+    called — the operator picked one local LLM, we probe one local
+    LLM."""
+    import dataclasses
+    from androscan.web import status_routes as sr
+    from androscan.web.app import create_app
+    from androscan.web.status_routes import invalidate_status_cache
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "apps").mkdir()
+
+    ollama_calls: list[tuple] = []
+    llamacpp_calls: list[tuple] = []
+
+    async def _spy_ollama(*a, **kw):
+        ollama_calls.append((a, kw))
+        return {"ok": False, "reachable": False, "url": "should-never-render",
+                "ping_ms": 0, "models": [], "error": "should-never-render"}
+    async def _spy_llamacpp(*a, **kw):
+        llamacpp_calls.append((a, kw))
+        return {"ok": True, "reachable": True,
+                "url": "http://127.0.0.1:8033/v1/models",
+                "ping_ms": 2, "models": ["qwen3-27b-q5km"], "error": None}
+
+    # Stub all the other probes the fixture would normally stub.
+    async def _missing(*a, **kw):
+        return {"ok": False, "found": False, "cmd": "x", "path": None,
+                "version": None, "error": "stubbed"}
+    async def _device_off(*a, **kw):
+        return {"ok": False, "connected": False, "state": None,
+                "serial": None, "error": "no device attached"}
+    async def _frida_off(*a, **kw):
+        return {"ok": False, "running": False, "pid": None,
+                "error": "frida-server not running on device"}
+    async def _abi(*a, **kw):
+        return {"ok": False, "abi": None, "frida_arch": None, "error": "no device"}
+    async def _root(*a, **kw):
+        return {"ok": False, "rooted": False, "can_adb_root": False,
+                "current_uid": None, "build_type": None, "debuggable": False,
+                "error": "no device"}
+
+    monkeypatch.setattr(sr, "probe_ollama_tags", _spy_ollama)
+    monkeypatch.setattr(sr, "probe_llamacpp", _spy_llamacpp)
+    monkeypatch.setattr(sr, "probe_adb_version", _missing)
+    monkeypatch.setattr(sr, "probe_jadx_version", _missing)
+    monkeypatch.setattr(sr, "probe_apktool_version", _missing)
+    monkeypatch.setattr(sr, "probe_frida_version", _missing)
+    monkeypatch.setattr(sr, "probe_frida_server", _frida_off)
+    monkeypatch.setattr(sr, "probe_device_cpu_abi", _abi)
+    monkeypatch.setattr(sr, "probe_device_root_status", _root)
+    monkeypatch.setattr(sr, "probe_adb_device", _device_off)
+    invalidate_status_cache()
+
+    cfg_llamacpp = dataclasses.replace(cfg, llm_provider="llamacpp")
+    app = create_app(cfg_llamacpp, cwd=tmp_path)
+    client = TestClient(app)
+
+    body = client.get("/api/status/global").json()
+    assert body["llm"]["provider"] == "llamacpp"
+    assert body["llm"]["label"] == "LLM (llama.cpp)"
+    assert body["llm"]["base_url"] == "http://127.0.0.1:8033/v1/models"
+    assert body["llm"]["models_available"] == ["qwen3-27b-q5km"]
+    # No llamacpp_model field on Config until LCP.4 — the helper
+    # accepts any loaded model so the card flips green.
+    assert body["llm"]["ok"] is True
+    assert body["llm"]["model_present"] is True
+    assert len(llamacpp_calls) == 1
+    assert len(ollama_calls) == 0  # mutual exclusion guard
 
 
 def test_get_global_status_no_device(

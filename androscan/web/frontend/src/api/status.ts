@@ -133,6 +133,15 @@ export type GlobalStatus = {
     serial: string | null;
   };
   llm: StatusCard & {
+    /** Discriminator for the LCP.3 / DEC-027 provider switch. The
+     *  backend ``_gather_global`` runs exactly one local-LLM probe
+     *  per request keyed on ``Config.provider_kind()``; this field
+     *  lets the Settings tab render a "via Ollama" / "via llama.cpp"
+     *  extras line without re-deriving the provider from the
+     *  operator-typed ``llm_provider`` (which can drift). Cloud
+     *  users keep getting ``"ollama"`` here in v1 — the cloud LLM
+     *  status card is a future ship. */
+    provider: "ollama" | "llamacpp";
     model: string;
     base_url: string | null;
     ping_ms: number | null;

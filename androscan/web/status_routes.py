@@ -52,6 +52,7 @@ from androscan.web.health_probes import (
     probe_frida_version,
     probe_frida_version_skew,
     probe_jadx_version,
+    probe_llamacpp,
     probe_ollama_tags,
     probe_path_writable,
     probe_pkg_installed,
@@ -59,6 +60,7 @@ from androscan.web.health_probes import (
     probe_pkg_uid,
     probe_python_env,
     probe_uiautomator_dump,
+    llamacpp_model_present,
     model_present,
 )
 from androscan.web.per_app_settings import (
@@ -121,15 +123,34 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
     # + ``id``); no side effects on adbd.
     root_p = probe_device_root_status("adb")
     device_p = probe_adb_device()
-    ollama_p = probe_ollama_tags(getattr(config, "ollama_base_url", "http://localhost:11434"))
+    # LCP.3 / DEC-027 — exactly one local-LLM probe runs per request,
+    # selected by ``Config.provider_kind()``. Mutually exclusive: when
+    # the operator runs llama.cpp we don't waste a syscall pinging an
+    # Ollama daemon that isn't up (and vice-versa). Cloud providers
+    # keep using the Ollama probe in v1 for backwards-compat — the
+    # card shows up red but doesn't block analysis (cloud LLM card is
+    # a future ship).
+    provider_kind = config.provider_kind()
+    if provider_kind == "local-openai-compat":
+        from androscan.config.loader import LLM_PROVIDERS
+        llamacpp_default = LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"]
+        llm_url = (
+            getattr(config, "llamacpp_base_url", None)
+            or llamacpp_default
+        )
+        llm_p = probe_llamacpp(llm_url)
+    else:
+        # local-ollama (default) and cloud both use the Ollama probe.
+        llm_p = probe_ollama_tags(getattr(config, "ollama_base_url", "http://localhost:11434"))
+
     embed_p = probe_embed_provider(
         getattr(config, "rag_embed_provider", "fastembed"),
         getattr(config, "rag_embed_model", ""),
         getattr(config, "ollama_base_url", "http://localhost:11434"),
     )
 
-    (adb_v, jadx_v, apktool_v, frida_v, frida_server_v, device_v, ollama_t, embed_s, abi_v, root_v) = await asyncio.gather(
-        adb_p, jadx_p, apktool_p, frida_p, frida_server_p, device_p, ollama_p, embed_p, abi_p, root_p,
+    (adb_v, jadx_v, apktool_v, frida_v, frida_server_v, device_v, llm_t, embed_s, abi_v, root_v) = await asyncio.gather(
+        adb_p, jadx_p, apktool_p, frida_p, frida_server_p, device_p, llm_p, embed_p, abi_p, root_p,
         return_exceptions=False,
     )
 
@@ -159,21 +180,50 @@ async def _gather_global(config: Config, apps_root: Path) -> dict[str, Any]:
             "error": frida_server_v.get("error") or "frida-server not running on device",
         }
 
-    # LLM model presence check piggy-backs on the ollama tags response.
-    chat_model = getattr(config, "ollama_model", "")
-    chat_present = model_present(ollama_t, chat_model)
-    llm_card = {
-        "ok": bool(ollama_t.get("ok")) and chat_present,
-        "label": "LLM (Ollama)",
-        "model": chat_model,
-        "base_url": ollama_t.get("url"),
-        "ping_ms": ollama_t.get("ping_ms"),
-        "models_available": ollama_t.get("models", []),
-        "model_present": chat_present,
-        "error": ollama_t.get("error") or (
-            None if chat_present else f"chat model {chat_model!r} not pulled (run: ollama pull {chat_model})"
-        ),
-    }
+    # LLM card shape is identical across providers (so the React
+    # ``StatusCardView`` doesn't need a per-provider variant); only
+    # the ``label`` / ``model`` / ``provider`` discriminators differ.
+    # The new ``provider`` field lets the frontend render a small
+    # "via llama.cpp" / "via Ollama" extras line without re-deriving
+    # it from ``llm_provider`` (which is operator-typed and can drift).
+    if provider_kind == "local-openai-compat":
+        chat_model = (
+            getattr(config, "llamacpp_model", None)
+            or ""  # LCP.4 will plumb a dedicated llamacpp_model field
+        )
+        chat_present = llamacpp_model_present(llm_t, chat_model)
+        llm_card = {
+            "ok": bool(llm_t.get("ok")) and chat_present,
+            "label": "LLM (llama.cpp)",
+            "provider": "llamacpp",
+            "model": chat_model or (llm_t.get("models") or [""])[0],
+            "base_url": llm_t.get("url"),
+            "ping_ms": llm_t.get("ping_ms"),
+            "models_available": llm_t.get("models", []),
+            "model_present": chat_present,
+            "error": llm_t.get("error") or (
+                None if chat_present
+                else f"configured llamacpp_model {chat_model!r} not loaded "
+                     f"(loaded: {llm_t.get('models') or []!r}); restart "
+                     "llama-server with the right -m <gguf-path>"
+            ),
+        }
+    else:
+        chat_model = getattr(config, "ollama_model", "")
+        chat_present = model_present(llm_t, chat_model)
+        llm_card = {
+            "ok": bool(llm_t.get("ok")) and chat_present,
+            "label": "LLM (Ollama)",
+            "provider": "ollama",
+            "model": chat_model,
+            "base_url": llm_t.get("url"),
+            "ping_ms": llm_t.get("ping_ms"),
+            "models_available": llm_t.get("models", []),
+            "model_present": chat_present,
+            "error": llm_t.get("error") or (
+                None if chat_present else f"chat model {chat_model!r} not pulled (run: ollama pull {chat_model})"
+            ),
+        }
 
     cfg_path = discover_config_path()
     sources = effective_sources(cfg_path)

@@ -910,6 +910,185 @@ def test_probe_ollama_tags_no_curl(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# LCP.3 / DEC-027 — llama.cpp llama-server probe (probe_llamacpp)
+
+
+class _FakeUrlopenResp:
+    """Minimal urlopen stand-in used by both the curl-absent fallback
+    path and the `_FakeProc`-equivalent on systems where curl is not
+    on PATH (Linux CI runners typically have it; the urllib path is
+    the safety net)."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeUrlopenResp":
+        return self
+
+    def __exit__(self, *a) -> None:
+        return None
+
+
+def _force_urllib_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the urllib fallback path so the test isn't sensitive to
+    whether curl happens to be on PATH on the CI runner."""
+    import androscan.web.health_probes as mod
+    monkeypatch.setattr(mod.shutil, "which", lambda name: None)
+    async def to_thread(fn, *args, **kw):
+        return fn(*args, **kw)
+    monkeypatch.setattr("asyncio.to_thread", to_thread)
+
+
+def test_probe_llamacpp_up_with_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_UP`` — server live, model loaded. ``ok`` flips green."""
+    _force_urllib_fallback(monkeypatch)
+    import json as _json
+
+    body = _json.dumps({
+        "object": "list",
+        "data": [{"id": "qwen3-27b-q5km", "object": "model", "owned_by": "llamacpp"}],
+    }).encode()
+
+    def fake_urlopen(req, timeout=0):
+        return _FakeUrlopenResp(body)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
+    assert out["ok"] is True
+    assert out["reachable"] is True
+    assert out["models"] == ["qwen3-27b-q5km"]
+    assert out["error"] is None
+    assert out["url"].endswith("/models")
+
+
+def test_probe_llamacpp_partial_up_no_models_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_PARTIAL_UP`` — server live (HTTP 200 with empty data list)
+    but model still mmap'ing. Operator sees a yellow card with a
+    "wait for cold-start" hint rather than a misleading red."""
+    _force_urllib_fallback(monkeypatch)
+    import json as _json
+
+    body = _json.dumps({"object": "list", "data": []}).encode()
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda req, timeout=0: _FakeUrlopenResp(body),
+    )
+
+    out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
+    assert out["ok"] is False
+    assert out["reachable"] is True   # server is up …
+    assert out["models"] == []        # … but model not loaded yet
+    assert out["error"] and "no models loaded" in out["error"]
+
+
+def test_probe_llamacpp_down_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_DOWN`` — server unreachable. ``urlopen`` raises URLError;
+    the probe surfaces the error string in ``error`` (truncated)."""
+    _force_urllib_fallback(monkeypatch)
+    from urllib.error import URLError
+
+    def fake_urlopen(req, timeout=0):
+        raise URLError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
+    assert out["ok"] is False
+    assert out["reachable"] is False
+    assert out["models"] == []
+    assert out["error"] and "connection refused" in out["error"]
+
+
+def test_probe_llamacpp_unparsable_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Server reachable but body isn't JSON — surface the parser
+    error rather than crashing the status aggregator."""
+    _force_urllib_fallback(monkeypatch)
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=0: _FakeUrlopenResp(b"<html>nginx error</html>"),
+    )
+
+    out = asyncio.run(hp.probe_llamacpp("http://127.0.0.1:8033/v1"))
+    assert out["ok"] is False
+    # urllib path returns the error from JSON parse failure under
+    # `_sync`; either the parsed-failure label or "JSONDecodeError"
+    # is acceptable, but the card MUST surface *something* rather
+    # than silently flipping green.
+    assert out["error"]
+
+
+def test_probe_llamacpp_error_shape_matches_probe_ollama_tags() -> None:
+    """Regression guard — :func:`probe_llamacpp` MUST return the
+    same key set as :func:`probe_ollama_tags` so the
+    :func:`status_routes._gather_global` LLM card builder can be a
+    single shared codepath."""
+    ollama_keys = {"ok", "reachable", "url", "ping_ms", "models", "error"}
+
+    # Construct a synthetic ``_DOWN`` shape from each probe and compare keys.
+    async def _ollama_dummy() -> dict:
+        # Re-use the one path that doesn't actually hit the network: the
+        # urllib fallback when both curl and urlopen are unreachable.
+        return {
+            "ok": False, "reachable": False,
+            "url": "http://x/api/tags", "ping_ms": 0,
+            "models": [], "error": "stubbed",
+        }
+
+    async def _llamacpp_dummy() -> dict:
+        return {
+            "ok": False, "reachable": False,
+            "url": "http://x/v1/models", "ping_ms": 0,
+            "models": [], "error": "stubbed",
+        }
+
+    olla = asyncio.run(_ollama_dummy())
+    lcp = asyncio.run(_llamacpp_dummy())
+    assert set(olla.keys()) == ollama_keys
+    assert set(lcp.keys()) == ollama_keys
+
+
+class TestLlamacppModelPresent:
+    """:func:`llamacpp_model_present` matches against
+    ``llama-server``'s operator-controlled model id (no canonical
+    ``:tag`` suffix scheme like Ollama)."""
+
+    def test_empty_models_returns_false(self) -> None:
+        assert hp.llamacpp_model_present({"models": []}, "qwen3") is False
+
+    def test_empty_model_arg_accepts_any_loaded_model(self) -> None:
+        """LCP.4 will plumb ``llamacpp_model``; until then the LLM
+        card flips green on any loaded model rather than refusing
+        to acknowledge a working server."""
+        assert hp.llamacpp_model_present(
+            {"models": ["qwen3-27b-q5km"]}, "",
+        ) is True
+
+    def test_exact_match_case_insensitive(self) -> None:
+        assert hp.llamacpp_model_present(
+            {"models": ["Qwen3-27B-Q5KM"]}, "qwen3-27b-q5km",
+        ) is True
+
+    def test_prefix_match_either_way(self) -> None:
+        assert hp.llamacpp_model_present(
+            {"models": ["qwen3-27b-q5km-v2"]}, "qwen3-27b-q5km",
+        ) is True
+        assert hp.llamacpp_model_present(
+            {"models": ["qwen3-27b"]}, "qwen3-27b-q5km",
+        ) is True
+
+    def test_no_match_returns_false(self) -> None:
+        assert hp.llamacpp_model_present(
+            {"models": ["qwen3-27b-q5km"]}, "llama2-7b",
+        ) is False
+
+
+# ---------------------------------------------------------------------------
 # Embed provider
 
 

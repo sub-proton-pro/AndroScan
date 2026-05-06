@@ -856,6 +856,158 @@ def model_present(tags: dict[str, Any], model: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# llama.cpp / llama-server health probe (LCP.3 / DEC-027)
+
+
+async def probe_llamacpp(
+    base_url: str,
+    timeout: float = HTTP_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    """``GET {base_url}/models`` to verify ``llama-server`` is reachable.
+
+    The configured ``base_url`` already includes the OpenAI-compat
+    ``/v1`` suffix (e.g. ``http://127.0.0.1:8033/v1``) so the path
+    appended here is just ``/models`` — no double-``/v1``. The
+    response shape on a successful probe is:
+
+        {"object": "list", "data": [{"id": "<model-id>", ...}]}
+
+    Returns a dict structurally parallel to :func:`probe_ollama_tags`
+    so the Settings tab status-card renderer can stay generic
+    (``StatusCardView`` doesn't need a per-provider variant):
+
+        {
+            "ok":         bool,   # server reachable AND >=1 model loaded
+            "reachable":  bool,   # server reachable (HTTP 200 from /models)
+            "url":        str,
+            "ping_ms":    int,
+            "models":     list[str],   # model ids extracted from data[]
+            "error":      str | None,  # operator-readable; truncated to 300
+        }
+
+    Three-state classification matters for the operator UX:
+
+    * ``_DOWN``       — ``ok=False, reachable=False`` — server isn't
+      running. Operator's first move is ``llama-server -c 16384
+      -ngl 99 -fa --port 8033 --host 127.0.0.1 --jinja``.
+    * ``_PARTIAL_UP`` — ``ok=False, reachable=True, models=[]`` —
+      common during model-load lag on cold starts (large GGUF files
+      can take 10-30s to mmap into RAM). Operator just needs to
+      wait; the next probe (Settings tab polls every 15s) will flip
+      to ``_UP``.
+    * ``_UP``         — ``ok=True, reachable=True, models=[<id>]`` —
+      ready to serve requests.
+
+    Mirrors :func:`probe_ollama_tags`'s curl-first / urllib-fallback
+    pattern so the Settings-tab status loop never blocks the event
+    loop on a stuck probe.
+    """
+    base = (base_url or "").strip().rstrip("/")
+    url = f"{base}/models"
+    started = time.perf_counter()
+
+    def _classify(parsed: dict[str, Any], elapsed_ms: int) -> dict[str, Any]:
+        """Map a parsed /v1/models response onto the structured probe shape."""
+        data = parsed.get("data") if isinstance(parsed, dict) else None
+        if not isinstance(data, list):
+            return {
+                "ok": False, "reachable": True, "url": url, "ping_ms": elapsed_ms,
+                "models": [],
+                "error": "unexpected /v1/models shape (no 'data' list)",
+            }
+        models = [
+            str(m.get("id"))
+            for m in data
+            if isinstance(m, dict) and m.get("id")
+        ]
+        if not models:
+            # _PARTIAL_UP — server up but no model loaded yet.
+            return {
+                "ok": False, "reachable": True, "url": url, "ping_ms": elapsed_ms,
+                "models": [],
+                "error": "llama-server reachable but no models loaded yet "
+                         "(cold-start mmap can take 10-30s for large GGUFs)",
+            }
+        return {
+            "ok": True, "reachable": True, "url": url, "ping_ms": elapsed_ms,
+            "models": models, "error": None,
+        }
+
+    if shutil.which("curl"):
+        rc, out, err = await _run(
+            "curl", "-fsS", "-m", str(int(max(1, timeout))), url,
+            timeout=timeout + 0.5,
+        )
+        ms = int((time.perf_counter() - started) * 1000)
+        if rc != 0:
+            return {
+                "ok": False, "reachable": False, "url": url, "ping_ms": ms,
+                "models": [], "error": (err or out or f"curl rc={rc}").strip()[:300],
+            }
+        try:
+            import json as _json
+            return _classify(_json.loads(out), ms)
+        except Exception as e:
+            return {
+                "ok": False, "reachable": True, "url": url, "ping_ms": ms,
+                "models": [], "error": f"unparsable response: {e}",
+            }
+
+    def _sync() -> tuple[bool, dict[str, Any], Optional[str]]:
+        """urllib fallback for hosts without curl on PATH."""
+        import json as _json
+        from urllib.error import URLError
+        from urllib.request import Request, urlopen
+        try:
+            with urlopen(
+                Request(url, headers={"Accept": "application/json"}),
+                timeout=timeout,
+            ) as resp:
+                body = resp.read().decode(errors="replace")
+            return True, _json.loads(body), None
+        except URLError as e:
+            return False, {}, f"urlopen: {e}"
+        except Exception as e:
+            return False, {}, f"{type(e).__name__}: {e}"
+
+    ok, parsed, err = await asyncio.to_thread(_sync)
+    ms = int((time.perf_counter() - started) * 1000)
+    if not ok:
+        return {
+            "ok": False, "reachable": False, "url": url, "ping_ms": ms,
+            "models": [], "error": err,
+        }
+    return _classify(parsed, ms)
+
+
+def llamacpp_model_present(tags: dict[str, Any], model: str) -> bool:
+    """Return True if ``model`` matches an entry in a ``probe_llamacpp`` result.
+
+    ``llama-server`` returns whatever model-id was loaded at server
+    startup (operator-controlled string, e.g. ``qwen3-27b-q5km``).
+    Unlike Ollama there's no canonical ``:tag`` suffix scheme, so this
+    helper does a case-insensitive exact match plus a prefix match
+    (operator may write a shortened label in Settings).
+
+    When ``model`` is empty (LCP.4 hasn't yet added the
+    ``llamacpp_model`` Config field) the helper accepts any loaded
+    model — the existence of *any* entry in the ``models`` list is
+    enough for the LLM status card to flip green.
+    """
+    models = tags.get("models") or []
+    if not models:
+        return False
+    if not model:
+        return True
+    model_norm = model.strip().lower()
+    for name in models:
+        n = (name or "").strip().lower()
+        if n == model_norm or n.startswith(model_norm) or model_norm.startswith(n):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Embed-provider probes
 
 
