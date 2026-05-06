@@ -2455,6 +2455,59 @@ code { color: var(--accent); }
   letter-spacing: 0.05em;
 }
 
+/* LCP.4 / DEC-027 — LLM provider radio block sits at the top of the
+   Global form. The accent border-left mirrors the Status panel's
+   provider-tagged card styling so the operator perceives the same
+   visual category across both surfaces. */
+.settings-llm-provider {
+  border-left: 3px solid var(--accent, #6f7cff);
+}
+
+.settings-llm-radio {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.settings-llm-radio-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  cursor: pointer;
+  font-size: 0.88rem;
+  user-select: none;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.settings-llm-radio-option:hover {
+  border-color: var(--accent, #6f7cff);
+}
+
+.settings-llm-radio-option.active {
+  border-color: var(--accent, #6f7cff);
+  background: rgba(111, 124, 255, 0.08);
+}
+
+.settings-llm-radio-option input[type="radio"] {
+  margin: 0;
+}
+
+.settings-llm-radio-option input[type="radio"]:disabled {
+  cursor: not-allowed;
+}
+
+.settings-llm-subsection {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
 .settings-field {
   display: grid;
   grid-template-columns: minmax(180px, 1fr) minmax(220px, 2fr) auto;

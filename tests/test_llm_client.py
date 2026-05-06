@@ -108,22 +108,29 @@ class TestResolveLlamacppBaseUrl:
 # ---------------------------------------------------------------------------
 
 
-def _make_llamacpp_mock_config() -> MagicMock:
+def _make_llamacpp_mock_config(**overrides) -> MagicMock:
     """Build a MagicMock Config that the LCP.2 dispatcher routes
     through the llama.cpp branch.
 
-    Pins ``llamacpp_base_url`` and ``llamacpp_model`` to ``None``
-    explicitly — without these, MagicMock's auto-attribute spawning
-    would shadow the ``getattr(config, "...", None)`` defaults inside
+    Pins ``llamacpp_base_url`` / ``llamacpp_model`` /
+    ``llamacpp_max_tokens`` to ``None`` explicitly by default —
+    without these, MagicMock's auto-attribute spawning would shadow
+    the ``getattr(config, "...", None)`` defaults inside
     :func:`_resolve_llamacpp_base_url` and :func:`_complete_llamacpp`,
-    making the registry-default fallback paths un-testable."""
-    cfg = MagicMock(
+    making the registry-default + ollama-num-predict fallback paths
+    un-testable. Tests that want to exercise the LCP.4 happy path
+    (where the dedicated ``llamacpp_*`` fields ARE set) override
+    those via ``**overrides``."""
+    base = dict(
         ollama_temperature=0.2,
         ollama_num_predict=8192,
         llm_provider="llamacpp",
         llamacpp_base_url=None,
         llamacpp_model=None,
+        llamacpp_max_tokens=None,
     )
+    base.update(overrides)
+    cfg = MagicMock(**base)
     cfg.provider_kind.return_value = "local-openai-compat"
     return cfg
 
@@ -166,16 +173,32 @@ class TestLlamacppRequestBodyShape:
         assert body["messages"][0]["content"] == "sys hint"
         assert body["messages"][1]["content"] == "test prompt"
 
-    def test_body_carries_temperature_and_max_tokens_from_ollama_fields(self) -> None:
-        """v1 LCP.2: llama.cpp re-uses the ``ollama_*`` Config fields
-        for temperature + max_tokens. LCP.4 adds parallel
-        ``llamacpp_*`` fields if operators report drift."""
+    def test_body_max_tokens_falls_back_to_ollama_num_predict_when_llamacpp_field_unset(self) -> None:
+        """Backwards-compat path: when ``llamacpp_max_tokens`` is unset
+        (the default helper pins it to ``None`` explicitly), the
+        dispatcher falls back to ``ollama_num_predict`` — so operators
+        upgrading from the LCP.2-only build keep getting the same
+        max_tokens value as before LCP.4 wired the dedicated knob."""
         config = self._mock_config()
         with patch("androscan.llm.client.requests.post", return_value=self._mock_resp()) as post_mock:
             _complete_llamacpp("test", config, stream=False)
         body = post_mock.call_args.kwargs["json"]
         assert body["temperature"] == 0.2
         assert body["max_tokens"] == 8192
+
+    def test_body_max_tokens_prefers_dedicated_llamacpp_field_when_set(self) -> None:
+        """LCP.4 happy path: when the operator has set
+        ``llamacpp_max_tokens`` (via Settings UI / YAML / env var),
+        the dispatcher uses it instead of ``ollama_num_predict`` —
+        letting the operator tune the two providers independently."""
+        config = _make_llamacpp_mock_config(
+            ollama_num_predict=8192,
+            llamacpp_max_tokens=4096,
+        )
+        with patch("androscan.llm.client.requests.post", return_value=self._mock_resp()) as post_mock:
+            _complete_llamacpp("test", config, stream=False)
+        body = post_mock.call_args.kwargs["json"]
+        assert body["max_tokens"] == 4096
 
     def test_body_sets_response_format_when_json_requested(self) -> None:
         """response_format='json' (analysis pipeline default) must

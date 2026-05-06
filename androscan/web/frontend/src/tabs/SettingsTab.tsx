@@ -307,6 +307,39 @@ function RawYamlEditor({
   );
 }
 
+// LCP.4 / DEC-027 — "LLM provider" radio sits above the auto-grouped
+// settings sections. The radio is the canonical chooser for
+// ``llm_provider``; the bare text-input that ``FormGlobal`` would
+// otherwise render (the field IS in ``field_map``) is suppressed.
+//
+// The three sections "ollama" / "llamacpp" / "llm.cloud_*" are
+// rendered INSIDE the radio block, gated by the active radio
+// value, so an operator picking "Local (Ollama)" never sees the
+// llama.cpp knobs (and vice versa). All other sections (paths,
+// workflow, output, web, rag, frida, trace) keep flowing through
+// the existing auto-grouper untouched.
+
+type ProviderRadio = "ollama" | "llamacpp" | "cloud";
+
+const CLOUD_VENDORS: readonly string[] = [
+  "openai",
+  "gemini",
+  "groq",
+  "deepseek",
+  "together",
+  "mistral",
+];
+
+function classifyProvider(value: unknown): ProviderRadio {
+  if (value === "ollama") return "ollama";
+  if (value === "llamacpp") return "llamacpp";
+  // Anything else (one of the six cloud vendors, or a typo'd value
+  // the operator may have hand-edited in YAML) falls into the
+  // Cloud bucket. The dropdown will surface the actual string so
+  // the operator can spot the typo and pick a real vendor.
+  return "cloud";
+}
+
 function FormGlobal({
   data,
   dirty,
@@ -327,9 +360,20 @@ function FormGlobal({
     return out;
   }, [data.field_map]);
 
+  // LCP.4 — sections owned by the LlmProviderRadio block. The
+  // auto-grouper below skips these so they render exactly once.
+  const LLM_OWNED_SECTIONS = new Set(["ollama", "llamacpp", "llm"]);
+
   return (
     <div className="settings-form">
+      <LlmProviderRadio
+        data={data}
+        dirty={dirty}
+        grouped={grouped}
+        onChange={onChange}
+      />
       {Object.entries(grouped)
+        .filter(([section]) => !LLM_OWNED_SECTIONS.has(section))
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([section, fields]) => (
           <fieldset key={section} className="settings-section">
@@ -355,6 +399,213 @@ function FormGlobal({
           </fieldset>
         ))}
     </div>
+  );
+}
+
+function LlmProviderRadio({
+  data,
+  dirty,
+  grouped,
+  onChange,
+}: {
+  data: GlobalSettingsResponse;
+  dirty: Record<string, unknown>;
+  grouped: Record<string, string[]>;
+  onChange: (field: string, value: unknown, original: unknown) => void;
+}) {
+  const currentValue =
+    (dirty["llm_provider"] as string | undefined) ??
+    (data.flat["llm_provider"] as string | undefined) ??
+    "ollama";
+  const radio = classifyProvider(currentValue);
+  const envLock = data.env_locks["ANDROSCAN_LLM_PROVIDER"];
+  const disabled = Boolean(envLock);
+
+  const setProvider = (next: string) => {
+    onChange("llm_provider", next, data.flat["llm_provider"]);
+  };
+
+  const handleRadio = (kind: ProviderRadio) => {
+    if (disabled) return;
+    if (kind === "ollama") setProvider("ollama");
+    else if (kind === "llamacpp") setProvider("llamacpp");
+    else if (radio !== "cloud") setProvider("openai"); // sensible default
+    // else current value already a cloud vendor — leave the dropdown alone.
+  };
+
+  // Filter the auto-grouped llm section's fields down to the
+  // cloud_* ones (cloud_model / cloud_api_key / cloud_temperature).
+  // The bare ``llm_provider`` field is intentionally not rendered
+  // anywhere — the radio + dropdown is the only chooser.
+  const llmCloudFields = (grouped["llm"] ?? []).filter((f) => f !== "llm_provider");
+  const ollamaFields = grouped["ollama"] ?? [];
+  const llamacppFields = grouped["llamacpp"] ?? [];
+
+  return (
+    <fieldset className="settings-section settings-llm-provider">
+      <legend>LLM provider</legend>
+      <div
+        className="settings-llm-radio"
+        role="radiogroup"
+        aria-label="LLM provider"
+      >
+        <RadioOption
+          checked={radio === "ollama"}
+          disabled={disabled}
+          label="Local (Ollama)"
+          onChange={() => handleRadio("ollama")}
+        />
+        <RadioOption
+          checked={radio === "llamacpp"}
+          disabled={disabled}
+          label="Local (llama.cpp)"
+          onChange={() => handleRadio("llamacpp")}
+        />
+        <RadioOption
+          checked={radio === "cloud"}
+          disabled={disabled}
+          label="Cloud"
+          onChange={() => handleRadio("cloud")}
+        />
+        {disabled && (
+          <span
+            className="env-lock-pill"
+            title={`Locked by ANDROSCAN_LLM_PROVIDER=${envLock}`}
+          >
+            ANDROSCAN_LLM_PROVIDER
+          </span>
+        )}
+      </div>
+      {radio === "ollama" && (
+        <div className="settings-llm-subsection">
+          {ollamaFields.map((f) => (
+            <SettingsField
+              key={f}
+              field={f}
+              meta={data.field_map[f]}
+              value={dirty[f] ?? data.flat[f]}
+              originalValue={data.flat[f]}
+              source={data.sources[f]}
+              envLock={
+                data.field_map[f].env_var
+                  ? data.env_locks[data.field_map[f].env_var as string]
+                  : undefined
+              }
+              liveReloadable={data.live_reloadable.includes(f)}
+              isDirty={f in dirty}
+              onChange={(v) => onChange(f, v, data.flat[f])}
+            />
+          ))}
+        </div>
+      )}
+      {radio === "llamacpp" && (
+        <div className="settings-llm-subsection">
+          <p className="settings-help">
+            Context size is set at <code>llama-server</code> start (e.g.
+            <code> --ctx-size 16384</code>) and isn't a request-level
+            parameter in OpenAI-compat mode. Restart the server to change it.
+          </p>
+          {llamacppFields.map((f) => (
+            <SettingsField
+              key={f}
+              field={f}
+              meta={data.field_map[f]}
+              value={dirty[f] ?? data.flat[f]}
+              originalValue={data.flat[f]}
+              source={data.sources[f]}
+              envLock={
+                data.field_map[f].env_var
+                  ? data.env_locks[data.field_map[f].env_var as string]
+                  : undefined
+              }
+              liveReloadable={data.live_reloadable.includes(f)}
+              isDirty={f in dirty}
+              onChange={(v) => onChange(f, v, data.flat[f])}
+            />
+          ))}
+        </div>
+      )}
+      {radio === "cloud" && (
+        <div className="settings-llm-subsection">
+          <div className="settings-field">
+            <label className="settings-field-label">
+              <span className="settings-field-name">Cloud vendor</span>
+              <span className="settings-field-id">llm.provider</span>
+            </label>
+            <div className="settings-field-input">
+              <select
+                value={currentValue}
+                disabled={disabled}
+                onChange={(e) => setProvider(e.target.value)}
+              >
+                {/* Off-vocab values (typos / future vendors) keep
+                    rendering so the operator can see + fix them. */}
+                {!CLOUD_VENDORS.includes(currentValue) && (
+                  <option value={currentValue}>{currentValue} (unknown)</option>
+                )}
+                {CLOUD_VENDORS.map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
+              </select>
+            </div>
+            <div className="settings-field-meta">
+              <span className={`source-pill source-${data.sources["llm_provider"] ?? "default"}`}>
+                {data.sources["llm_provider"] ?? "default"}
+              </span>
+            </div>
+          </div>
+          {llmCloudFields.map((f) => (
+            <SettingsField
+              key={f}
+              field={f}
+              meta={data.field_map[f]}
+              value={dirty[f] ?? data.flat[f]}
+              originalValue={data.flat[f]}
+              source={data.sources[f]}
+              envLock={
+                data.field_map[f].env_var
+                  ? data.env_locks[data.field_map[f].env_var as string]
+                  : undefined
+              }
+              liveReloadable={data.live_reloadable.includes(f)}
+              isDirty={f in dirty}
+              onChange={(v) => onChange(f, v, data.flat[f])}
+            />
+          ))}
+        </div>
+      )}
+    </fieldset>
+  );
+}
+
+function RadioOption({
+  checked,
+  disabled,
+  label,
+  onChange,
+}: {
+  checked: boolean;
+  disabled: boolean;
+  label: string;
+  onChange: () => void;
+}) {
+  return (
+    <label
+      className={
+        checked
+          ? "settings-llm-radio-option active"
+          : "settings-llm-radio-option"
+      }
+    >
+      <input
+        type="radio"
+        name="llm-provider-radio"
+        checked={checked}
+        disabled={disabled}
+        onChange={onChange}
+      />
+      <span>{label}</span>
+    </label>
   );
 }
 

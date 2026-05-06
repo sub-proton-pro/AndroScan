@@ -403,3 +403,211 @@ class TestResolveCloudApiKeyForLocalProviders:
         for name in ("ollama", "llamacpp"):
             cfg = dataclasses.replace(Config.default(), llm_provider=name)
             assert cfg.resolve_cloud_base_url() == ""
+
+
+# ---------------------------------------------------------------------------
+# DEC-027 / LCP.4 — llama.cpp Config plumbing (base_url / model / max_tokens)
+# ---------------------------------------------------------------------------
+
+
+class TestLlamacppBaseUrl:
+    """``llamacpp.base_url`` (OpenAI-compat ``/v1`` endpoint of
+    ``llama-server``) — added in LCP.4."""
+
+    def test_default_matches_registry(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The Config default MUST match
+        ``LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"]`` so
+        the registry remains the single source of truth — no string
+        literal duplication that could drift between the loader and
+        the LLM client's resolver."""
+        monkeypatch.chdir(tmp_path)
+        expected = LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"]
+        assert load_config().llamacpp_base_url == expected
+
+    def test_parses_from_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llamacpp": {"base_url": "http://192.168.1.50:8033/v1"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        assert load_config().llamacpp_base_url == "http://192.168.1.50:8033/v1"
+
+    def test_yaml_strips_trailing_slash(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Mirrors the ``ollama_base_url`` normalisation — operators
+        often paste the URL with or without a trailing slash; the
+        loader should tolerate both."""
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llamacpp": {"base_url": "http://127.0.0.1:8033/v1/"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        assert load_config().llamacpp_base_url == "http://127.0.0.1:8033/v1"
+
+    def test_env_override_wins_over_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llamacpp": {"base_url": "http://yaml-host:8033/v1"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANDROSCAN_LLAMACPP_BASE_URL", "http://env-host:9999/v1")
+        assert load_config().llamacpp_base_url == "http://env-host:9999/v1"
+
+    def test_field_is_live_reloadable(self) -> None:
+        from androscan.config.loader import LIVE_RELOADABLE_FIELDS
+        assert "llamacpp_base_url" in LIVE_RELOADABLE_FIELDS
+
+    def test_field_is_in_field_map(self) -> None:
+        from androscan.config.loader import CONFIG_FIELD_MAP
+        section, key, env = CONFIG_FIELD_MAP["llamacpp_base_url"]
+        assert (section, key, env) == ("llamacpp", "base_url", "ANDROSCAN_LLAMACPP_BASE_URL")
+
+
+class TestLlamacppModel:
+    """``llamacpp.model`` — operator-supplied label for the GGUF loaded
+    at ``llama-server`` startup. ``llama-server`` ignores the
+    request-body ``model`` field; the Config knob is for log /
+    Settings UI readability only."""
+
+    def test_default_is_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert load_config().llamacpp_model == ""
+
+    def test_parses_from_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llamacpp": {"model": "qwen3-27b-q5km"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        assert load_config().llamacpp_model == "qwen3-27b-q5km"
+
+    def test_env_override_wins_over_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llamacpp": {"model": "yaml-label"}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANDROSCAN_LLAMACPP_MODEL", "env-label")
+        assert load_config().llamacpp_model == "env-label"
+
+    def test_field_is_live_reloadable(self) -> None:
+        from androscan.config.loader import LIVE_RELOADABLE_FIELDS
+        assert "llamacpp_model" in LIVE_RELOADABLE_FIELDS
+
+    def test_field_is_in_field_map(self) -> None:
+        from androscan.config.loader import CONFIG_FIELD_MAP
+        section, key, env = CONFIG_FIELD_MAP["llamacpp_model"]
+        assert (section, key, env) == ("llamacpp", "model", "ANDROSCAN_LLAMACPP_MODEL")
+
+
+class TestLlamacppMaxTokens:
+    """``llamacpp.max_tokens`` — OpenAI-compat
+    ``/v1/chat/completions`` cap. Mirrors the role of
+    ``ollama.num_predict`` for the llama.cpp dispatch path."""
+
+    def test_default_is_8192(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        assert load_config().llamacpp_max_tokens == 8192
+
+    def test_parses_from_yaml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llamacpp": {"max_tokens": 4096}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        assert load_config().llamacpp_max_tokens == 4096
+
+    def test_env_override_wins_over_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llamacpp": {"max_tokens": 2048}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANDROSCAN_LLAMACPP_MAX_TOKENS", "16384")
+        assert load_config().llamacpp_max_tokens == 16384
+
+    def test_env_invalid_falls_back_to_yaml(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Mirrors the established loader posture: bad env input warns
+        on stderr and falls back to the YAML/default value rather
+        than crashing config load."""
+        cfg_path = tmp_path / "global_config.yaml"
+        cfg_path.write_text(
+            yaml.safe_dump({"llamacpp": {"max_tokens": 4096}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("ANDROSCAN_LLAMACPP_MAX_TOKENS", "not-a-number")
+        cfg = load_config()
+        assert cfg.llamacpp_max_tokens == 4096
+        assert "ANDROSCAN_LLAMACPP_MAX_TOKENS" in capsys.readouterr().err
+
+    def test_field_is_live_reloadable(self) -> None:
+        from androscan.config.loader import LIVE_RELOADABLE_FIELDS
+        assert "llamacpp_max_tokens" in LIVE_RELOADABLE_FIELDS
+
+    def test_field_is_in_field_map(self) -> None:
+        from androscan.config.loader import CONFIG_FIELD_MAP
+        section, key, env = CONFIG_FIELD_MAP["llamacpp_max_tokens"]
+        assert (section, key, env) == ("llamacpp", "max_tokens", "ANDROSCAN_LLAMACPP_MAX_TOKENS")
+
+
+class TestLlamacppRoundTrip:
+    """End-to-end: every ``llamacpp_*`` field round-trips cleanly
+    through ``global_view_from_config`` + ``_merge_from_yaml`` so the
+    Settings UI's "save form -> rewrite YAML -> reload Config" loop
+    preserves operator-set values without drift."""
+
+    def test_round_trip_through_global_view(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from androscan.config.loader import (
+            _merge_from_yaml,
+            global_view_from_config,
+        )
+        original = dataclasses.replace(
+            Config.default(),
+            llamacpp_base_url="http://10.0.0.5:8033/v1",
+            llamacpp_model="qwen3-30b",
+            llamacpp_max_tokens=12288,
+        )
+        view = global_view_from_config(original)
+        assert view["llamacpp"] == {
+            "base_url": "http://10.0.0.5:8033/v1",
+            "model": "qwen3-30b",
+            "max_tokens": 12288,
+        }
+        flat = _merge_from_yaml(view)
+        assert flat["llamacpp_base_url"] == "http://10.0.0.5:8033/v1"
+        assert flat["llamacpp_model"] == "qwen3-30b"
+        assert flat["llamacpp_max_tokens"] == 12288
+
+    def test_active_model_picks_llamacpp_when_provider_is_llamacpp(self) -> None:
+        """``active_model`` is the canonical accessor used by the run
+        header / CLI banner / Settings UI status card. After LCP.4 it
+        must route on ``provider_kind`` so llama.cpp operators see
+        their GGUF label rather than the unrelated ``ollama_model``."""
+        cfg = dataclasses.replace(
+            Config.default(), llm_provider="llamacpp", llamacpp_model="qwen3-27b-q5km",
+        )
+        assert cfg.active_model == "qwen3-27b-q5km"
+
+    def test_active_model_returns_not_set_when_llamacpp_label_empty(self) -> None:
+        cfg = dataclasses.replace(
+            Config.default(), llm_provider="llamacpp", llamacpp_model="",
+        )
+        assert cfg.active_model == "(not set)"

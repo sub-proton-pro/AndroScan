@@ -15,6 +15,26 @@ ollama:
   # headroom; live-reloadable.
   num_ctx: 16384
 
+# LCP.4 / DEC-027 — llama.cpp ``llama-server`` local LLM provider.
+# Activate by setting ``llm.provider`` (or the ``ANDROSCAN_LLM_PROVIDER``
+# env var) to ``"llamacpp"``. Operator must run ``llama-server`` on the
+# configured port (default 8033 — chosen to avoid the upstream default
+# 8080 collision class). Recommended startup line:
+#   llama-server -c 16384 -ngl 99 -fa --port 8033 \
+#                --host 127.0.0.1 --jinja -m <path-to-gguf>
+# - ``base_url`` includes the OpenAI-compat ``/v1`` suffix.
+# - ``model``     is a free-text label (llama-server ignores the
+#                  request-body ``model`` field; the actual GGUF is
+#                  loaded at server startup). Useful for log readability.
+# - ``max_tokens`` is the OpenAI-compat ``/v1/chat/completions`` cap.
+#                  Mirrors the role of ``ollama.num_predict`` for the
+#                  llama.cpp dispatch path. Bump this above 8192 if
+#                  your server-side ``--ctx-size`` budget allows.
+llamacpp:
+  base_url: "http://127.0.0.1:8033/v1"
+  model: ""
+  max_tokens: 8192
+
 paths:
   run_folder_root: "apps"
   apktool_cmd: "apktool"

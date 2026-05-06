@@ -700,17 +700,23 @@ def _complete_llamacpp(
     is the OpenAI SSE flavour (``data: {...}\\n\\n``) parsed by
     :func:`_stream_llamacpp_sse`.
 
-    v1 LCP.2 fields:
+    v1 fields (LCP.2 introduced; LCP.4 wired the dedicated knobs):
       * ``base_url``   ← :func:`_resolve_llamacpp_base_url`
-      * ``model``      ← ``model`` arg or :data:`LLAMACPP_DEFAULT_MODEL_LABEL`
-        (``llama-server`` ignores the request-body model field; the
-        actual model is the GGUF loaded at server startup. LCP.4
-        adds a ``llamacpp_model`` Config field for the operator to
-        label their loaded model in logs / Settings UI.)
-      * ``temperature`` ← ``config.ollama_temperature`` (LCP.4 adds
-        ``llamacpp_temperature``)
-      * ``max_tokens``  ← ``config.ollama_num_predict`` (LCP.4 adds
-        ``llamacpp_max_tokens``)
+        (Config.llamacpp_base_url, falling back to the registry default
+        ``http://127.0.0.1:8033/v1``)
+      * ``model``      ← ``model`` arg or ``config.llamacpp_model`` or
+        :data:`LLAMACPP_DEFAULT_MODEL_LABEL`. ``llama-server`` ignores
+        the request-body model field; the actual model is the GGUF
+        loaded at server startup. The Config field is purely a label
+        for log/metric readability — operators write their GGUF
+        identifier (e.g. ``qwen3-27b-q5km``) in Settings.
+      * ``temperature`` ← ``config.ollama_temperature`` (shared across
+        both local providers — operators rarely tune this differently
+        between Ollama and llama.cpp).
+      * ``max_tokens``  ← ``config.llamacpp_max_tokens`` (LCP.4 added
+        the dedicated knob; falls back to ``config.ollama_num_predict``
+        when the new field is absent so MagicMock-based unit tests
+        from LCP.2 keep working without per-test edits).
       * ``response_format`` ← ``{"type": "json_object"}`` when
         ``response_format == "json"`` (Ollama parity); GBNF grammar
         enforcement is the LCP.6 follow-up.
@@ -736,7 +742,12 @@ def _complete_llamacpp(
         or LLAMACPP_DEFAULT_MODEL_LABEL
     )
     temperature = getattr(config, "ollama_temperature", 0.2)
-    max_tokens = getattr(config, "ollama_num_predict", OLLAMA_NUM_PREDICT_TIERS[0])
+    # LCP.4: prefer the dedicated llamacpp_max_tokens field, falling
+    # back to ollama_num_predict for backwards-compat with the MagicMock
+    # configs in tests/test_llm_client.py that pre-date the new field.
+    max_tokens = getattr(config, "llamacpp_max_tokens", None)
+    if not max_tokens:
+        max_tokens = getattr(config, "ollama_num_predict", OLLAMA_NUM_PREDICT_TIERS[0])
 
     if messages is not None:
         msgs = messages

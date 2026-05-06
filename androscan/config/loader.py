@@ -113,6 +113,10 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     "cloud_model":                 ("llm",      "cloud_model",       "ANDROSCAN_CLOUD_MODEL"),
     "cloud_api_key":               ("llm",      "cloud_api_key",      None),
     "cloud_temperature":           ("llm",      "cloud_temperature",  None),
+    # LCP.4 / DEC-027 — llama.cpp ``llama-server`` knobs.
+    "llamacpp_base_url":           ("llamacpp", "base_url",          "ANDROSCAN_LLAMACPP_BASE_URL"),
+    "llamacpp_model":              ("llamacpp", "model",             "ANDROSCAN_LLAMACPP_MODEL"),
+    "llamacpp_max_tokens":         ("llamacpp", "max_tokens",        "ANDROSCAN_LLAMACPP_MAX_TOKENS"),
     "run_folder_root":             ("paths",    "run_folder_root",   "ANDROSCAN_RUN_FOLDER"),
     "apktool_cmd":                 ("paths",    "apktool_cmd",        None),
     "jadx_cmd":                    ("paths",    "jadx_cmd",           None),
@@ -152,6 +156,14 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
     "cloud_model",
     "cloud_api_key",
     "cloud_temperature",
+    # LCP.4 / DEC-027 — llama.cpp knobs. base_url + max_tokens are
+    # read per-call by ``_complete_llamacpp`` at the top of every
+    # request (no in-flight state to bounce); model is just a label
+    # (llama-server ignores the request-body field, the actual GGUF
+    # is loaded at server startup), so live-reload is harmless.
+    "llamacpp_base_url",
+    "llamacpp_model",
+    "llamacpp_max_tokens",
     "apktool_cmd",
     "jadx_cmd",
     "max_turns",
@@ -200,6 +212,14 @@ class Config:
     cloud_model: str
     cloud_api_key: str
     cloud_temperature: float
+    # llama.cpp ``llama-server`` knobs — added in LCP.4 (DEC-027).
+    # Operators select these via the Settings UI radio "Local (llama.cpp)".
+    # Hand-edited YAML form lives under the ``llamacpp:`` section. The
+    # ``ollama_temperature`` field is shared across both local providers
+    # (operators rarely tune temperature differently between them).
+    llamacpp_base_url: str   # e.g. "http://127.0.0.1:8033/v1"
+    llamacpp_model: str      # operator's GGUF label (free-text; llama-server ignores)
+    llamacpp_max_tokens: int # OpenAI-compat /v1/chat/completions max_tokens cap
     run_folder_root: str
     max_turns: int
     max_hypotheses_per_report: int
@@ -233,6 +253,15 @@ class Config:
             cloud_model="",
             cloud_api_key="",
             cloud_temperature=0.2,
+            # LCP.4 / DEC-027 — llama.cpp local provider knobs. Default
+            # base_url is sourced from LLM_PROVIDERS["local"]["llamacpp"]
+            # so the registry remains the single source of truth (no
+            # duplicate string literal to drift between layers). Default
+            # max_tokens=8192 is conservative — operators with larger
+            # ``--ctx-size`` should bump it via Settings UI / YAML.
+            llamacpp_base_url=LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"],
+            llamacpp_model="",
+            llamacpp_max_tokens=8192,
             run_folder_root="apps",
             max_turns=constants.MAX_TURNS_DEFAULT,
             max_hypotheses_per_report=constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT,
@@ -294,9 +323,20 @@ class Config:
 
     @property
     def active_model(self) -> str:
-        """Return the model name for the active provider."""
-        if self.is_cloud:
+        """Return the model name for the active provider.
+
+        LCP.4 / DEC-027 — llama.cpp's request-body ``model`` field is
+        operator-controlled (defaults to empty; llama-server ignores
+        the value and serves whatever GGUF was loaded at startup).
+        Empty ``llamacpp_model`` resolves to ``"(not set)"`` so banners
+        like the CLI run header show ``llama.cpp (not set)`` rather
+        than the previous fallback of the wrong provider's model name.
+        """
+        kind = self.provider_kind()
+        if kind == "cloud":
             return self.cloud_model or "(not set)"
+        if kind == "local-openai-compat":
+            return self.llamacpp_model or "(not set)"
         return self.ollama_model
 
     def resolve_cloud_api_key(self) -> str:
@@ -375,6 +415,16 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["cloud_model"] = (llm.get("cloud_model") or "").strip()
     out["cloud_api_key"] = (llm.get("cloud_api_key") or "").strip()
     out["cloud_temperature"] = _safe_float(llm.get("cloud_temperature"), 0.2, "llm.cloud_temperature")
+    # LCP.4 / DEC-027 — llama.cpp ``llama-server`` knobs.
+    llamacpp = config_dict.get("llamacpp") or {}
+    llamacpp_default_url = LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"]
+    out["llamacpp_base_url"] = (
+        (llamacpp.get("base_url") or "").strip().rstrip("/") or llamacpp_default_url
+    )
+    out["llamacpp_model"] = (llamacpp.get("model") or "").strip()
+    out["llamacpp_max_tokens"] = _safe_int(
+        llamacpp.get("max_tokens"), 8192, "llamacpp.max_tokens",
+    )
     out["run_folder_root"] = paths.get("run_folder_root") or "apps"
     out["max_turns"] = _safe_int(workflow.get("max_turns"), constants.MAX_TURNS_DEFAULT, "workflow.max_turns")
     out["max_hypotheses_per_report"] = _safe_int(workflow.get("max_hypotheses_per_report"), constants.MAX_HYPOTHESES_PER_REPORT_DEFAULT, "workflow.max_hypotheses_per_report")
@@ -454,6 +504,30 @@ def load_config(config_path: Optional[str] = None) -> Config:
         merged["llm_provider"] = os.environ["ANDROSCAN_LLM_PROVIDER"].strip().lower()
     if os.environ.get("ANDROSCAN_CLOUD_MODEL"):
         merged["cloud_model"] = os.environ["ANDROSCAN_CLOUD_MODEL"].strip()
+    # LCP.4 / DEC-027 — llama.cpp env overrides. base_url is normalised
+    # the same way as ``ANDROSCAN_OLLAMA_URL`` (strip + trailing-slash
+    # rstrip) so the operator can paste either form. max_tokens fails
+    # soft to the YAML / default value on a non-integer to match the
+    # established posture of every other ``ANDROSCAN_*`` numeric env
+    # override (loader never raises on bad env input).
+    if os.environ.get("ANDROSCAN_LLAMACPP_BASE_URL"):
+        merged["llamacpp_base_url"] = (
+            os.environ["ANDROSCAN_LLAMACPP_BASE_URL"].strip().rstrip("/")
+        )
+    if os.environ.get("ANDROSCAN_LLAMACPP_MODEL"):
+        merged["llamacpp_model"] = os.environ["ANDROSCAN_LLAMACPP_MODEL"].strip()
+    if os.environ.get("ANDROSCAN_LLAMACPP_MAX_TOKENS"):
+        try:
+            merged["llamacpp_max_tokens"] = max(
+                1, int(os.environ["ANDROSCAN_LLAMACPP_MAX_TOKENS"].strip()),
+            )
+        except ValueError:
+            print(
+                f"Warning: ANDROSCAN_LLAMACPP_MAX_TOKENS="
+                f"{os.environ['ANDROSCAN_LLAMACPP_MAX_TOKENS']!r} is not a "
+                "valid integer; using YAML/default.",
+                file=sys.stderr,
+            )
     if os.environ.get("ANDROSCAN_WEB_HOST"):
         merged["web_host"] = os.environ["ANDROSCAN_WEB_HOST"].strip() or merged.get("web_host", "127.0.0.1")
     if os.environ.get("ANDROSCAN_WEB_PORT"):
@@ -542,6 +616,12 @@ def load_config(config_path: Optional[str] = None) -> Config:
         cloud_model=merged["cloud_model"],
         cloud_api_key=merged["cloud_api_key"],
         cloud_temperature=merged["cloud_temperature"],
+        llamacpp_base_url=str(
+            merged.get("llamacpp_base_url")
+            or LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"]
+        ).strip().rstrip("/"),
+        llamacpp_model=str(merged.get("llamacpp_model") or "").strip(),
+        llamacpp_max_tokens=max(1, int(merged.get("llamacpp_max_tokens", 8192))),
         run_folder_root=merged["run_folder_root"],
         max_turns=max(1, merged["max_turns"]),
         max_hypotheses_per_report=max(0, merged["max_hypotheses_per_report"]),
@@ -662,6 +742,16 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
         cloud_model=str(flat.get("cloud_model") or "").strip(),
         cloud_api_key=str(flat.get("cloud_api_key") or "").strip(),
         cloud_temperature=float(flat.get("cloud_temperature") or 0.2),
+        # LCP.4 / DEC-027 — llama.cpp knobs. ``with_overrides`` is the
+        # live-reload path used by Settings UI saves; clamps mirror the
+        # ones in ``load_config()``'s final ``Config(...)`` constructor
+        # so a save through either path produces an identical Config.
+        llamacpp_base_url=str(
+            flat.get("llamacpp_base_url")
+            or LLM_PROVIDERS["local"]["llamacpp"]["base_url_default"]
+        ).strip().rstrip("/"),
+        llamacpp_model=str(flat.get("llamacpp_model") or "").strip(),
+        llamacpp_max_tokens=max(1, int(flat.get("llamacpp_max_tokens") or 8192)),
         run_folder_root=str(flat["run_folder_root"] or "apps"),
         max_turns=max(1, int(flat["max_turns"])),
         max_hypotheses_per_report=max(0, int(flat["max_hypotheses_per_report"])),
