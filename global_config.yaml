@@ -54,8 +54,16 @@ llm:
     # response payload growth (~1.5×) on deep PredicateOrigin chains.
     num_predict: 12288
     # Phase 11 11.6 / DEC-025 — Ollama's default 8192-token context can
-    # squeeze v2's ~2× input prompt growth. Live-reloadable.
-    num_ctx: 16384
+    # squeeze v2's ~2× input prompt growth. Bumped to 32768 to give verbose
+    # thinking-mode models (gemma4:26b) room for 15-20K reasoning tokens
+    # plus the JSON body. Live-reloadable.
+    num_ctx: 32768
+    # Ollama thinking-mode emission. Default ``true`` preserves chain-of-thought
+    # output for the workbench and ``-vv`` CLI verbosity. Flip to ``false`` (or
+    # pass ``--ollama-think false`` per run) for verbose-loop models like
+    # gemma4:26b whose thinking can consume 25K+ tokens before any JSON.
+    # Non-thinking models ignore this flag.
+    think: true
 
   # LCP.4 / DEC-027 — llama.cpp ``llama-server`` local LLM provider.
   # Recommended startup line:

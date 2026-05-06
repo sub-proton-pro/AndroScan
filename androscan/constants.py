@@ -20,8 +20,18 @@ PER_COMPONENT_ANALYSIS_DEFAULT = False
 # so operators can override per-deployment via global_config.yaml.
 OLLAMA_TIMEOUT_TIERS = [150, 300, 600, 900]
 OLLAMA_NUM_PREDICT_DEFAULT = 12288  # 11.6 — was 8192 (DEC-025)
-OLLAMA_NUM_PREDICT_TIERS = [12288, 16384]
+# Third tier (24576) added for verbose thinking-mode models like gemma4:26b
+# whose internal reasoning routinely emits 15-20K tokens before the JSON body.
+# Auto-increase only kicks in on truncation, so smaller models pay no cost.
+OLLAMA_NUM_PREDICT_TIERS = [12288, 16384, 24576]
 OLLAMA_NUM_CTX_DEFAULT = 16384  # 11.6 — Ollama default is 8192 (DEC-025)
+# Whether to enable Ollama "thinking mode" for reasoning-capable models. Default
+# True preserves the existing chain-of-thought logging used by the workbench.
+# Operators can flip this off in global_config.yaml (``ollama.think: false``)
+# for models whose thinking mode is verbose-loop pathological (notably
+# ``gemma4:26b``, which can consume 25K+ tokens of repetitive analysis before
+# emitting any JSON). Has no effect on non-thinking models.
+OLLAMA_THINK_DEFAULT = True
 
 # Phase 11 sub-step 11.6 / DEC-025 — ``trace.max_slice_depth`` config
 # knob default. Mirrors ``slicing.MAX_SLICE_DEPTH``; the slicer's

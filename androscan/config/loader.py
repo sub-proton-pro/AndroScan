@@ -123,6 +123,7 @@ CONFIG_FIELD_MAP: dict[str, tuple[str, str, Optional[str]]] = {
     # Bumped above the Ollama default (8192) to absorb the v2
     # inter-procedural slicer's ~2× input prompt growth.
     "ollama_num_ctx":              ("ollama",   "num_ctx",           "ANDROSCAN_OLLAMA_NUM_CTX"),
+    "ollama_think":                ("ollama",   "think",             "ANDROSCAN_OLLAMA_THINK"),
     "llm_provider":                ("llm",      "provider",          "ANDROSCAN_LLM_PROVIDER"),
     # DEC-028 — cloud knobs moved under their own ``cloud`` sub-section
     # (was flat under ``llm.cloud_*``); on-disk YAML path is
@@ -176,6 +177,7 @@ LIVE_RELOADABLE_FIELDS: frozenset[str] = frozenset({
     "ollama_temperature",
     "ollama_num_predict",
     "ollama_num_ctx",
+    "ollama_think",
     "llm_provider",
     "cloud_model",
     "cloud_api_key",
@@ -288,6 +290,10 @@ class Config:
     ollama_temperature: float
     ollama_num_predict: int
     ollama_num_ctx: int  # Phase 11 sub-step 11.6 / DEC-025
+    # Ollama thinking-mode emission. Default True preserves chain-of-thought
+    # output; flip via ``--ollama-think false`` for verbose-loop models like
+    # gemma4:26b. No-op for non-thinking models.
+    ollama_think: bool
     # "ollama" / "llamacpp" (local) or any key in LLM_PROVIDERS["cloud"]
     # (gemini / openai / groq / deepseek / together / mistral).
     llm_provider: str
@@ -346,6 +352,7 @@ class Config:
             ollama_temperature=0.2,
             ollama_num_predict=constants.OLLAMA_NUM_PREDICT_DEFAULT,
             ollama_num_ctx=constants.OLLAMA_NUM_CTX_DEFAULT,
+            ollama_think=constants.OLLAMA_THINK_DEFAULT,
             llm_provider="ollama",
             cloud_model="",
             cloud_api_key="",
@@ -536,6 +543,11 @@ def _merge_from_yaml(config_dict: dict[str, Any]) -> dict[str, Any]:
     out["ollama_temperature"] = _safe_float(ollama.get("temperature"), 0.2, "llm.ollama.temperature")
     out["ollama_num_predict"] = _safe_int(ollama.get("num_predict"), constants.OLLAMA_NUM_PREDICT_DEFAULT, "llm.ollama.num_predict")
     out["ollama_num_ctx"] = _safe_int(ollama.get("num_ctx"), constants.OLLAMA_NUM_CTX_DEFAULT, "llm.ollama.num_ctx")
+    # Ollama thinking-mode emission. Default True preserves chain-of-thought;
+    # flip via YAML or ``--ollama-think false`` for verbose-loop models like
+    # gemma4:26b. No-op for non-thinking models.
+    think_val = ollama.get("think")
+    out["ollama_think"] = bool(think_val) if think_val is not None else constants.OLLAMA_THINK_DEFAULT
     out["llm_provider"] = (llm.get("provider") or "ollama").strip().lower() if isinstance(llm, dict) else "ollama"
     # DEC-028 — cloud knobs read from ``llm.cloud.*`` (was the flat
     # ``llm.cloud_*``). Defaults preserve pre-DEC-028 semantics on a
@@ -759,6 +771,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 f"Warning: ANDROSCAN_OLLAMA_NUM_CTX={os.environ['ANDROSCAN_OLLAMA_NUM_CTX']!r} invalid; using default.",
                 file=sys.stderr,
             )
+    if os.environ.get("ANDROSCAN_OLLAMA_THINK"):
+        merged["ollama_think"] = os.environ["ANDROSCAN_OLLAMA_THINK"].strip().lower() in ("1", "true", "yes", "on")
     if os.environ.get("ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"):
         try:
             merged["web_screencap_interval_ms"] = max(50, int(os.environ["ANDROSCAN_WEB_SCREENCAP_INTERVAL_MS"].strip()))
@@ -775,6 +789,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
         ollama_temperature=merged["ollama_temperature"],
         ollama_num_predict=max(1, merged["ollama_num_predict"]),
         ollama_num_ctx=max(1, merged["ollama_num_ctx"]),
+        ollama_think=bool(merged.get("ollama_think", constants.OLLAMA_THINK_DEFAULT)),
         llm_provider=merged["llm_provider"],
         cloud_model=merged["cloud_model"],
         cloud_api_key=merged["cloud_api_key"],
@@ -921,6 +936,7 @@ def with_overrides(config: Config, **overrides: Any) -> Config:
         ollama_temperature=float(flat["ollama_temperature"]),
         ollama_num_predict=max(1, int(flat["ollama_num_predict"])),
         ollama_num_ctx=max(1, int(flat["ollama_num_ctx"])),
+        ollama_think=bool(flat.get("ollama_think", constants.OLLAMA_THINK_DEFAULT)),
         llm_provider=str(flat.get("llm_provider") or "ollama").strip().lower() or "ollama",
         cloud_model=str(flat.get("cloud_model") or "").strip(),
         cloud_api_key=str(flat.get("cloud_api_key") or "").strip(),
@@ -991,7 +1007,7 @@ def coerce_yaml_value(field: str, raw: Any) -> Any:
         "trace_max_slice_depth",
     }
     float_fields = {"ollama_temperature", "cloud_temperature"}
-    bool_fields = {"per_component_analysis", "local_grammar_enabled"}
+    bool_fields = {"per_component_analysis", "local_grammar_enabled", "ollama_think"}
     str_fields = {
         "ollama_base_url", "ollama_model",
         "llm_provider", "cloud_model", "cloud_api_key",

@@ -383,6 +383,7 @@ def _complete_ollama(
     # Phase 11 sub-step 11.6 / DEC-025 — see ``_stream_ollama`` for
     # the rationale on the num_ctx forward.
     num_ctx = getattr(config, "ollama_num_ctx", 16384)
+    think = getattr(config, "ollama_think", True)
 
     timeout_idx = 0
     num_predict_idx = 0
@@ -420,6 +421,7 @@ def _complete_ollama(
             "model": model_name,
             "messages": msgs,
             "stream": stream,
+            "think": bool(think),
             "options": {
                 "temperature": temperature,
                 "num_predict": current_num_predict,
