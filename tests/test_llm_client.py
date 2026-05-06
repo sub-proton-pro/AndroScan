@@ -1,0 +1,577 @@
+"""Tests for the LCP.2 llama.cpp HTTP path + the unified provider_kind()
+router in :mod:`androscan.llm.client`.
+
+The existing ``tests/test_llm.py`` covers the Ollama path and the
+prompt builder + parser; this file focuses on the new
+``_complete_llamacpp`` codepath, the ``<think>`` strip helper, and
+the three-way ``complete()`` dispatcher introduced in LCP.2 (DEC-027).
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+import requests
+
+from androscan.config import Config
+from androscan.llm.client import (
+    CompleteResult,
+    LLAMACPP_DEFAULT_MODEL_LABEL,
+    _build_llamacpp_messages,
+    _complete_llamacpp,
+    _resolve_llamacpp_base_url,
+    _strip_think_blocks,
+    _stream_llamacpp_sse,
+    complete,
+)
+
+
+# ---------------------------------------------------------------------------
+# <think>...</think> strip helper
+# ---------------------------------------------------------------------------
+
+
+class TestStripThinkBlocks:
+    """The defensive helper both local providers call for parity with
+    the Ollama native ``message.thinking`` channel."""
+
+    def test_no_think_block_is_idempotent(self) -> None:
+        text = '{"hypotheses": []}'
+        content, thinking = _strip_think_blocks(text)
+        assert content == text
+        assert thinking == ""
+
+    def test_empty_string_is_idempotent(self) -> None:
+        assert _strip_think_blocks("") == ("", "")
+
+    def test_extracts_single_think_block(self) -> None:
+        raw = '<think>Reasoning step.</think>\n{"hypotheses": []}'
+        content, thinking = _strip_think_blocks(raw)
+        assert content == '{"hypotheses": []}'
+        assert thinking == "Reasoning step."
+
+    def test_extracts_multiple_think_blocks(self) -> None:
+        raw = "<think>step 1</think> body <think>step 2</think> more"
+        content, thinking = _strip_think_blocks(raw)
+        assert "<think>" not in content.lower()
+        assert "step 1" in thinking
+        assert "step 2" in thinking
+
+    def test_handles_multiline_think_block(self) -> None:
+        raw = "<think>line1\nline2\nline3</think>\nbody"
+        content, thinking = _strip_think_blocks(raw)
+        assert content == "body"
+        assert "line1" in thinking and "line3" in thinking
+
+    def test_case_insensitive_matching(self) -> None:
+        raw = "<THINK>capital</THINK>body"
+        content, thinking = _strip_think_blocks(raw)
+        assert content == "body"
+        assert thinking == "capital"
+
+    def test_partial_open_tag_without_close_is_left_alone(self) -> None:
+        """A stray ``<think`` substring with no matching close tag must
+        NOT eat the rest of the response — operators would lose real
+        JSON content. The helper returns the input unchanged."""
+        raw = "{'foo': '<think malformed'}"
+        content, thinking = _strip_think_blocks(raw)
+        assert content == raw
+        assert thinking == ""
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp base URL resolution
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLlamacppBaseUrl:
+    """v1 LCP.2 falls back to the registry default; LCP.4 will add
+    ``llamacpp_base_url`` Config field."""
+
+    def test_falls_back_to_registry_default_for_default_config(self) -> None:
+        cfg = Config.default()
+        assert _resolve_llamacpp_base_url(cfg) == "http://127.0.0.1:8033/v1"
+
+    def test_strips_trailing_slash_from_custom_field(self) -> None:
+        """Future LCP.4 field-level override must be normalised the same
+        way as the registry default — no double-slash when joined to
+        ``/chat/completions``."""
+        cfg = MagicMock(llamacpp_base_url="http://127.0.0.1:9999/v1/")
+        assert _resolve_llamacpp_base_url(cfg) == "http://127.0.0.1:9999/v1"
+
+    def test_empty_custom_field_falls_back_to_default(self) -> None:
+        cfg = MagicMock(llamacpp_base_url="")
+        assert _resolve_llamacpp_base_url(cfg) == "http://127.0.0.1:8033/v1"
+
+
+# ---------------------------------------------------------------------------
+# Request body shape
+# ---------------------------------------------------------------------------
+
+
+def _make_llamacpp_mock_config() -> MagicMock:
+    """Build a MagicMock Config that the LCP.2 dispatcher routes
+    through the llama.cpp branch.
+
+    Pins ``llamacpp_base_url`` and ``llamacpp_model`` to ``None``
+    explicitly — without these, MagicMock's auto-attribute spawning
+    would shadow the ``getattr(config, "...", None)`` defaults inside
+    :func:`_resolve_llamacpp_base_url` and :func:`_complete_llamacpp`,
+    making the registry-default fallback paths un-testable."""
+    cfg = MagicMock(
+        ollama_temperature=0.2,
+        ollama_num_predict=8192,
+        llm_provider="llamacpp",
+        llamacpp_base_url=None,
+        llamacpp_model=None,
+    )
+    cfg.provider_kind.return_value = "local-openai-compat"
+    return cfg
+
+
+def _make_llamacpp_mock_resp(content: str = '{"hypotheses": []}') -> MagicMock:
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "choices": [{
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    return resp
+
+
+class TestLlamacppRequestBodyShape:
+    """The body sent to ``/v1/chat/completions`` MUST match the OpenAI
+    chat-completions schema so ``llama-server`` (and any other
+    OpenAI-compat shim) accepts it."""
+
+    @staticmethod
+    def _mock_resp(content: str = '{"hypotheses": []}') -> MagicMock:
+        return _make_llamacpp_mock_resp(content)
+
+    @staticmethod
+    def _mock_config() -> MagicMock:
+        return _make_llamacpp_mock_config()
+
+    def test_body_contains_messages_with_system_and_user(self) -> None:
+        config = self._mock_config()
+        with patch("androscan.llm.client.requests.post", return_value=self._mock_resp()) as post_mock:
+            _complete_llamacpp(
+                "test prompt", config, system_content="sys hint", stream=False,
+            )
+        body = post_mock.call_args.kwargs["json"]
+        roles = [m["role"] for m in body["messages"]]
+        assert roles == ["system", "user"]
+        assert body["messages"][0]["content"] == "sys hint"
+        assert body["messages"][1]["content"] == "test prompt"
+
+    def test_body_carries_temperature_and_max_tokens_from_ollama_fields(self) -> None:
+        """v1 LCP.2: llama.cpp re-uses the ``ollama_*`` Config fields
+        for temperature + max_tokens. LCP.4 adds parallel
+        ``llamacpp_*`` fields if operators report drift."""
+        config = self._mock_config()
+        with patch("androscan.llm.client.requests.post", return_value=self._mock_resp()) as post_mock:
+            _complete_llamacpp("test", config, stream=False)
+        body = post_mock.call_args.kwargs["json"]
+        assert body["temperature"] == 0.2
+        assert body["max_tokens"] == 8192
+
+    def test_body_sets_response_format_when_json_requested(self) -> None:
+        """response_format='json' (analysis pipeline default) must
+        translate to the OpenAI ``response_format: {"type":
+        "json_object"}`` flavour."""
+        config = self._mock_config()
+        with patch("androscan.llm.client.requests.post", return_value=self._mock_resp()) as post_mock:
+            _complete_llamacpp(
+                "test", config, stream=False, response_format="json",
+            )
+        body = post_mock.call_args.kwargs["json"]
+        assert body["response_format"] == {"type": "json_object"}
+
+    def test_body_omits_response_format_when_not_json(self) -> None:
+        """workbench chat path passes ``response_format=None`` for prose
+        replies — no ``response_format`` key at all on the wire."""
+        config = self._mock_config()
+        with patch("androscan.llm.client.requests.post", return_value=self._mock_resp()) as post_mock:
+            _complete_llamacpp(
+                "test", config, stream=False, response_format=None,
+            )
+        body = post_mock.call_args.kwargs["json"]
+        assert "response_format" not in body
+
+    def test_body_uses_default_model_label_when_no_model_arg(self) -> None:
+        """``llama-server`` ignores the request-body ``model`` field
+        (it serves whatever was loaded at startup), but the schema
+        still requires the field. The default label keeps logs +
+        upstream metrics readable."""
+        config = self._mock_config()
+        with patch("androscan.llm.client.requests.post", return_value=self._mock_resp()) as post_mock:
+            _complete_llamacpp("test", config, stream=False)
+        body = post_mock.call_args.kwargs["json"]
+        assert body["model"] == LLAMACPP_DEFAULT_MODEL_LABEL
+
+    def test_url_targets_chat_completions_endpoint(self) -> None:
+        config = self._mock_config()
+        with patch("androscan.llm.client.requests.post", return_value=self._mock_resp()) as post_mock:
+            _complete_llamacpp("test", config, stream=False)
+        url = post_mock.call_args.args[0]
+        assert url.endswith("/v1/chat/completions")
+
+
+# ---------------------------------------------------------------------------
+# SSE stream parsing
+# ---------------------------------------------------------------------------
+
+
+class _FakeStreamResponse:
+    """Minimal stand-in for :class:`requests.Response` in stream=True
+    mode — yields the canned SSE lines on ``iter_lines()`` and is a
+    valid context manager."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def __enter__(self) -> "_FakeStreamResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_lines(self, decode_unicode: bool = True) -> list[str]:
+        return list(self._lines)
+
+
+class TestLlamacppSseParsing:
+    """OpenAI-style SSE chunks: ``data: {json}\\n\\n``, terminating
+    with ``data: [DONE]``. Empty + unrelated lines are tolerated."""
+
+    def test_concatenates_delta_content_across_chunks(self) -> None:
+        lines = [
+            'data: {"choices":[{"delta":{"content":"Hello "},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":"world"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        with patch("androscan.llm.client.requests.post", return_value=_FakeStreamResponse(lines)):
+            result = _stream_llamacpp_sse(
+                "http://x/v1/chat/completions", {"model": "m", "messages": []},
+                timeout=10, on_token=None, on_thinking=None,
+            )
+        assert result.content == "Hello world"
+        assert result.metadata["done_reason"] == "stop"
+
+    def test_invokes_on_token_for_each_content_delta(self) -> None:
+        lines = [
+            'data: {"choices":[{"delta":{"content":"A"}}]}',
+            'data: {"choices":[{"delta":{"content":"B"}}]}',
+            "data: [DONE]",
+        ]
+        seen: list[str] = []
+        with patch("androscan.llm.client.requests.post", return_value=_FakeStreamResponse(lines)):
+            _stream_llamacpp_sse(
+                "http://x", {}, timeout=10,
+                on_token=seen.append, on_thinking=None,
+            )
+        assert seen == ["A", "B"]
+
+    def test_tolerates_empty_lines_and_done_sentinel(self) -> None:
+        lines = [
+            "",
+            'data: {"choices":[{"delta":{"content":"X"}}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        with patch("androscan.llm.client.requests.post", return_value=_FakeStreamResponse(lines)):
+            result = _stream_llamacpp_sse(
+                "http://x", {}, timeout=10,
+                on_token=None, on_thinking=None,
+            )
+        assert result.content == "X"
+
+    def test_strips_leaked_think_blocks_during_stream_collection(self) -> None:
+        """If the model leaks ``<think>...</think>`` into the content
+        delta, the assembled content must be the post-strip text and
+        the captured thinking flows through the thinking channel."""
+        lines = [
+            'data: {"choices":[{"delta":{"content":"<think>scratch</think>"}}]}',
+            'data: {"choices":[{"delta":{"content":"final"}}]}',
+            "data: [DONE]",
+        ]
+        with patch("androscan.llm.client.requests.post", return_value=_FakeStreamResponse(lines)):
+            result = _stream_llamacpp_sse(
+                "http://x", {}, timeout=10,
+                on_token=None, on_thinking=None,
+            )
+        assert result.content == "final"
+        assert "scratch" in result.thinking
+
+    def test_skips_malformed_sse_chunks_without_crashing(self) -> None:
+        """A real-world ``llama-server`` run can emit a malformed line
+        on quantized variants — the parser must not abort the stream."""
+        lines = [
+            'data: {"choices":[{"delta":{"content":"ok "}}]}',
+            "data: not-json-at-all",
+            'data: {"choices":[{"delta":{"content":"recovered"}}]}',
+            "data: [DONE]",
+        ]
+        with patch("androscan.llm.client.requests.post", return_value=_FakeStreamResponse(lines)):
+            result = _stream_llamacpp_sse(
+                "http://x", {}, timeout=10,
+                on_token=None, on_thinking=None,
+            )
+        assert result.content == "ok recovered"
+
+
+# ---------------------------------------------------------------------------
+# Retry logic on transient HTTP errors
+# ---------------------------------------------------------------------------
+
+
+class TestLlamacppTransientErrorRetry:
+    """Timeout escalation + retryable HTTP status set
+    ``{429, 500, 502, 503, 504}``. Connection errors fail fast — the
+    operator's most likely cause is "llama-server isn't running" and
+    a setup hint is the right nudge."""
+
+    @staticmethod
+    def _mock_config() -> MagicMock:
+        return _make_llamacpp_mock_config()
+
+    def test_connection_error_fails_fast_with_setup_hint(self) -> None:
+        config = self._mock_config()
+        with patch("androscan.llm.client.requests.post", side_effect=requests.ConnectionError):
+            with pytest.raises(RuntimeError, match="Cannot connect to llama-server"):
+                _complete_llamacpp("test", config, stream=False)
+
+    def test_timeout_escalates_through_tiers_then_raises(self) -> None:
+        """Three timeout tiers (120 / 240 / 480) — after exhausting
+        them the function raises with ``timed out`` in the message."""
+        config = self._mock_config()
+        with patch(
+            "androscan.llm.client.requests.post", side_effect=requests.Timeout,
+        ) as post_mock:
+            with pytest.raises(RuntimeError, match="timed out"):
+                _complete_llamacpp("test", config, stream=False)
+        # Exactly three POST attempts (one per timeout tier).
+        assert post_mock.call_count == 3
+
+    def test_http_503_retries_then_succeeds(self) -> None:
+        """Transient 503 (model still loading) retries; the third
+        attempt succeeds and the function returns the parsed
+        result."""
+        config = self._mock_config()
+
+        bad_resp = MagicMock()
+        bad_resp.status_code = 503
+        bad_err = requests.HTTPError("503 Service Unavailable")
+        bad_err.response = bad_resp
+        bad_resp.raise_for_status.side_effect = bad_err
+        bad_resp.json.return_value = {}
+        bad_resp.text = ""
+
+        good_resp = MagicMock()
+        good_resp.raise_for_status = MagicMock()
+        good_resp.json.return_value = {
+            "choices": [{
+                "message": {"role": "assistant", "content": '{"ok": true}'},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+        responses = [bad_resp, bad_resp, good_resp]
+        with patch(
+            "androscan.llm.client.requests.post", side_effect=responses,
+        ) as post_mock:
+            result = _complete_llamacpp("test", config, stream=False)
+        assert result.content == '{"ok": true}'
+        assert post_mock.call_count == 3
+
+    def test_http_400_does_not_retry(self) -> None:
+        """A 4xx (other than 429) is operator error (bad payload, bad
+        model name); retrying would just amplify the wrong request."""
+        config = self._mock_config()
+        bad_resp = MagicMock()
+        bad_resp.status_code = 400
+        bad_err = requests.HTTPError("400 Bad Request")
+        bad_err.response = bad_resp
+        bad_resp.raise_for_status.side_effect = bad_err
+        bad_resp.json.return_value = {"error": "bad model name"}
+        bad_resp.text = '{"error":"bad model name"}'
+
+        with patch(
+            "androscan.llm.client.requests.post", return_value=bad_resp,
+        ) as post_mock:
+            with pytest.raises(RuntimeError, match="HTTP 400"):
+                _complete_llamacpp("test", config, stream=False)
+        assert post_mock.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Response handling — empty body + <think> strip in non-stream path
+# ---------------------------------------------------------------------------
+
+
+class TestLlamacppNonStreamResponseHandling:
+    """Non-stream path mirrors the SSE path's <think> strip; the
+    operator-visible empty-body error includes the setup tip."""
+
+    @staticmethod
+    def _mock_config() -> MagicMock:
+        return _make_llamacpp_mock_config()
+
+    def test_empty_response_raises_with_setup_tip(self) -> None:
+        config = self._mock_config()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            "choices": [{
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1},
+        }
+        with patch("androscan.llm.client.requests.post", return_value=resp):
+            with pytest.raises(RuntimeError, match="empty response"):
+                _complete_llamacpp("test", config, stream=False)
+
+    def test_strips_think_block_from_non_stream_content(self) -> None:
+        config = self._mock_config()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": '<think>plan</think>{"hypotheses": []}',
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        with patch("androscan.llm.client.requests.post", return_value=resp):
+            result = _complete_llamacpp("test", config, stream=False)
+        assert result.content == '{"hypotheses": []}'
+        assert "plan" in result.thinking
+
+
+# ---------------------------------------------------------------------------
+# Three-way complete() router
+# ---------------------------------------------------------------------------
+
+
+class TestCompleteRouterDispatch:
+    """The LCP.2 router is a switch on ``Config.provider_kind()``. The
+    tests for each branch use a real ``Config`` (not MagicMock) so
+    the actual ``provider_kind()`` reverse-lookup is exercised — the
+    other branches are mocked at the next layer down."""
+
+    @staticmethod
+    def _config_with_provider(name: str, **overrides) -> Config:
+        import dataclasses
+        defaults = dict(llm_provider=name, cloud_api_key="")
+        defaults.update(overrides)
+        return dataclasses.replace(Config.default(), **defaults)
+
+    def test_provider_ollama_dispatches_to_complete_ollama(self) -> None:
+        config = self._config_with_provider("ollama")
+        sentinel = CompleteResult(content="o", thinking="", metadata={})
+        with patch(
+            "androscan.llm.client._complete_ollama", return_value=sentinel,
+        ) as ollama_mock, patch(
+            "androscan.llm.client._complete_llamacpp", return_value=None,
+        ) as llamacpp_mock, patch(
+            "androscan.llm.client._complete_cloud", return_value=None,
+        ) as cloud_mock:
+            result = complete("p", config=config)
+        assert result is sentinel
+        ollama_mock.assert_called_once()
+        llamacpp_mock.assert_not_called()
+        cloud_mock.assert_not_called()
+
+    def test_provider_llamacpp_dispatches_to_complete_llamacpp(self) -> None:
+        config = self._config_with_provider("llamacpp")
+        sentinel = CompleteResult(content="l", thinking="", metadata={})
+        with patch(
+            "androscan.llm.client._complete_ollama", return_value=None,
+        ) as ollama_mock, patch(
+            "androscan.llm.client._complete_llamacpp", return_value=sentinel,
+        ) as llamacpp_mock, patch(
+            "androscan.llm.client._complete_cloud", return_value=None,
+        ) as cloud_mock:
+            result = complete("p", config=config)
+        assert result is sentinel
+        llamacpp_mock.assert_called_once()
+        ollama_mock.assert_not_called()
+        cloud_mock.assert_not_called()
+
+    def test_provider_openai_dispatches_to_complete_cloud(self) -> None:
+        """Any cloud provider name routes through the cloud branch.
+        Picking ``openai`` here is representative."""
+        config = self._config_with_provider(
+            "openai", cloud_model="gpt-x", cloud_api_key="sk-test",
+        )
+        sentinel = CompleteResult(content="c", thinking="", metadata={})
+        with patch(
+            "androscan.llm.client._complete_ollama", return_value=None,
+        ) as ollama_mock, patch(
+            "androscan.llm.client._complete_llamacpp", return_value=None,
+        ) as llamacpp_mock, patch(
+            "androscan.llm.client._complete_cloud", return_value=sentinel,
+        ) as cloud_mock:
+            result = complete("p", config=config)
+        assert result is sentinel
+        cloud_mock.assert_called_once()
+        ollama_mock.assert_not_called()
+        llamacpp_mock.assert_not_called()
+
+    def test_unknown_provider_falls_back_to_cloud_branch(self) -> None:
+        """``provider_kind`` returns ``cloud`` for unknown names —
+        :func:`_complete_cloud` then surfaces the existing "no API
+        key" error path. Pin this in: it's the contract Settings UI
+        relies on for typo-detection."""
+        config = self._config_with_provider("unknown-provider")
+        sentinel = CompleteResult(content="x", thinking="", metadata={})
+        with patch(
+            "androscan.llm.client._complete_cloud", return_value=sentinel,
+        ) as cloud_mock:
+            result = complete("p", config=config)
+        assert result is sentinel
+        cloud_mock.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Build helpers
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLlamacppMessages:
+    """Same OpenAI-compat schema as the cloud path — but kept as a
+    parallel function so future llama.cpp-specific image-handling
+    tweaks don't have to branch inside the cloud builder."""
+
+    def test_text_only_message_omits_image_parts(self) -> None:
+        msgs = _build_llamacpp_messages("sys", "user")
+        assert msgs == [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "user"},
+        ]
+
+    def test_no_system_content_emits_user_only(self) -> None:
+        msgs = _build_llamacpp_messages(None, "user")
+        assert msgs == [{"role": "user", "content": "user"}]
+
+    def test_images_produce_multimodal_content_array(self) -> None:
+        msgs = _build_llamacpp_messages("sys", "describe", images=["B64DATA"])
+        user_msg = msgs[1]
+        assert user_msg["role"] == "user"
+        parts = user_msg["content"]
+        assert isinstance(parts, list)
+        assert parts[0] == {"type": "text", "text": "describe"}
+        assert parts[1]["type"] == "image_url"
+        assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")

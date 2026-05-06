@@ -76,6 +76,10 @@ def test_complete_calls_ollama_and_returns_response():
         llm_provider="ollama",
         is_cloud=False,
     )
+    # LCP.2: complete() now routes via provider_kind(); pre-LCP.2 mocks
+    # only set is_cloud=False, which would route an unset provider_kind
+    # MagicMock through the cloud branch. Pin it explicitly.
+    config.provider_kind.return_value = "local-ollama"
     with patch("androscan.llm.client.requests.post", return_value=mock_resp) as post_mock:
         result = complete("test prompt", config=config, stream=False)
     assert isinstance(result, CompleteResult)
@@ -89,9 +93,27 @@ def test_complete_calls_ollama_and_returns_response():
     assert call_kw["json"]["stream"] is False
 
 
+def _ollama_mock_config(**overrides) -> MagicMock:
+    """Helper: build a MagicMock Config that routes through the
+    Ollama branch under the LCP.2 provider_kind() dispatcher."""
+    base = dict(
+        ollama_base_url="http://localhost:11434",
+        ollama_timeout_sec=10,
+        ollama_model="x",
+        ollama_temperature=0.2,
+        ollama_num_predict=8192,
+        llm_provider="ollama",
+        is_cloud=False,
+    )
+    base.update(overrides)
+    cfg = MagicMock(**base)
+    cfg.provider_kind.return_value = "local-ollama"
+    return cfg
+
+
 def test_complete_raises_on_connection_error():
     """complete() raises RuntimeError when Ollama is unreachable."""
-    config = MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=5, ollama_model="x", ollama_temperature=0.2, ollama_num_predict=8192, llm_provider="ollama", is_cloud=False)
+    config = _ollama_mock_config(ollama_timeout_sec=5)
     with patch("androscan.llm.client.requests.post", side_effect=requests.ConnectionError):
         with pytest.raises(RuntimeError, match="Cannot connect to Ollama"):
             complete("test", config=config)
@@ -99,7 +121,7 @@ def test_complete_raises_on_connection_error():
 
 def test_complete_raises_on_timeout():
     """complete() raises RuntimeError on request timeout after retries."""
-    config = MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x", ollama_temperature=0.2, ollama_num_predict=8192, llm_provider="ollama", is_cloud=False)
+    config = _ollama_mock_config()
     with patch("androscan.llm.client.requests.post", side_effect=requests.Timeout):
         with pytest.raises(RuntimeError, match="timed out"):
             complete("test", config=config)
@@ -112,7 +134,7 @@ def test_complete_raises_friendly_message_on_404():
     http_err = requests.HTTPError("404 Not Found")
     http_err.response = mock_resp
     mock_resp.raise_for_status.side_effect = http_err
-    config = MagicMock(ollama_base_url="http://localhost:11434", ollama_timeout_sec=10, ollama_model="x", ollama_temperature=0.2, ollama_num_predict=8192, llm_provider="ollama", is_cloud=False)
+    config = _ollama_mock_config()
     mock_resp.json.return_value = {}  # so _parse_http_error uses generic 404 message
     with patch("androscan.llm.client.requests.post", return_value=mock_resp):
         with pytest.raises(RuntimeError) as exc_info:
