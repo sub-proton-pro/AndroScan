@@ -354,6 +354,7 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
     pendingChatPrefill,
     setPendingChatPrefill,
     dossier,
+    bumpTraceCacheVersion,
   } = useWorkbench();
 
   // v2.1.8 — chat dock right-pane handle + collapsed state. Mirrors
@@ -585,11 +586,20 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
 
   // After a successful Build, bump the reload tick so the status +
   // cached list pick up the new row.
+  //
+  // v2.1.10 — also bump the context-level ``traceCacheVersion`` so
+  // the ``LabTab.ManualHooksMode`` overlay re-fetches its
+  // ``anchoredMethods`` map. v2.1.10 always-mounts both Lab modes
+  // simultaneously (so Trace state survives mode-hops); the previous
+  // unmount-on-switch design relied on the remount to re-fire the
+  // overlay fetch — see the ``traceCacheVersion`` doc-block in
+  // WorkbenchContext.tsx for the full rationale.
   useEffect(() => {
     if (state.kind === "loaded" && state.from === "build") {
       setCachedReloadTick((t) => t + 1);
+      bumpTraceCacheVersion();
     }
-  }, [state]);
+  }, [state, bumpTraceCacheVersion]);
 
   const lowConfidenceSet = useMemo(() => {
     if (state.kind !== "loaded") return new Set<number>();
@@ -931,6 +941,11 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
         clear();
       }
       setCachedReloadTick((t) => t + 1);
+      // v2.1.10 — see the post-build effect above for the rationale.
+      // Manual Hooks's anchoredMethods overlay reads from the same
+      // cache; a delete removes glyphs that the overlay was carrying,
+      // so the consumer needs the same refresh signal.
+      bumpTraceCacheVersion();
     }
   };
 

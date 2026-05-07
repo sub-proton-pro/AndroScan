@@ -177,6 +177,41 @@ type WorkbenchState = {
   pendingChatPrefill: PendingChatPrefill | null;
   setPendingChatPrefill: (p: PendingChatPrefillInput | null) => void;
 
+  // Phase 11 v2.1 sub-step v2.1.10: cross-Lab-mode "the trace cache
+  // for the active app changed" signal. Bumped by ``LabTraceMode``
+  // after a successful Build / Delete; consumed by
+  // ``LabTab.ManualHooksMode``'s ``anchoredMethods`` effect (which
+  // builds the ``CallGraphView`` overlay glyphs from the cache) so
+  // the overlay refreshes immediately after a Trace-mode mutation.
+  //
+  // Why a counter and not a snapshot of the cache rows: the consumer
+  // needs to *re-fetch*, not consume a payload — this is a
+  // "something changed, reload" signal. Counter beats a boolean
+  // because successive bumps within one render commit are
+  // distinguishable (the consumer's effect runs once per fresh
+  // value, not once total). Mirrors the local ``cachedReloadTick`` /
+  // ``sessionsRefreshTick`` patterns inside LabTab.tsx but lifts the
+  // counter to context because v2.1.10's "always-mount Trace + Manual
+  // Hooks" change means the two modes are now siblings in the React
+  // tree (formerly mutually-exclusive conditional renders) and can't
+  // share a local prop-thread.
+  //
+  // Pre-v2.1.10, ManualHooksMode was unmounted whenever ``labMode !==
+  // "manual-hooks"``, so any Trace-mode build / delete became visible
+  // on the next mode hop simply by virtue of the effect re-running
+  // on remount. v2.1.10 keeps both modes mounted simultaneously
+  // (Trace state survives mode-hops, see DEC-025 closing-note v2.1.10
+  // sub-bullet) so the freshness-via-remount pattern no longer
+  // applies and we need an explicit refresh signal.
+  //
+  // Reset semantics: NOT reset on appId change — the consumer
+  // already keys its effect on appId, and a stale counter from a
+  // previous app is harmless (the consumer's effect re-fires on
+  // appId change anyway). Keeping the counter monotonic across app
+  // changes simplifies reasoning ("counter went up → re-fetch").
+  traceCacheVersion: number;
+  bumpTraceCacheVersion: () => void;
+
   // per-tab chat history (persisted client-side)
   chats: Record<TabId, ChatMessage[]>;
   appendChat: (tab: TabId, msg: ChatMessage) => void;
@@ -286,6 +321,7 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   const [pendingChatPrefill, setPendingChatPrefillState] =
     useState<PendingChatPrefill | null>(null);
   const [labMode, setLabModeState] = useState<LabMode>(() => loadStoredLabMode());
+  const [traceCacheVersion, setTraceCacheVersion] = useState<number>(0);
   const [mapResult, setMapResult] = useState<MapResult | null>(null);
   const [mapBusy, setMapBusy] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
@@ -453,6 +489,10 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const bumpTraceCacheVersion = useCallback(() => {
+    setTraceCacheVersion((v) => v + 1);
+  }, []);
+
   const setLabMode = useCallback((m: LabMode) => {
     setLabModeState(m);
     try {
@@ -531,6 +571,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setPendingSettingsSection,
       pendingChatPrefill,
       setPendingChatPrefill,
+      traceCacheVersion,
+      bumpTraceCacheVersion,
       mapResult,
       mapBusy,
       mapError,
@@ -567,6 +609,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
       setPendingSettingsSection,
       pendingChatPrefill,
       setPendingChatPrefill,
+      traceCacheVersion,
+      bumpTraceCacheVersion,
       mapResult,
       mapBusy,
       mapError,

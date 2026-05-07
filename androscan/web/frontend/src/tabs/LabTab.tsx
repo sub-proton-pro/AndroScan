@@ -163,15 +163,45 @@ export function LabTab() {
         ))}
       </nav>
       <div className="lab-mode-content">
-        {labMode === "trace" && (
+        {/* v2.1.10 — Trace + Manual Hooks are always-mounted with
+            ``display:none`` toggling, so the operator's in-progress
+            state (entry draft, loaded ``BehaviorAnchor``, decompile
+            tree, hook builder draft, active Frida session, ChatDock
+            scroll position, etc.) survives mode-hops within the Lab
+            tab. Pre-v2.1.10 these were conditional renders that
+            unmounted the inactive mode and lost all local state on
+            return; the regression was operator-reported on the v2.1.9
+            ship vehicle. Graph mode stays conditional (per operator
+            scope choice on the v2.1.10 design questionnaire) — its
+            single-pane CallGraphView mounts a Cytoscape Web Worker
+            that's measurably expensive to keep idle, and the
+            operator's Graph-mode state (cytoscape pan / zoom) is
+            owned inside the cytoscape instance which already serialises
+            its own viewport across remounts via the localStorage
+            cache the Inspect graph also uses.
+            
+            The Manual Hooks ``anchoredMethods`` overlay used to
+            refresh on remount-after-Trace-build (lines 436-441
+            doc-block); v2.1.10 replaces that pattern with the
+            ``traceCacheVersion`` counter on ``WorkbenchContext`` —
+            see the doc-block in WorkbenchContext.tsx and the
+            ``bumpTraceCacheVersion`` calls in
+            ``LabTraceMode``'s post-Build / post-Delete effects. */}
+        <div
+          className="lab-mode-content-pane"
+          hidden={labMode !== "trace"}
+        >
           <LabTraceMode
             appId={appId}
             onActiveAnchorChange={handleActiveAnchorChange}
           />
-        )}
-        {labMode === "manual-hooks" && (
+        </div>
+        <div
+          className="lab-mode-content-pane"
+          hidden={labMode !== "manual-hooks"}
+        >
           <ManualHooksMode activeAnchor={activeAnchor} />
-        )}
+        </div>
         {labMode === "graph" && <GraphMode />}
       </div>
     </div>
@@ -211,9 +241,22 @@ function GraphMode() {
 
 // ---------------------------------------------------------------------------
 // Manual Hooks mode — the legacy Hook Lab 3-column layout, untouched from the
-// pre-10.6 surface. Lifted into its own component so the mode switch is a
-// clean conditional render (avoids re-running ManualHooksMode's effects on
-// every mode hop).
+// pre-10.6 surface. Lifted into its own component so the parent ``LabTab``
+// can mount it (v2.1.10) inside a ``[hidden]``-toggled wrapper without
+// dragging the rest of LabTab's render tree into the always-mounted shape.
+//
+// **v2.1.10 — always-mounted via the parent's ``.lab-mode-content-pane``
+// wrapper** so the operator's in-progress state (Frida session, hook
+// builder draft, scope tab choice, ChatDock scroll position, decompiled
+// source cache) survives Lab-mode hops. The Trace mode beside it is also
+// always-mounted; only Graph mode keeps the conditional render (its
+// Cytoscape Web Worker is measurably expensive to keep idle).
+//
+// One legacy assumption broken by v2.1.10: the ``anchoredMethods`` overlay
+// fetch used to rely on remount-after-Trace-build to refresh — see the
+// ``v2.1.10`` paragraph in the ``BehaviorAnchor → Cytoscape overlay map``
+// doc-block below for how the explicit ``traceCacheVersion`` counter on
+// ``WorkbenchContext`` replaces that pattern.
 // ---------------------------------------------------------------------------
 
 function ManualHooksMode({
@@ -226,7 +269,7 @@ function ManualHooksMode({
    *  without leaving Manual Hooks mode. */
   activeAnchor: BehaviorAnchor | null;
 }) {
-  const { appId, dossier, pendingChatPrefill } = useWorkbench();
+  const { appId, dossier, pendingChatPrefill, traceCacheVersion } = useWorkbench();
   const [selected, setSelected] = useState<SelectedNode | null>(null);
 
   // Active trace target. Either the most-recently-Injected session, or
@@ -433,11 +476,18 @@ function ManualHooksMode({
   // -------------------------------------------------------------------------
   // BehaviorAnchor → Cytoscape overlay map (Phase 11 sub-step 11.3).
   //
-  // Fetched once per (appId, mount) — ``ManualHooksMode`` is unmounted
-  // when ``labMode !== "manual-hooks"`` (LabTab uses conditional
-  // rendering at line 165), so any trace build / delete in Trace mode
-  // is naturally visible the next time the operator switches back: the
-  // mode-switch re-mounts this component and fires the effect fresh.
+  // v2.1.10 — re-fetched on (appId change) OR (traceCacheVersion bump
+  // from ``LabTraceMode``'s post-Build / post-Delete effects). The
+  // pre-v2.1.10 design fetched once per (appId, mount) and relied on
+  // ``ManualHooksMode`` being unmounted when ``labMode !== "manual-
+  // hooks"`` so a Trace-mode build / delete became visible on the
+  // next mode hop simply by virtue of the effect re-running on
+  // remount. v2.1.10 always-mounts both Trace and Manual Hooks (so
+  // Trace state survives mode-hops, see DEC-025 closing-note v2.1.10
+  // sub-bullet) which dissolves the freshness-via-remount pattern;
+  // ``traceCacheVersion`` on ``WorkbenchContext`` is the explicit
+  // refresh signal that replaces it. See WorkbenchContext.tsx's
+  // ``traceCacheVersion`` doc-block for the counter rationale.
   //
   // The fetch returns 404 on "no traces ever built" and 200+empty on
   // "built then cleared" — the consumer treats both as "no overlay,
@@ -468,7 +518,7 @@ function ManualHooksMode({
     return () => {
       cancelled = true;
     };
-  }, [appId]);
+  }, [appId, traceCacheVersion]);
 
   const anchoredMethods = useMemo<ReadonlyMap<string, AnchoredMethodMeta> | null>(() => {
     if (anchoredMethodRows == null) return null;

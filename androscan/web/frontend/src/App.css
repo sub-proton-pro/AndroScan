@@ -2325,12 +2325,29 @@ code { color: var(--accent); }
   margin-top: 2px;
 }
 
+/* v2.1.10 — the scroller lives on ``.settings-panel-host`` (the
+   right column of the ``.settings-tab`` grid) instead of on the
+   inner ``.settings-panel-body`` it used to live on. The previous
+   shape (host: overflow-hidden + body: overflow-auto inside a
+   max-width-centered .settings-panel) put the scrollbar at the
+   inner panel's right edge — typically 24px (panel right padding)
+   or more (when the panel was centered inside a wider host). v2.1.10
+   moves the scrollbar out to the host's right edge, which is the
+   absolute right edge of the right column (i.e. the "extreme right
+   of the page" minus the 240px settings-nav). The sticky-header
+   trick below keeps the panel header pinned at the top while the
+   body scrolls — same operator UX as before, scrollbar in a more
+   sensible place.
+
+   Affects all four settings sub-panels (Global / App / Status /
+   Diagnostics) since they share the .settings-panel shell. */
 .settings-panel-host {
   display: flex;
   flex-direction: column;
   align-items: stretch;
   min-height: 0;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .settings-panel {
@@ -2345,13 +2362,29 @@ code { color: var(--accent); }
   box-sizing: border-box;
 }
 
+/* v2.1.10 — body is no longer a scroller (the .settings-panel-host
+   above is). Reduced to a plain content block; ``flex: 1`` +
+   ``min-height: 0`` are dropped because the host's scroll absorbs
+   the overflow now. ``padding-top`` carries the spacing that used
+   to come from the header's ``margin-bottom: 16px`` (dropped because
+   with the header now ``position: sticky`` the margin would leave
+   a transparent strip below the header that scrolled content
+   could show through). ``padding-bottom`` retained so the bottom-
+   most content has visual breathing-room from the scroll viewport's
+   bottom edge. */
 .settings-panel-body {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
+  padding-top: 16px;
   padding-bottom: 16px;
 }
 
+/* v2.1.10 — sticky to the top of the host's scroll viewport.
+   ``background: var(--bg)`` matches the page underlay so scrolled
+   content doesn't bleed through. ``z-index: 2`` clears the
+   .settings-banner (z-index: auto / 0 by default) and any nested
+   form chrome that could otherwise paint on top of the header
+   during scroll. ``margin-bottom`` is dropped (the spacing the old
+   margin-bottom provided is now in .settings-panel-body's
+   padding-top above). */
 .settings-panel-header {
   display: flex;
   align-items: flex-end;
@@ -2359,7 +2392,10 @@ code { color: var(--accent); }
   gap: 16px;
   border-bottom: 1px solid var(--border);
   padding-bottom: 12px;
-  margin-bottom: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg);
 }
 
 .settings-panel-header h2 {
@@ -4230,9 +4266,32 @@ code { color: var(--accent); }
   color: var(--muted);
 }
 
+/* v2.1.10 — compressibility constraints on the label cell.
+   ``.trace-row-meta`` is a CSS Grid with the label as an ``auto``
+   track and the payload as ``1fr``. Pre-v2.1.10 the label cell had
+   no width / overflow rules, so an unbreakable label like
+   ``onCreate$lambda$0_trace`` (no spaces / hyphens / break opps)
+   forced the ``auto`` track to its full max-content width, leaving
+   the ``1fr`` payload track at near-zero in narrow panes (the
+   Manual Hooks right column defaults to 22% of the Lab tab width).
+   The expanded payload then wrapped every ~8-10 chars via
+   ``overflow-wrap: anywhere``, rendering JSON as a tall narrow
+   "column" instead of a wider row — operator-reported on the v2.1.9
+   ship vehicle.
+   v2.1.10 caps the label at 14rem and ellipsis-truncates anything
+   longer, freeing the payload column to take the remaining width.
+   The full label is still readable via the row's existing
+   ``title={compact}`` browser tooltip + the chevron-expand renders
+   the label inline in the payload's first key (e.g.
+   ``{label:"onCreate$lambda$0_trace",phase:"entry",…}``). */
 .trace-label {
   color: var(--text);
   font-weight: 600;
+  min-width: 0;
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Payload column — the trailing ``1fr`` cell of ``.trace-row-meta``.
@@ -4704,6 +4763,24 @@ code { color: var(--accent); }
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* v2.1.10 — wrapper for the always-mounted Trace + Manual Hooks
+   panes inside ``.lab-mode-content``. ``display: contents`` makes
+   the wrapper transparent to layout so the child (``.lab-trace-shell``
+   / ``.tab-panels``) acts as a direct flex item of ``.lab-mode-content``
+   exactly as it did pre-v2.1.10. ``[hidden]`` on the wrapper hides
+   the entire subtree (children are CSS-hidden so the browser skips
+   paint / layout for the inactive mode while React keeps the DOM
+   alive — operator state survives the mode hop). Mirrors the
+   identical ``.lab-tab-host`` / ``.settings-tab-host`` precedent
+   above (lines ~2270). */
+.lab-mode-content-pane {
+  display: contents;
+}
+
+.lab-mode-content-pane[hidden] {
+  display: none;
 }
 
 /* Graph mode is a single full-pane CallGraphView — give it a flex child so
