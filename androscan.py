@@ -267,6 +267,17 @@ def _run() -> int:
         help="API key for cloud provider (prefer env vars like GEMINI_API_KEY instead).",
     )
     parser.add_argument(
+        "--ollama-think",
+        choices=["true", "false"],
+        default=None,
+        metavar="BOOL",
+        help=(
+            "Override Ollama 'think' mode (per-run). 'true' enables chain-of-thought "
+            "emission; 'false' suppresses it (recommended for verbose-thinking models "
+            "like gemma4:26b). Falls back to config (ollama.think) when omitted."
+        ),
+    )
+    parser.add_argument(
         "--list-models",
         action="store_true",
         default=False,
@@ -330,6 +341,8 @@ def _run() -> int:
             config = dataclasses.replace(config, cloud_model=args.model)
         else:
             config = dataclasses.replace(config, ollama_model=args.model)
+    if args.ollama_think is not None:
+        config = dataclasses.replace(config, ollama_think=(args.ollama_think == "true"))
 
     apk_path = args.apk
     tasks = args.tasks if args.tasks else ["exported_components"]
@@ -352,6 +365,9 @@ def _run() -> int:
     provider_label = config.llm_provider if config.is_cloud else "ollama (local)"
     print(f"  Provider: {provider_label}")
     print(f"  Model:    {config.active_model}")
+    if not config.is_cloud:
+        think_label = "on" if config.ollama_think else "off"
+        print(f"  Think:    {think_label}")
     print(f"  Tasks:    {tasks_str}")
     print()
 

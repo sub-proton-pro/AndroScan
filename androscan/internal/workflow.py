@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from androscan.config import Config, load_config
 from androscan.internal.app_meta import compute_apk_sha256, load_app_meta, save_app_meta
-from androscan.internal.evidence_ref import resolve_ref, validate_ref
+from androscan.internal.evidence_ref import lookup_component_meta, resolve_ref, validate_ref
 from androscan.internal.exploit_verification import run_exploit_verification
 from androscan.internal.observations_store import append_observations, load_observations
 from androscan.internal.run_folder import write_run_meta
@@ -29,15 +29,75 @@ if TYPE_CHECKING:
     from androscan.internal.run_log import RunLogger
 
 
-def _hypothesis_to_dict(h: Hypothesis) -> dict:
-    """Serialize Hypothesis for consolidation prompt."""
+def _rewrite_component_evidence_refs(
+    raw_refs: list,
+    full_ref: str,
+    slice_ref: str,
+    dossier_dict: dict,
+) -> list[str]:
+    """Harden per-component evidence_refs against thinking-mode-LLM noise.
+
+    Used during per-component analysis where we always know the canonical dossier path
+    (``full_ref``) of the component being analysed.
+
+    Behaviour:
+    1. Slice-local index refs (``exported_activities[0]``) are rewritten to the
+       full-dossier index (``exported_activities[N]``).
+    2. Refs that resolve via :func:`resolve_ref` against the full dossier are kept in
+       canonical form (handles short component names and ``.kt``/``.java`` decorations).
+    3. Refs that don't resolve (e.g. helper-class names like ``WeakBankLab.kt``) are
+       dropped — they were always going to be rejected at consolidation time.
+    4. ``full_ref`` is guaranteed to be present (prepended if missing) so every finding
+       has at least one valid anchor even when the LLM emits ``evidence_refs: []``.
+
+    Returns a deduped list of canonical dossier paths.
+    """
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for r in raw_refs or []:
+        r_str = (r or "").strip() if isinstance(r, str) else ""
+        if not r_str:
+            continue
+        if r_str == slice_ref:
+            canonical: Optional[str] = full_ref
+        else:
+            canonical = resolve_ref(dossier_dict, r_str)
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            resolved.append(canonical)
+    if full_ref not in seen:
+        resolved.insert(0, full_ref)
+    return resolved
+
+
+def _hypothesis_to_dict(h: Hypothesis, dossier_dict: Optional[dict] = None) -> dict:
+    """Serialize Hypothesis for consolidation prompt.
+
+    If ``dossier_dict`` is provided, evidence_refs are pre-resolved to canonical dossier
+    paths (e.g. ``SecretActivity`` -> ``exported_activities[1]``) before serialization.
+    This gives the consolidation LLM clean, unambiguous refs to preserve, reducing the
+    chance that thinking-mode models (Gemma 4) paraphrase them into invalid forms during
+    merge. Refs that fail to resolve are passed through unchanged so the post-consolidation
+    resolver can still attempt them.
+    """
+    refs = list(h.evidence_refs or [])
+    if dossier_dict is not None and refs:
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for ref in refs:
+            canonical = resolve_ref(dossier_dict, ref)
+            chosen = canonical if canonical else ref
+            if chosen not in seen:
+                seen.add(chosen)
+                resolved.append(chosen)
+        refs = resolved
     d: dict = {
         "id": h.id,
         "component_type": h.component_type,
         "component_name": h.component_name,
         "title": h.title,
         "description": h.description,
-        "evidence_refs": list(h.evidence_refs or []),
+        "evidence_refs": refs,
         "exploitability": h.exploitability,
         "confidence": h.confidence,
         "remediation_hint": h.remediation_hint or "",
@@ -47,18 +107,83 @@ def _hypothesis_to_dict(h: Hypothesis) -> dict:
     return d
 
 
+def _post_process_consolidated(
+    hypotheses: List[Hypothesis],
+    dossier_dict: Optional[dict],
+) -> List[Hypothesis]:
+    """Clean up consolidation-LLM output before downstream stages consume it.
+
+    Two structural defects observed with thinking-mode models (Gemma 4):
+
+    1. **Duplicate ids**: every merged finding ends up with ``id="finding-0"``,
+       which collides during exploit-verification reporting. We rewrite to
+       ``finding-0``, ``finding-1``, ... preserving the original order.
+    2. **Empty component_type / component_name**: the consolidation LLM drops
+       these fields when merging. We backfill them from the first canonical
+       evidence_ref via :func:`lookup_component_meta`. If no ref resolves we
+       leave the fields untouched (they remain empty as before, no regression).
+    """
+    out: List[Hypothesis] = []
+    seen_ids: set[str] = set()
+    for idx, h in enumerate(hypotheses):
+        new_id = (h.id or "").strip()
+        if not new_id or new_id in seen_ids:
+            new_id = f"finding-{idx}"
+            collision = 0
+            while new_id in seen_ids:
+                collision += 1
+                new_id = f"finding-{idx}-{collision}"
+        seen_ids.add(new_id)
+
+        comp_type = (h.component_type or "").strip()
+        comp_name = (h.component_name or "").strip()
+        if dossier_dict is not None and (not comp_type or not comp_name):
+            for ref in h.evidence_refs or []:
+                meta = lookup_component_meta(dossier_dict, ref) if isinstance(ref, str) else None
+                if meta:
+                    if not comp_type:
+                        comp_type = meta[0]
+                    if not comp_name:
+                        comp_name = meta[1]
+                    break
+
+        out.append(
+            Hypothesis(
+                id=new_id,
+                component_type=comp_type,
+                component_name=comp_name,
+                title=h.title,
+                description=h.description,
+                evidence_refs=list(h.evidence_refs or []),
+                exploitability=h.exploitability,
+                confidence=h.confidence,
+                remediation_hint=h.remediation_hint,
+                exploit_params=h.exploit_params,
+            )
+        )
+    return out
+
+
 def consolidate_hypotheses(
     hypotheses: List[Hypothesis],
     config: Optional[Config] = None,
     run_logger: Optional["RunLogger"] = None,
+    dossier_dict: Optional[dict] = None,
 ) -> List[Hypothesis]:
-    """Deduplicate and merge overlapping hypotheses via one LLM call. On failure or empty response, return original list."""
+    """Deduplicate and merge overlapping hypotheses via one LLM call. On failure or empty response, return original list.
+
+    If ``dossier_dict`` is provided, per-component evidence_refs are pre-resolved to canonical
+    dossier paths before being shown to the consolidation LLM. This is the third layer of the
+    Gemma-4 evidence-ref-preservation defence (see ``_hypothesis_to_dict`` and
+    ``build_consolidation_prompt``). Backward-compatible: callers that don't pass the dossier
+    keep the original behaviour.
+    """
     if not hypotheses:
         return []
     if config is None:
         config = load_config()
 
-    dict_list = [_hypothesis_to_dict(h) for h in hypotheses]
+    dict_list = [_hypothesis_to_dict(h, dossier_dict=dossier_dict) for h in hypotheses]
     prompt = build_consolidation_prompt(dict_list)
     if not prompt:
         return hypotheses
@@ -86,9 +211,10 @@ def consolidate_hypotheses(
 
     resp = parse_response(result.content)
     if resp.hypotheses:
+        cleaned = _post_process_consolidated(resp.hypotheses, dossier_dict)
         if run_logger:
-            run_logger.info(f"Consolidation: {len(hypotheses)} -> {len(resp.hypotheses)} hypotheses.")
-        return resp.hypotheses
+            run_logger.info(f"Consolidation: {len(hypotheses)} -> {len(cleaned)} hypotheses.")
+        return cleaned
     if run_logger:
         run_logger.warning("Consolidation returned no hypotheses; using original list.")
     return hypotheses
@@ -287,8 +413,12 @@ def run_workflow(
                         full_ref = f"{list_key}[{full_index}]"
                         component_hyps: list[Hypothesis] = []
                         for h in comp_resp.hypotheses:
-                            refs = list(h.evidence_refs or [])
-                            refs = [full_ref if r.strip() == slice_ref else r for r in refs]
+                            refs = _rewrite_component_evidence_refs(
+                                list(h.evidence_refs or []),
+                                full_ref=full_ref,
+                                slice_ref=slice_ref,
+                                dossier_dict=analysis_dossier,
+                            )
                             rewritten = Hypothesis(
                                 id=h.id,
                                 component_type=h.component_type,
@@ -306,7 +436,7 @@ def run_workflow(
                         if run_logger and component_hyps:
                             run_logger.component_findings(component_type, label, component_hyps)
                         break
-            hypotheses = consolidate_hypotheses(all_hypotheses, config, run_logger)
+            hypotheses = consolidate_hypotheses(all_hypotheses, config, run_logger, dossier_dict=analysis_dossier)
         else:
             # Single-shot: one prompt with full dossier.
             turn = 0
