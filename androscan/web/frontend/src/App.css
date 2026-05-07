@@ -4716,23 +4716,15 @@ code { color: var(--accent); }
   flex-direction: column;
 }
 
-/* v2.1.8 — Manual Hooks mode wrapper. Lifts the existing 3-column
-   PanelGroup under a thin header strip so we can drop a per-mode
-   AppPicker into the top-right of the mode pane. The flex column
-   layout lets the PanelGroup own the remaining vertical space. */
-.lab-manual-hooks-mode {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-/* v2.1.8 — per-Lab-mode header strip carrying the local AppPicker.
-   Trace mode reuses ``.pane-head`` (it already had a header); Manual
-   Hooks + Graph modes use this dedicated strip because they didn't
-   previously render a header. Visual contract: thin row, mode title
-   on the left, AppPicker pinned to the right (mirrors the global
-   header's [AppPicker | HealthDot] pattern). */
+/* v2.1.9 — per-Lab-mode header strip carrying the local AppPicker.
+   Used by Graph mode only as of v2.1.9 (Trace + Manual Hooks moved
+   their pickers into the empty-state CTA per .lab-empty-state below
+   to close the v2.1.8 visual-stacking regression where two identical
+   "Select project…" dropdowns sat on consecutive vertical lines —
+   the per-mode strip directly under the global header). Visual
+   contract: thin row, mode title on the left, AppPicker pinned to
+   the right (mirrors the global header's [AppPicker | HealthDot]
+   pattern). */
 .lab-mode-head {
   display: flex;
   align-items: center;
@@ -4764,6 +4756,55 @@ code { color: var(--accent); }
   min-height: 0;
   display: flex;
   flex-direction: row;
+}
+
+/* v2.1.9 — shared empty-state CTA card surfacing the AppPicker
+   inline with a "No app selected" message. Used by both Trace mode
+   (replaces the v2.1.8 one-line ``<p className="muted small">``
+   empty-state copy) and Manual Hooks mode (replaces the v2.1.8
+   ``.lab-mode-head`` strip + 3-column PanelGroup when ``appId`` is
+   null). Visual contract: centered card on a flex-grow shell,
+   bordered + padded so the picker reads as a deliberate primary
+   action rather than incidental content. The card stays compact
+   (max-width caps the line length so the prose doesn't sprawl
+   across wide screens). */
+.lab-empty-state {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1.5rem;
+}
+
+.lab-empty-state-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.75rem;
+  max-width: 32rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.lab-empty-state-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.lab-empty-state-body {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.lab-empty-state-card .app-picker {
+  width: 100%;
 }
 
 /* Trace mode placeholder (LabTraceMode.tsx). The full BehaviorAnchorCard /

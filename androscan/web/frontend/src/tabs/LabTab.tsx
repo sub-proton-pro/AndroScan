@@ -488,16 +488,39 @@ function ManualHooksMode({
     return out;
   }, [anchoredMethodRows]);
 
+  // v2.1.9 — empty-state CTA when no app is selected. Replaces the
+  // v2.1.8 ``.lab-mode-head`` strip (which stacked vertically under
+  // the global header's AppPicker and read as a layout bug rather
+  // than a deliberate redundancy — operator dogfood feedback). The
+  // entire 3-column ``PanelGroup`` is gated on ``appId`` because
+  // none of the Manual Hooks panels (CallGraphView / HookBuilder /
+  // Sessions / CodeView / Chat) can do useful work without an
+  // ``app_id`` — they all gate on it internally and would otherwise
+  // render placeholder messaging in 4 of 5 panels, cluttering the
+  // empty state. Once an app is picked, the original v2.1.8
+  // ``PanelGroup`` renders unchanged (no strip on top); operators
+  // rely on the global header's AppPicker for mid-session project
+  // switching. Symmetric with ``LabTraceMode`` v2.1.9. Graph mode
+  // keeps its v2.1.8 ``.lab-mode-head`` strip per operator scope
+  // choice (single-pane CallGraphView has no non-empty body to
+  // render when ``appId`` is null, so the ergonomics differ).
+  if (!appId) {
+    return (
+      <div className="lab-empty-state" role="status" aria-live="polite">
+        <div className="lab-empty-state-card">
+          <h3 className="lab-empty-state-title">No app selected</h3>
+          <p className="lab-empty-state-body">
+            Pick a project below to start hooking. The same dropdown
+            lives in the top-right header — both surfaces are kept in
+            sync.
+          </p>
+          <AppPicker />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="lab-manual-hooks-mode">
-      {/* v2.1.8 — local AppPicker mirrors the global one in the
-          top-right header. Both read/write the same ``appId`` via
-          ``WorkbenchContext`` so picking from either surface updates
-          the other in lockstep with no explicit plumbing. */}
-      <header className="lab-mode-head">
-        <span className="lab-mode-head-title">Manual Hooks</span>
-        <AppPicker />
-      </header>
     <PanelGroup direction="horizontal" autoSaveId="lab-manual-h" className="tab-panels">
       <Panel defaultSize={32} minSize={20} className="panel">
         <CallGraphView
@@ -686,7 +709,6 @@ function ManualHooksMode({
         )}
       </Panel>
     </PanelGroup>
-    </div>
   );
 }
 

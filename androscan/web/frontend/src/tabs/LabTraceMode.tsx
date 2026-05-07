@@ -68,6 +68,29 @@
  * still folds the active anchor into its own ``trace`` attachment
  * when the operator mode-hops over to Manual Hooks.
  *
+ * **v2.1.9 — AppPicker placement migration (closes v2.1.8 visual-
+ * stacking regression).** v2.1.8 also bundled a per-Lab-mode
+ * ``<AppPicker />`` UX request — Trace's was added to the
+ * ``<header className="pane-head">`` via ``<span className=
+ * "pane-head-actions">``; Manual Hooks + Graph got new
+ * ``<header className="lab-mode-head">`` strips. Operator dogfood
+ * caught that Manual Hooks's strip stacked vertically directly under
+ * the global header's AppPicker (two identical "Select project…"
+ * dropdowns on consecutive lines), which read as a layout bug
+ * rather than a deliberate redundancy. v2.1.9 closes the
+ * regression by surfacing the picker **only in the empty-state
+ * when ``appId`` is null** — in Trace mode the picker now lives
+ * inline with the empty-state CTA card (replacing the prior
+ * one-line ``<p className="muted small">No app selected — pick a
+ * project from the dropdown above"</p>``); the picker disappears
+ * entirely once an app is selected and operators rely on the
+ * global header for mid-session project switching. Symmetric
+ * change in ``LabTab.ManualHooksMode``. Graph mode keeps its
+ * v2.1.8 ``.lab-mode-head`` strip per operator scope choice on
+ * the v2.1.9 design questionnaire (the single-pane CallGraphView
+ * has no non-empty body to render when ``appId`` is null, so the
+ * ergonomics differ from Trace / Manual Hooks).
+ *
  * v2.1.1 also bootstraps the decompile status + class-tree fetch
  * lifecycle that ``ClassMethodTree`` needs (mirrors the same pattern
  * ``InspectTab`` uses — ``getDecompileStatus`` on app change,
@@ -920,21 +943,38 @@ export function LabTraceMode({ appId, onActiveAnchorChange }: Props) {
             <span className="muted small">
               UI element ➜ decision points ➜ bypass plans
             </span>
-            {/* v2.1.8 — local AppPicker mirrors the global one in the
-                top-right header. Both read/write the same
-                ``appId`` via ``WorkbenchContext``, so picking from
-                either surface updates the other in lockstep with no
-                explicit plumbing. */}
-            <span className="pane-head-actions">
-              <AppPicker />
-            </span>
           </header>
 
+          {/* v2.1.9 — empty-state CTA card surfacing the AppPicker
+              inline with the "No app selected" message. v2.1.8
+              originally placed the picker in the pane-head's
+              right-side actions slot, which stacked vertically
+              under the global header's AppPicker (visible directly
+              above the mode pane) and read as a layout bug rather
+              than a deliberate redundancy. v2.1.9 surfaces the
+              picker only when it's contextually useful (operator has
+              no app selected and needs to pick one); when an
+              ``appId`` is set, the in-pane picker disappears and
+              operators rely on the global header for mid-session
+              switching. Symmetric with Manual Hooks mode's empty-
+              state card; Graph mode keeps its v2.1.8 ``.lab-mode-head``
+              strip per operator scope choice on the v2.1.9 design
+              questionnaire (single-pane CallGraphView with no
+              non-empty body to render when ``appId`` is null —
+              different ergonomics than the Trace / Manual Hooks
+              cases). */}
           {!appId && (
-            <p className="muted small">
-              No app selected — pick a project from the dropdown above to start
-              tracing behaviour.
-            </p>
+            <div className="lab-empty-state" role="status" aria-live="polite">
+              <div className="lab-empty-state-card">
+                <h3 className="lab-empty-state-title">No app selected</h3>
+                <p className="lab-empty-state-body">
+                  Pick a project below to start tracing behaviour. The
+                  same dropdown lives in the top-right header — both
+                  surfaces are kept in sync.
+                </p>
+                <AppPicker />
+              </div>
+            </div>
           )}
 
       {appId && (
