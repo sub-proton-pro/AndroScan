@@ -1009,11 +1009,35 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
 
     app.include_router(build_rag_router(config, _app_dir))
     app.include_router(build_graph_router(config, _app_dir))
+
+    # Lazy Frida client provider — defined here (above the trace
+    # router) so both the trace router (Phase 13 sub-step 13.2's
+    # dynamic-trace endpoint) and the Hook Lab router below can
+    # share the same provider closure. The provider construction
+    # is cheap and only talks to ``frida-server`` on the first
+    # ``client.is_available()`` / ``client.attach`` call, so wiring
+    # it eagerly at app-startup time is safe even when ``[frida]``
+    # isn't installed (the import is wrapped inside the function).
+    def _frida_provider() -> Any:
+        from androscan.adapters.frida_client import get_frida_client as _gfc
+        return _gfc(app, _current_config())
+
     # Phase 10 sub-step 10.6: per-app Behavior Trace cache routes.
     # Pure-SQLite reads + a synchronous skill-invocation POST; the route
     # surface is intentionally narrow so 10.7's frontend can build
-    # against it without further iteration.
-    app.include_router(build_trace_router(_current_config, _app_dir))
+    # against it without further iteration. Phase 13 sub-step 13.2
+    # also adds ``POST /{app_id}/dynamic`` + ``DELETE /{app_id}/
+    # dynamic/{session_id}`` on this same REST router (they need
+    # ``_frida_provider`` for the Frida session lifecycle); Phase 13
+    # sub-step 13.3 adds the ``WS /ws/trace/{app_id}/{session_id}``
+    # multiplexed-events surface as a separate router (mirrors the
+    # ``build_frida_router`` (rest, ws) split since the WS prefix
+    # differs from the REST prefix).
+    _trace_rest, _trace_ws = build_trace_router(
+        _current_config, _app_dir, _frida_provider
+    )
+    app.include_router(_trace_rest)
+    app.include_router(_trace_ws)
     app.include_router(
         build_status_router(
             config_provider=_current_config,
@@ -1032,13 +1056,10 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
 
     # Hook Lab routes (DEC-023, sub-step 4.5). The router factory
     # returns ``(rest_router, ws_router)``; we mount both. The Frida
-    # client is created lazily inside the provider so a missing
-    # ``[frida]`` extra still lets the *templates* + *render* routes
-    # work (they're pure Python).
-    def _frida_provider() -> Any:
-        from androscan.adapters.frida_client import get_frida_client as _gfc
-        return _gfc(app, _current_config())
-
+    # client is created lazily inside ``_frida_provider`` (defined
+    # just above the trace router) so a missing ``[frida]`` extra
+    # still lets the *templates* + *render* routes work (they're
+    # pure Python).
     _frida_rest, _frida_ws = build_frida_router(
         config_provider=_current_config,
         apps_root_provider=lambda: root,

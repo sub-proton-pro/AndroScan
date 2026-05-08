@@ -71,23 +71,50 @@ operator works in another mode (10.7 / 10.8).
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 import logging
+import secrets
 import sqlite3
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from androscan.adapters.frida_client import FridaUnavailableError, _event_to_jsonable
+from androscan.adapters.frida_hooks import (
+    HookParamError,
+    HookTemplateNotFound,
+    render_by_id as render_hook_template,
+)
 from androscan.analysis import call_graph
 from androscan.config import Config
 from androscan.internal import trace_cache
+from androscan.internal.app_meta import load_app_meta
+from androscan.internal.run_folder import create_run_folder
 from androscan.skills import SkillContext, execute as execute_skill
 from androscan.web.decompile_cache import (
     cache_root_for as decompile_cache_root,
     get_status as decompile_status,
+)
+from androscan.web.frida_routes import _resolve_target_prefix
+from androscan.web.per_app_settings import load_app_settings
+from androscan.web.trace_dynamic import (
+    cap_methods,
+    extract_closure_methods,
+    methods_to_json,
+)
+from androscan.web.trace_summary import (
+    SUMMARY_FAILED_KIND,
+    SUMMARY_PENDING_KIND,
+    SUMMARY_READY_KIND,
+    SummaryCallable,
+    default_summary_callable,
+    lookup_cached_summary,
+    method_key as summary_method_key,
+    store_summary,
 )
 
 
@@ -100,6 +127,50 @@ logger = logging.getLogger(__name__)
 # benefit from the explicit signal that they hit the ceiling).
 _MAX_HOPS = 6
 _MAX_ENTRY_LEN = 500
+
+# Phase 13 / DEC-029 sub-step 13.2 — dynamic-trace hop-cap ceiling.
+# DEC-029's threshold-color UX maps hook count to risk:
+#   ≤ 20   green  (cheap)
+#   21-50  yellow
+#   51-100 orange
+#   > 100  red    (device may stutter)
+# The hard ceiling on the route is intentionally set above the red
+# threshold (500) so a power-user with a beefy device + a particularly
+# large BehaviorAnchor can still kick off a trace; the UI is the
+# operator-facing throttle, the route only enforces the absurd-input
+# ceiling. Below 1 collapses to "no methods to hook" which the route
+# surfaces as 422 (rather than silently 200ing an empty trace).
+_MIN_HOP_CAP = 1
+_MAX_HOP_CAP = 500
+_DEFAULT_HOP_CAP = 50
+
+# Frida event-label prefix — every event emitted by ``behavior_trace_multi``
+# carries this label so the WebSocket multiplex (Phase 13 sub-step 13.3)
+# can filter trace events vs. summary events vs. legacy Hook Lab events
+# off a single channel. Suffix is a 4-byte token (8 hex chars) to keep the
+# label scannable in dogfood logs while staying collision-resistant.
+_EVENT_LABEL_PREFIX = "behavior-trace"
+
+
+class StartDynamicTraceBody(BaseModel):
+    """Phase 13 sub-step 13.2 request body for
+    ``POST /{app_id}/dynamic``.
+
+    The operator picks an existing *cached* anchor by ``(entry, hops)``
+    rather than POSTing the whole :class:`BehaviorAnchor` payload —
+    the anchor lives in ``trace.sqlite`` already; re-sending it would
+    just be a round-trip the route doesn't need. ``hop_cap`` is the
+    threshold-colored UI cap from DEC-029 (the operator confirms the
+    cost before the route fires the trace; the route just enforces
+    sanity bounds). ``spawn`` mirrors the Hook Lab field — Frida can
+    either ``attach`` to a running process or ``spawn`` a fresh one.
+    """
+
+    entry: str = Field(..., min_length=1, max_length=_MAX_ENTRY_LEN)
+    hops: int = Field(default=3, ge=1, le=_MAX_HOPS)
+    hop_cap: int = Field(default=_DEFAULT_HOP_CAP, ge=_MIN_HOP_CAP, le=_MAX_HOP_CAP)
+    spawn: bool = False
+    event_label: Optional[str] = Field(default=None, max_length=128)
 
 
 class NormaliseEntryRequest(BaseModel):
@@ -408,20 +479,51 @@ _SYNTHETIC_RUN_LEAF = "trace-build"
 
 AppDirResolver = Callable[[str], Path]
 ConfigProvider = Callable[[], Config]
+FridaClientProvider = Callable[[], Any]
 
 
 def build_trace_router(
     config_provider: ConfigProvider,
     app_dir_resolver: AppDirResolver,
-) -> APIRouter:
-    """Create the ``/api/trace`` router, wired to the live ``Config``
-    + the same ``app_dir_resolver`` callable as the existing routers.
+    frida_client_provider: Optional[FridaClientProvider] = None,
+    summary_callable: Optional[SummaryCallable] = None,
+) -> tuple[APIRouter, APIRouter]:
+    """Create the ``/api/trace`` REST router + the ``/ws/trace/...``
+    WebSocket router, wired to the live ``Config`` + the same
+    ``app_dir_resolver`` callable as the existing routers.
 
     ``app_dir_resolver(app_id) -> Path`` must raise
     :class:`HTTPException(404)` for unknown ids (same contract as
     ``rag_router`` / ``graph_router``); we don't ship our own.
+
+    ``frida_client_provider`` is a Phase 13 sub-step 13.2 addition.
+    Optional so the existing Phase 10/11 callers (and tests) can
+    keep instantiating the router with two args; the dynamic-trace
+    routes (POST + DELETE + WS) return **503** when it's ``None``.
+    Production wiring in :mod:`androscan.web.app` always passes the
+    same lazy provider that the Frida router uses
+    (``get_frida_client(app, config)``) so both routers see the
+    same ``app.state.frida_client`` cache.
+
+    ``summary_callable`` is a Phase 13 sub-step 13.3 addition.
+    Optional so tests can inject deterministic stubs at the
+    :data:`SummaryCallable` seam without monkeypatching the LLM
+    client; ``None`` means the WebSocket handler still forwards
+    Frida events but skips the summary multiplex (no
+    ``summary_pending`` / ``summary_ready`` / ``summary_failed``
+    events) — useful for environments without an LLM. Production
+    wiring uses :func:`default_summary_callable` (thin inline LLM
+    call); 13.4 swaps in a registered ``summarise_method`` skill
+    that ALSO reads the decompiled source.
+
+    Returns ``(rest_router, ws_router)`` — REST router is mounted at
+    its own ``/api/trace`` prefix; WS router has no prefix and
+    carries the absolute ``/ws/trace/{app_id}/{session_id}`` path
+    so it can sit alongside the Hook Lab's ``/ws/frida/...``
+    surface (mirrors :func:`build_frida_router` exactly).
     """
     router = APIRouter(prefix="/api/trace", tags=["trace"])
+    ws_router = APIRouter(tags=["trace-ws"])
 
     # ----------------------------------------------------------------------
     # Helpers
@@ -982,4 +1084,725 @@ def build_trace_router(
             "error": None,
         }
 
-    return router
+    # ----------------------------------------------------------------------
+    # Phase 13 / DEC-029 sub-step 13.2 — dynamic trace orchestration
+    #
+    # Two routes that bridge a cached :class:`BehaviorAnchor` to a live
+    # Frida session running the ``behavior_trace_multi`` template.
+    # The closure-extraction + hop-cap logic lives in
+    # :mod:`androscan.web.trace_dynamic` (pure functions, separately
+    # tested); the route here owns the lifecycle:
+    #
+    #   1. resolve app_dir + decompile cache (404 / 409)
+    #   2. read cached BehaviorAnchor (404 if not cached — operator
+    #      has to ``POST /anchor`` first to build it)
+    #   3. extract closure → cap at hop_cap → build methods_json
+    #   4. enforce per-app hook prefix allowlist (403)
+    #   5. render ``behavior_trace_multi`` template
+    #   6. ``client.is_available()`` (503)
+    #   7. ``client.attach(package, spawn=...)`` (503/502)
+    #   8. ``session.set_persistence_path(run/dynamic_trace.jsonl)``
+    #   9. ``session.load_script(rendered.js)`` (502 on failure;
+    #      detach the half-attached session before raising)
+    #
+    # Stop endpoint mirrors ``DELETE /api/frida/sessions/{session_id}`` —
+    # 404 on unknown session, otherwise ``session.detach()`` (exceptions
+    # logged but the route still returns 200 since the session is
+    # going to be GC'd by ``detach_all`` on shutdown anyway).
+    #
+    # JSONL persistence path: ``apps/<app_id>/<run>/dynamic_trace.jsonl``
+    # per DEC-029. One file per run (no per-session-id filename, no
+    # ``frida/`` subdirectory) — every dynamic trace gets a fresh run
+    # folder via :func:`create_run_folder`.
+
+    @router.post("/{app_id}/dynamic")
+    def trace_start_dynamic(
+        app_id: str, body: StartDynamicTraceBody
+    ) -> dict[str, Any]:
+        """Start a dynamic trace by attaching Frida to the per-app
+        package + injecting the ``behavior_trace_multi`` script with
+        the cached anchor's closure (capped at ``hop_cap``).
+
+        Status codes:
+
+        * **200** — session attached + script loaded; response carries
+          ``session_id``, ``hook_count``, ``ws_url``, ``persist_path``.
+        * **404** — unknown ``app_id`` (resolver) or no cached anchor
+          for ``(entry, hops)`` (operator must
+          ``POST /api/trace/{app_id}/anchor`` first).
+        * **422** — ``entry`` fails the bounds check
+          (:func:`_validate_entry`); empty closure after ``hop_cap``;
+          template render parameter error.
+        * **409** — decompile cache not ready (mirrors
+          :func:`_cache_dir_for`'s precondition).
+        * **403** — no per-app ``hook_target_package_prefix``
+          configured (the operator must set it in Settings before
+          any Inject can run; mirrors the Hook Lab fail-closed
+          posture).
+        * **503** — Frida not available (``frida-server`` not running,
+          ``[frida]`` extra not installed); this router not wired
+          with a ``frida_client_provider``.
+        * **502** — Frida attach / load_script failed (device said no
+          / handshake broke).
+        """
+        if frida_client_provider is None:
+            # Tests / pre-Phase-13 callers can construct the router
+            # without the Frida seam; the dynamic-trace route then
+            # surfaces as 503 rather than crashing on a missing-DI
+            # ``NoneType`` call.
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "frida_unavailable: dynamic trace seam not wired. "
+                    "This server was built without a frida_client_provider."
+                ),
+            )
+
+        # ---- 1) App + cache directory ----------------------------------
+        app_dir: Path = app_dir_resolver(app_id)
+        cache_dir = _cache_dir_for(app_id)
+
+        # ---- 2) Read cached anchor -------------------------------------
+        e = _validate_entry(body.entry)
+        anchor = trace_cache.read_anchor(cache_dir, e, body.hops)
+        if anchor is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No cached anchor for entry={e!r} hops={body.hops}. "
+                    f"POST /api/trace/{app_id}/anchor first to build it."
+                ),
+            )
+
+        # ---- 3) Closure extraction + hop_cap ---------------------------
+        closure = extract_closure_methods(anchor)
+        capped = cap_methods(closure, body.hop_cap)
+        if not capped:
+            # Either the anchor has no methods at all (unlikely past
+            # the skill's fail-open guards) or hop_cap is 0 (the
+            # Pydantic model already pins ge=1, so this is paranoia).
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Anchor closure is empty after hop_cap. "
+                    "Re-trace with a larger hops value or a different entry."
+                ),
+            )
+        methods_json = methods_to_json(capped)
+
+        # ---- 4) Per-app hook prefix allowlist --------------------------
+        # Mirrors :func:`androscan.web.frida_routes._resolve_target_prefix`
+        # exactly so a per-app prefix configured for the Hook Lab is
+        # automatically honoured by the dynamic trace too. The route's
+        # injected package is the prefix itself — for v1, the operator
+        # traces *the app's own package*; per-class targeting is a v2
+        # affordance once the UI has a "trace this dependency" mode.
+        per_app = load_app_settings(app_dir)
+        prefix = _resolve_target_prefix(per_app, app_dir)
+        if not prefix:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "hook_blocked: no hook_target_package_prefix configured "
+                    "for this app. Set it in Settings → per-app → Hook before "
+                    "starting a dynamic trace."
+                ),
+            )
+        package = prefix
+
+        # ---- 5) Render template ----------------------------------------
+        event_label = (body.event_label or "").strip() or (
+            f"{_EVENT_LABEL_PREFIX}-{secrets.token_hex(4)}"
+        )
+        try:
+            rendered = render_hook_template(
+                "behavior_trace_multi",
+                {"methods_json": methods_json, "event_label": event_label},
+            )
+        except HookTemplateNotFound as exc:
+            # Should never happen — the template is registered at
+            # process start in ``frida_hooks.__init__`` — but surface
+            # cleanly if someone surgically removes it.
+            logger.error("behavior_trace_multi template missing: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail="behavior_trace_multi template not registered",
+            ) from exc
+        except HookParamError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        # ---- 6) Frida availability + 7) attach -------------------------
+        client = frida_client_provider()
+        if not client.is_available():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "frida_unavailable: install with `pip install -e '.[frida]'` "
+                    "and ensure frida-server is running on the device."
+                ),
+            )
+        try:
+            session = client.attach(package, spawn=body.spawn)
+        except FridaUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 — preserve route fail-soft
+            logger.warning("frida.attach failed for %s: %s", package, exc)
+            raise HTTPException(
+                status_code=502, detail=f"frida attach failed: {exc}"
+            ) from exc
+
+        session.app_id = app_id
+        session.template_id = "behavior_trace_multi"
+
+        # ---- 8) JSONL persistence --------------------------------------
+        # DEC-029 lock: ``apps/<app_id>/<run>/dynamic_trace.jsonl`` —
+        # one file per run, no ``frida/`` subdirectory, no per-session
+        # filename. Each dynamic trace gets a fresh run folder.
+        persist_path: Optional[Path] = None
+        try:
+            run_folder = create_run_folder(app_id, config=config_provider())
+            persist_path = run_folder / "dynamic_trace.jsonl"
+            session.set_persistence_path(persist_path)
+        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+            logger.warning(
+                "dynamic trace persistence setup failed for %s: %s",
+                session.session_id,
+                exc,
+            )
+            persist_path = None
+
+        # ---- 9) Load script (detach on failure) ------------------------
+        try:
+            session.load_script(rendered.js)
+        except Exception as exc:  # noqa: BLE001 — preserve route fail-soft
+            logger.warning(
+                "frida.load_script failed for session %s: %s",
+                session.session_id,
+                exc,
+            )
+            try:
+                session.detach()
+            except Exception as detach_exc:  # noqa: BLE001
+                logger.warning(
+                    "follow-up detach also failed for %s: %s",
+                    session.session_id,
+                    detach_exc,
+                )
+            raise HTTPException(
+                status_code=502, detail=f"frida load_script failed: {exc}"
+            ) from exc
+
+        # ---- Response --------------------------------------------------
+        # ``ws_url`` points at the existing ``/ws/frida/{session_id}``
+        # endpoint for v1 — Phase 13 sub-step 13.3 will introduce
+        # ``/ws/trace/{session_id}`` with ``summary_pending`` /
+        # ``summary_ready`` / ``summary_failed`` multiplexing layered
+        # on top of the same Frida event stream. Until then, the
+        # frontend can subscribe to the Frida channel directly and
+        # filter by ``event_label`` to scope to this trace.
+        started_at = getattr(session, "started_at", None)
+        if hasattr(started_at, "isoformat"):
+            started_at_str = started_at.isoformat()
+        else:
+            started_at_str = str(started_at) if started_at is not None else ""
+        return {
+            "session_id": session.session_id,
+            "app_id": app_id,
+            "template_id": "behavior_trace_multi",
+            "package": package,
+            "pid": getattr(session, "pid", None),
+            "started_at": started_at_str,
+            "hook_count": len(capped),
+            "closure_size": len(closure),
+            "hop_cap": body.hop_cap,
+            "event_label": event_label,
+            "ws_url": f"/ws/frida/{session.session_id}",
+            "persist_path": str(persist_path) if persist_path else None,
+            "anchor": {
+                "entry_method": anchor.entry_method.smali_signature,
+                "hops": anchor.hops,
+            },
+        }
+
+    @router.delete("/{app_id}/dynamic/{session_id}")
+    def trace_stop_dynamic(app_id: str, session_id: str) -> dict[str, Any]:
+        """Detach a running dynamic-trace Frida session.
+
+        Mirrors ``DELETE /api/frida/sessions/{session_id}`` exactly:
+        404 on unknown session; otherwise ``session.detach()`` (any
+        detach-side exception is logged but the route still returns
+        ``{"ok": True, ...}`` because the session is going to be
+        GC'd by ``detach_all`` on shutdown either way).
+
+        ``app_id`` is part of the path purely for routing symmetry
+        with the start endpoint; we don't enforce ``session.app_id ==
+        app_id`` because operator-side workflows occasionally swap
+        apps in the same workbench tab and we'd rather they get a
+        clean stop than a 409 on a stale tab.
+        """
+        if frida_client_provider is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "frida_unavailable: dynamic trace seam not wired. "
+                    "This server was built without a frida_client_provider."
+                ),
+            )
+        # 404 on unknown app_id — keeps the URL grammar honest even
+        # though the session-id check below is the load-bearing one.
+        app_dir_resolver(app_id)
+        client = frida_client_provider()
+        session = client.get_session(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404, detail=f"unknown session_id: {session_id}"
+            )
+        try:
+            session.detach()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "dynamic trace session %s detach raised: %s",
+                session_id,
+                exc,
+            )
+        return {"ok": True, "session_id": session_id}
+
+    # ----------------------------------------------------------------------
+    # Phase 13 / DEC-029 sub-step 13.3 — WebSocket multiplexing
+    #
+    # ``WS /ws/trace/{app_id}/{session_id}`` mirrors
+    # :func:`androscan.web.frida_routes.ws_trace`'s replay-then-stream
+    # lifecycle exactly (accept → 1008-close on unknown session →
+    # ring-buffer replay → register ``on_event`` hook → forever-pump
+    # bounded ``asyncio.Queue`` → restore previous hook on disconnect)
+    # and adds three new event kinds layered on top of the existing
+    # Frida envelope:
+    #
+    #   * ``summary_pending`` — emitted when a method's ``phase: "entry"``
+    #     fires for the first time in this session AND the
+    #     ``skill_results_cache`` doesn't already carry a summary for
+    #     ``(app_sha, class_smali, method_name, descriptor)``.
+    #   * ``summary_ready``   — emitted when the LLM returns. Carries
+    #     ``cached: bool`` so the UI can distinguish a fresh result
+    #     from a same-tick cache hit (cache hits short-circuit the
+    #     ``summary_pending`` step entirely — the operator only sees
+    #     ``summary_ready`` with ``cached: true``).
+    #   * ``summary_failed``  — emitted on LLM error / timeout; carries
+    #     the failure ``error`` text.
+    #
+    # Discrimination via the existing event envelope's ``kind`` field —
+    # old clients filtering on the existing trace ``kind``s ignore
+    # these silently (additive-by-design discipline established by
+    # DEC-022's chat agentic-loop SSE vocabulary + Phase 11 v2.1.5's
+    # ``widget`` event kind).
+    #
+    # The summary call is fired from the WS handler's per-event hook,
+    # NOT from the Frida adapter (which stays generic) — this keeps
+    # the LLM dependency localized to the trace route.
+
+    # Sub-step 13.3 default summary callable — thin inline LLM call.
+    # 13.4 will replace this with a registered ``summarise_method``
+    # skill that ALSO reads the decompiled source via
+    # ``decompile_cache``. Resolved once at factory-construction time
+    # so tests can override at construction without runtime patching.
+    _resolved_summary_callable: Optional[SummaryCallable] = (
+        summary_callable if summary_callable is not None
+        else default_summary_callable(config_provider)
+    )
+
+    @ws_router.websocket("/ws/trace/{app_id}/{session_id}")
+    async def ws_trace(websocket: WebSocket, app_id: str, session_id: str) -> None:
+        """Stream the dynamic-trace events + summary multiplex.
+
+        See module-level docstring for the full envelope contract.
+        Connection lifecycle:
+
+        1. Accept the socket. If ``frida_client_provider`` is ``None``
+           (legacy two-arg factory call), send a structured error
+           and 1008-close — same contract as the POST/DELETE
+           endpoints.
+        2. Resolve the live :class:`FridaSession` via the same
+           ``frida_client_provider`` the POST endpoint used. Unknown
+           ``session_id`` → structured error + 1008-close. Unknown
+           ``app_id`` is NOT 1008-closed — we read the app_dir
+           opportunistically (for the ``app_sha`` cache key) but
+           tolerate a missing ``app_meta.json`` by skipping the
+           summary multiplex (the trace events still flow).
+        3. Drain the ring buffer once (replay). Each event goes
+           through ``_dispatch`` so cached summaries fire even on
+           events the operator joined late.
+        4. Register a non-async ``on_event`` hook that pushes
+           subsequent events into the bounded queue via
+           ``loop.call_soon_threadsafe``. The Frida message thread
+           never blocks on the socket.
+        5. Run the forever-pump; on ``WebSocketDisconnect``,
+           unregister the hook + cancel any in-flight summary tasks.
+
+        The bounded queue (``maxsize=2000``) means a runaway producer
+        eventually drops *queue* items rather than starving the
+        event loop. Drops are signalled to the client via a single
+        ``{type: "drop", session_id: ...}`` notice — same shape the
+        existing ``/ws/frida/...`` handler uses, so 13.6's frontend
+        can reuse the same drop-handler logic.
+        """
+        await websocket.accept()
+        if frida_client_provider is None:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "error": "frida_unavailable",
+                    "message": "dynamic trace seam not wired into this server",
+                    "app_id": app_id,
+                    "session_id": session_id,
+                }
+            )
+            await websocket.close(code=1008)
+            return
+
+        client = frida_client_provider()
+        session = client.get_session(session_id)
+        if session is None:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "error": "unknown_session",
+                    "app_id": app_id,
+                    "session_id": session_id,
+                }
+            )
+            await websocket.close(code=1008)
+            return
+
+        # Best-effort app_sha read for the cache key. Missing
+        # ``app_meta.json`` → ``None`` → summary multiplex still
+        # works, but the cache layer never finds anything (every
+        # entry stays in-memory for this session) and every summary
+        # gets re-fired on a fresh session. Logged so an operator
+        # tailing the workbench logs can see why their cache isn't
+        # warming up.
+        try:
+            app_dir = app_dir_resolver(app_id)
+        except HTTPException:
+            app_dir = None
+        app_sha: Optional[str] = None
+        if app_dir is not None:
+            meta = load_app_meta(app_dir) or {}
+            sha_val = meta.get("apk_sha256")
+            if isinstance(sha_val, str) and sha_val:
+                app_sha = sha_val
+        if app_sha is None:
+            logger.info(
+                "ws_trace %s: app_meta.json missing apk_sha256; summary cache disabled",
+                session_id,
+            )
+
+        cfg = config_provider()
+        run_folder_root = Path(getattr(cfg, "run_folder_root", "apps") or "apps")
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=2000)
+
+        # Per-method dedup set — only the first ``phase: "entry"``
+        # event for a given method triggers the summary call. Re-
+        # invocations of the same method during the same session
+        # don't re-fire the LLM (the operator only cares about the
+        # summary once per method per session; the cache layer
+        # handles cross-session dedup).
+        fired_method_keys: set[str] = set()
+        # In-flight summary tasks; cancelled on WS disconnect so the
+        # executor doesn't keep running an LLM call for a client
+        # that's already gone.
+        pending_summary_tasks: set[asyncio.Task[None]] = set()
+
+        async def _emit_summary_ready(
+            cls_java: str,
+            method_name: str,
+            descriptor: str,
+            summary_text: str,
+            cached: bool,
+        ) -> None:
+            await websocket.send_json(
+                {
+                    "ts": _now_ts(),
+                    "session_id": session.session_id,
+                    "kind": SUMMARY_READY_KIND,
+                    "payload": {
+                        "class": cls_java,
+                        "method": method_name,
+                        "descriptor": descriptor,
+                        "summary": summary_text,
+                        "cached": cached,
+                    },
+                    "raw": None,
+                }
+            )
+
+        async def _emit_summary_pending(
+            cls_java: str, method_name: str, descriptor: str
+        ) -> None:
+            await websocket.send_json(
+                {
+                    "ts": _now_ts(),
+                    "session_id": session.session_id,
+                    "kind": SUMMARY_PENDING_KIND,
+                    "payload": {
+                        "class": cls_java,
+                        "method": method_name,
+                        "descriptor": descriptor,
+                    },
+                    "raw": None,
+                }
+            )
+
+        async def _emit_summary_failed(
+            cls_java: str, method_name: str, descriptor: str, error: str
+        ) -> None:
+            await websocket.send_json(
+                {
+                    "ts": _now_ts(),
+                    "session_id": session.session_id,
+                    "kind": SUMMARY_FAILED_KIND,
+                    "payload": {
+                        "class": cls_java,
+                        "method": method_name,
+                        "descriptor": descriptor,
+                        "error": error,
+                    },
+                    "raw": None,
+                }
+            )
+
+        async def _fire_summary(
+            cls_java: str, method_name: str, descriptor: str
+        ) -> None:
+            """Background task — invoke the summary callable and
+            emit ``summary_ready`` (success) or ``summary_failed``
+            (timeout / exception). Caches successful results."""
+            assert _resolved_summary_callable is not None
+            try:
+                summary_text = await _resolved_summary_callable(
+                    cls_java, method_name, descriptor
+                )
+            except asyncio.TimeoutError:
+                try:
+                    await _emit_summary_failed(
+                        cls_java, method_name, descriptor, "summary_timeout"
+                    )
+                except Exception:  # noqa: BLE001 — WS likely closed
+                    pass
+                return
+            except asyncio.CancelledError:
+                # WS shut down mid-flight; don't try to send.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ws_trace %s summary callable raised for %s/%s: %s",
+                    session.session_id, cls_java, method_name, exc,
+                )
+                try:
+                    await _emit_summary_failed(
+                        cls_java, method_name, descriptor, str(exc) or repr(exc)
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+            if not (summary_text or "").strip():
+                try:
+                    await _emit_summary_failed(
+                        cls_java, method_name, descriptor, "empty_summary"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+            try:
+                await _emit_summary_ready(
+                    cls_java, method_name, descriptor, summary_text, cached=False
+                )
+            except Exception:  # noqa: BLE001 — WS likely closed
+                # Even if the WS is gone, still cache the result so
+                # the next operator who attaches to a fresh session
+                # gets the cached summary on first hit.
+                pass
+
+            # Cache only on success + only when ``app_sha`` was
+            # resolvable (no sha → no stable per-app key).
+            if app_dir is not None and app_sha is not None:
+                try:
+                    store_summary(
+                        run_folder_root,
+                        app_id,
+                        # ``run_folder_name`` here is informational
+                        # only (the cache stores it for "[cached
+                        # from run X]" hover-text in v2 of the UI);
+                        # the dynamic-trace run folder isn't easy to
+                        # reach back to from inside the WS handler,
+                        # so we use a stable synthetic name.
+                        "dynamic-trace-ws",
+                        app_sha,
+                        cls_java,
+                        method_name,
+                        descriptor,
+                        summary_text,
+                    )
+                except Exception as cache_exc:  # noqa: BLE001
+                    logger.warning(
+                        "ws_trace %s cache store failed for %s/%s: %s",
+                        session.session_id,
+                        cls_java,
+                        method_name,
+                        cache_exc,
+                    )
+
+        async def _dispatch_summary_for_entry(payload: Any) -> None:
+            """Per-event check: is this an ``entry`` phase for a
+            method we haven't summarised yet? If so, lookup cache /
+            fire summary. Soft-fail on any payload-shape surprise —
+            an unfamiliar event must NEVER kill the WS pump."""
+            if _resolved_summary_callable is None:
+                return  # summary multiplex disabled
+            if not isinstance(payload, dict):
+                return
+            phase = payload.get("phase")
+            if phase != "entry":
+                return
+            cls_java = payload.get("class")
+            method_name = payload.get("method")
+            descriptor = payload.get("descriptor", "")
+            if not isinstance(cls_java, str) or not cls_java:
+                return
+            if not isinstance(method_name, str) or not method_name:
+                return
+            if not isinstance(descriptor, str):
+                descriptor = str(descriptor or "")
+
+            mkey = summary_method_key(cls_java, method_name, descriptor)
+            if mkey in fired_method_keys:
+                return
+            fired_method_keys.add(mkey)
+
+            # Cache hit → emit ready immediately, skip the pending
+            # event (the operator's UI never sees a same-tick
+            # pending → ready flicker for a cached summary).
+            cached: Optional[str] = None
+            if app_sha is not None:
+                cached = lookup_cached_summary(
+                    run_folder_root,
+                    app_id,
+                    app_sha,
+                    cls_java,
+                    method_name,
+                    descriptor,
+                )
+            if cached is not None:
+                await _emit_summary_ready(
+                    cls_java, method_name, descriptor, cached, cached=True
+                )
+                return
+
+            # Cache miss → emit pending + fire the LLM in the
+            # background. We deliberately do NOT await the task —
+            # the WS pump must keep flowing trace events even while
+            # one method's summary is in-flight.
+            await _emit_summary_pending(cls_java, method_name, descriptor)
+            task = asyncio.create_task(
+                _fire_summary(cls_java, method_name, descriptor)
+            )
+            pending_summary_tasks.add(task)
+            task.add_done_callback(pending_summary_tasks.discard)
+
+        # Step 3 — replay the ring buffer once. Each event goes
+        # through ``_dispatch_summary_for_entry`` first so cached
+        # summaries fire even when the operator joined late.
+        for event in session.events():
+            event_dict = _event_to_jsonable(event)
+            try:
+                await websocket.send_json(event_dict)
+            except Exception:
+                # Client closed mid-replay. Bail without registering.
+                return
+            try:
+                await _dispatch_summary_for_entry(event_dict.get("payload"))
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.warning(
+                    "ws_trace %s replay dispatch raised: %s",
+                    session_id, exc,
+                )
+
+        # Step 4 — register live hook
+        previous_hook = session.on_event
+
+        def _push(event: Any) -> None:
+            # Frida message thread → bounce to the event loop.
+            try:
+                loop.call_soon_threadsafe(_offer, event)
+            except RuntimeError:
+                # Loop closed (server shutting down) — drop quietly.
+                return
+
+        def _offer(event: Any) -> None:
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # Coalesce adjacent overflows into one drop counter
+                # rather than spamming the client (mirrors
+                # frida_routes.ws_trace exactly).
+                try:
+                    _ = queue.get_nowait()
+                except asyncio.QueueEmpty:  # pragma: no cover - race
+                    pass
+                queue.put_nowait({"__drop__": True})
+
+        session.on_event = _push
+
+        try:
+            while True:
+                event = await queue.get()
+                if isinstance(event, dict) and event.get("__drop__"):
+                    await websocket.send_json(
+                        {"type": "drop", "session_id": session_id}
+                    )
+                    continue
+                event_dict = _event_to_jsonable(event)
+                await websocket.send_json(event_dict)
+                try:
+                    await _dispatch_summary_for_entry(event_dict.get("payload"))
+                except Exception as exc:  # noqa: BLE001 — defensive
+                    logger.warning(
+                        "ws_trace %s live dispatch raised: %s",
+                        session_id, exc,
+                    )
+        except WebSocketDisconnect:
+            logger.debug("dynamic trace ws %s disconnected", session_id)
+        except Exception as exc:
+            logger.warning("dynamic trace ws %s error: %s", session_id, exc)
+            try:
+                await websocket.close(code=1011)
+            except Exception:  # pragma: no cover - secondary close failure
+                pass
+        finally:
+            # Restore the previous hook; do NOT detach — multiple
+            # WS clients (the operator's two browser tabs) could
+            # observe the same session, mirrors frida_routes.
+            if session.on_event is _push:
+                session.on_event = previous_hook
+            # Cancel any in-flight summary tasks so the executor
+            # doesn't keep running an LLM call for a client that's
+            # already gone. ``CancelledError`` is swallowed inside
+            # ``_fire_summary``.
+            for task in list(pending_summary_tasks):
+                if not task.done():
+                    task.cancel()
+
+    return router, ws_router
+
+
+def _now_ts() -> float:
+    """Return the current wall-clock timestamp.
+
+    Pulled out as a module-level helper so the WebSocket handler can
+    monkeypatch a stable timestamp in tests if needed (current tests
+    don't pin ``ts``, but the seam is here for free)."""
+    import time
+    return time.time()

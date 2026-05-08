@@ -181,6 +181,13 @@ _TEMPLATE_MODULES: tuple[str, ...] = (
     # renderer doesn't analyse the body, so any classification would
     # be a guess (the template's pentester summary calls this out).
     "androscan.adapters.frida_hooks.custom",
+    # Phase 13 / DEC-029 sub-step 13.1 — multi-method dynamic tracer.
+    # Hooks every overload of every (class, method, descriptor) triple
+    # in a BehaviorAnchor closure, emits per-thread depth-aware
+    # entry / exit / hook_failed / ready / error events with
+    # tier-stringified args + return values. Backend deliverable for
+    # the Behavior Trace v3 dynamic + both modes. Read-only.
+    "androscan.adapters.frida_hooks.behavior_trace_multi",
 )
 
 
