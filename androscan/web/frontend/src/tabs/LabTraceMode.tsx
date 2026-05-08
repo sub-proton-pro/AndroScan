@@ -223,6 +223,7 @@ import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { BehaviorTrace } from "../components/trace/BehaviorTrace";
 import { DecisionTimeline } from "../components/trace/DecisionTimeline";
+import { ExecutionFlow } from "../components/trace/ExecutionFlow";
 
 // Phase 13 sub-step 13.5 — legacy-rollback flag for the "Decision
 // Timeline" → "Behavior Trace" rename. Off by default; flip on
@@ -1293,6 +1294,21 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   // unchanged; semantic meaning is "Behavior Trace section collapsed?"
   // under the 13.5 rebrand.
   const [decisionsCollapsed, setDecisionsCollapsed] = useState(false);
+  // Phase 13 sub-step 13.6 — Execution Flow flowchart collapse state.
+  // Defaults open so the operator sees the new visual surface on
+  // first paint; collapses with the same chevron pattern as the
+  // Behavior Trace list below it. 13.7's Inspector pane will live
+  // inside this section (right-side fixed-width pane); 13.8 adds the
+  // Static / Dynamic / Both mode toggle + live-value chips.
+  const [executionFlowCollapsed, setExecutionFlowCollapsed] = useState(false);
+  // Phase 13 sub-step 13.6 — selected node id, lifted to this level
+  // so 13.7's Inspector pane (which will be a sibling of
+  // ``ExecutionFlow``) can read the same selection without prop-
+  // drilling. v1 leaves the consumer of the click event as a no-op
+  // pure setter; 13.7 will read it.
+  const [selectedFlowNodeId, setSelectedFlowNodeId] = useState<string | null>(
+    null,
+  );
 
   if (state.kind === "idle") {
     return (
@@ -1345,6 +1361,53 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   return (
     <div className="trace-result">
       <BehaviorAnchorCard anchor={anchor} source={from} />
+
+      {/* Phase 13 sub-step 13.6 — Execution Flow flowchart. New
+          primary visual surface for the active anchor; sits above
+          the (legacy-shaped) Behavior Trace list during the 13.6 →
+          13.8 build-out so operators can dogfood the flowchart
+          alongside the familiar linear list. 13.7 will add the
+          right-side Inspector pane; 13.8 will add the Static /
+          Dynamic / Both mode toggle and live-value chips. */}
+      <section className="trace-section">
+        <header className="trace-section-head">
+          <button
+            type="button"
+            className="logcat-toggle-btn"
+            onClick={() => setExecutionFlowCollapsed((c) => !c)}
+            aria-expanded={!executionFlowCollapsed}
+            aria-controls="execution-flow-body"
+            aria-label={
+              executionFlowCollapsed
+                ? "Expand execution flow"
+                : "Collapse execution flow"
+            }
+            title={
+              executionFlowCollapsed
+                ? "Expand execution flow"
+                : "Collapse execution flow"
+            }
+          >
+            {executionFlowCollapsed ? <IconChevronUp size={10} /> : <IconChevronDown size={10} />}
+          </button>
+          <h3>
+            Execution Flow{" "}
+            <span className="muted small">
+              ({anchor.decisions.length} decision
+              {anchor.decisions.length === 1 ? "" : "s"})
+            </span>
+          </h3>
+        </header>
+        {!executionFlowCollapsed && (
+          <div id="execution-flow-body">
+            <ExecutionFlow
+              anchor={anchor}
+              selectedNodeId={selectedFlowNodeId}
+              onNodeClick={(node) => setSelectedFlowNodeId(node.id)}
+            />
+          </div>
+        )}
+      </section>
 
       <section className="trace-section">
         <header className="trace-section-head">

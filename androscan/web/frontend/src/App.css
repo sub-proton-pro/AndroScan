@@ -6599,3 +6599,303 @@ code { color: var(--accent); }
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* ===========================================================================
+ * Phase 13 sub-step 13.6 — ExecutionFlow flowchart (DEC-029).
+ *
+ * The ``.execution-flow-*`` namespace styles React Flow's custom nodes,
+ * custom edges, controls, minimap, and background to match the canonical
+ * mockup at ``canvases/phase-13-trace-mockup.canvas.tsx``. Locked design
+ * choices:
+ *
+ *   * Nodes: 220x72px, 6px radius, three-line stacked-card visual,
+ *     corner pills (GATE / ALLOW / DENY / NEUTRAL / ENTRY).
+ *   * Edges: 1.5px stroke, 6x6 arrowhead, color-only emphasis.
+ *     Verdict palette mirrors the rest of the trace UI:
+ *       allow      = var(--ok)
+ *       deny       = var(--err)
+ *       neutral    = var(--muted)
+ *       unverdicted = var(--border-strong)
+ *
+ * React Flow's default theme leaks through to the surrounding chrome
+ * (``.react-flow__background`` etc.); we override the bits that
+ * matter and let the rest pick up the workbench's dark theme.
+ * =========================================================================== */
+
+.execution-flow-container {
+  position: relative;
+  width: 100%;
+  height: 480px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+/* React Flow's default stylesheet uses light colors; pin the
+ * background + grid dots to the workbench palette. */
+.execution-flow-container .react-flow__background {
+  background-color: var(--panel);
+}
+.execution-flow-container .react-flow__background .react-flow__background-pattern {
+  fill: var(--border);
+  opacity: 0.4;
+}
+.execution-flow-container .react-flow__attribution {
+  display: none;
+}
+
+.execution-flow-container .react-flow__controls,
+.execution-flow-container .execution-flow-controls {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.execution-flow-container .react-flow__controls button {
+  background: var(--panel-2);
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+.execution-flow-container .react-flow__controls button:hover {
+  background: var(--bg);
+}
+.execution-flow-container .react-flow__controls button svg {
+  fill: var(--text);
+}
+
+.execution-flow-container .react-flow__minimap,
+.execution-flow-container .execution-flow-minimap {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.execution-flow-container .react-flow__minimap-mask {
+  fill: rgba(0, 0, 0, 0.45);
+}
+
+/* --- Node card ------------------------------------------------------------ */
+
+.execution-flow-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-2);
+  font-size: 11px;
+  line-height: 1.25;
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  transition: border-color 100ms ease-out, box-shadow 100ms ease-out;
+}
+
+.execution-flow-node:hover {
+  border-color: var(--accent);
+}
+
+.execution-flow-node-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.execution-flow-node-entry {
+  border-color: var(--accent);
+}
+
+.execution-flow-node-gate {
+  border-color: var(--warn);
+}
+
+.execution-flow-node-stacked {
+  /* Stacked-card visual: faux second card peeking behind the
+   * primary card via box-shadow stacking. */
+  box-shadow:
+    -3px 3px 0 0 var(--panel-2),
+    -3px 3px 0 1px var(--border),
+    0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+.execution-flow-node-inlined {
+  border-style: dashed;
+}
+
+.execution-flow-node-synthetic {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--border);
+  cursor: default;
+}
+.execution-flow-node-synthetic:hover {
+  border-color: var(--border);
+}
+
+.execution-flow-node-sink_allow {
+  border-color: var(--ok);
+}
+.execution-flow-node-sink_deny {
+  border-color: var(--err);
+}
+.execution-flow-node-sink_neutral {
+  border-color: var(--muted);
+}
+
+.execution-flow-node-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.execution-flow-node-class {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.execution-flow-node-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+  font-size: 10px;
+}
+
+.execution-flow-node-source-line {
+  color: var(--muted);
+}
+
+.execution-flow-node-overload-pill,
+.execution-flow-node-inlined-pill {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  font-size: 9px;
+}
+
+.execution-flow-node-inlined-pill {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.execution-flow-node-synthetic-body {
+  text-align: center;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+/* --- Corner pill --------------------------------------------------------- */
+
+.execution-flow-pill {
+  position: absolute;
+  top: -8px;
+  right: 8px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+}
+
+.execution-flow-pill-entry {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.execution-flow-pill-gate {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.execution-flow-pill-allow {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.execution-flow-pill-deny {
+  border-color: var(--err);
+  color: var(--err);
+}
+.execution-flow-pill-neutral {
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+/* --- Source/target handles ------------------------------------------------ */
+
+/* Hide React Flow's default visible handle dots — the locked card
+ * design owns its own visual chrome. */
+.execution-flow-handle.react-flow__handle {
+  width: 6px;
+  height: 6px;
+  background: transparent;
+  border: none;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* --- Edges --------------------------------------------------------------- */
+
+.execution-flow-edge {
+  stroke-width: 1.5;
+  fill: none;
+}
+
+.execution-flow-edge-allow {
+  stroke: var(--ok);
+}
+.execution-flow-edge-deny {
+  stroke: var(--err);
+}
+.execution-flow-edge-neutral {
+  stroke: var(--muted);
+}
+.execution-flow-edge-unverdicted {
+  stroke: var(--border-strong);
+  stroke-dasharray: 4 3;
+}
+
+/* React Flow renders one shared marker definition; pin it to the
+ * default theme color (the actual color is inherited from the
+ * stroke via ``currentColor`` on the marker path). */
+.execution-flow-container .react-flow__edge-path {
+  stroke-width: 1.5;
+}
+.execution-flow-container svg.react-flow__edges marker path {
+  fill: currentColor;
+}
+
+.execution-flow-edge-label {
+  position: absolute;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 500;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.execution-flow-edge-label-allow {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.execution-flow-edge-label-deny {
+  color: var(--err);
+  border-color: var(--err);
+}
+.execution-flow-edge-label-neutral {
+  color: var(--muted);
+}
+.execution-flow-edge-label-unverdicted {
+  color: var(--muted);
+  font-style: italic;
+}
+
