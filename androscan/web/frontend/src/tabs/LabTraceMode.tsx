@@ -224,6 +224,8 @@ import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { BehaviorTrace } from "../components/trace/BehaviorTrace";
 import { DecisionTimeline } from "../components/trace/DecisionTimeline";
 import { ExecutionFlow } from "../components/trace/ExecutionFlow";
+import { Inspector } from "../components/trace/Inspector";
+import type { ExecutionFlowNode } from "../components/trace/executionFlowGraph";
 
 // Phase 13 sub-step 13.5 — legacy-rollback flag for the "Decision
 // Timeline" → "Behavior Trace" rename. Off by default; flip on
@@ -1301,14 +1303,31 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   // inside this section (right-side fixed-width pane); 13.8 adds the
   // Static / Dynamic / Both mode toggle + live-value chips.
   const [executionFlowCollapsed, setExecutionFlowCollapsed] = useState(false);
-  // Phase 13 sub-step 13.6 — selected node id, lifted to this level
-  // so 13.7's Inspector pane (which will be a sibling of
+  // Phase 13 sub-step 13.6 / 13.7 — selected ExecutionFlow node,
+  // lifted to this level so 13.7's Inspector pane (sibling of
   // ``ExecutionFlow``) can read the same selection without prop-
-  // drilling. v1 leaves the consumer of the click event as a no-op
-  // pure setter; 13.7 will read it.
-  const [selectedFlowNodeId, setSelectedFlowNodeId] = useState<string | null>(
-    null,
-  );
+  // drilling and without re-running the graph-build helper. We
+  // store the full ``ExecutionFlowNode`` (not just the id) so the
+  // Inspector gets ``overloadCount`` + ``possiblyInlined`` + the
+  // synthetic-sink guard fields directly from the graph layer.
+  const [selectedFlowNode, setSelectedFlowNode] =
+    useState<ExecutionFlowNode | null>(null);
+
+  // Clear the Inspector selection whenever the active anchor changes
+  // (operator seeds a new entry, runs a new build, or the anchor's
+  // method set changes underneath us). Without this, a stale
+  // ``selectedFlowNode.id`` would carry over and the Inspector would
+  // try to resolve a method that no longer exists in the new
+  // ``BehaviorAnchor`` — :func:`Inspector.resolveSelection` returns
+  // ``null`` in that case, but the empty-state UX is cleaner than
+  // showing the empty placeholder under a "selected" header.
+  const anchorKey =
+    state.kind === "loaded"
+      ? `${state.anchor.entry_method.class_name}#${state.anchor.entry_method.method_name}#${state.anchor.hops}`
+      : null;
+  useEffect(() => {
+    setSelectedFlowNode(null);
+  }, [anchorKey]);
 
   if (state.kind === "idle") {
     return (
@@ -1399,11 +1418,18 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
           </h3>
         </header>
         {!executionFlowCollapsed && (
-          <div id="execution-flow-body">
+          <div id="execution-flow-body" className="execution-flow-row">
             <ExecutionFlow
               anchor={anchor}
-              selectedNodeId={selectedFlowNodeId}
-              onNodeClick={(node) => setSelectedFlowNodeId(node.id)}
+              selectedNodeId={selectedFlowNode?.id ?? null}
+              onNodeClick={(node) => setSelectedFlowNode(node)}
+            />
+            <Inspector
+              anchor={anchor}
+              selectedNodeId={selectedFlowNode?.id ?? null}
+              selectedNodeData={selectedFlowNode}
+              appId={appId}
+              onClear={() => setSelectedFlowNode(null)}
             />
           </div>
         )}

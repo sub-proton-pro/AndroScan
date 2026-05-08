@@ -6624,12 +6624,27 @@ code { color: var(--accent); }
 
 .execution-flow-container {
   position: relative;
+  /* Phase 13 sub-step 13.7 — when the Inspector pane mounts as a
+   * sibling, the flowchart container shrinks via flex; otherwise
+   * it takes the full row width.
+   */
+  flex: 1 1 auto;
+  min-width: 0;
   width: 100%;
-  height: 480px;
+  height: 560px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--panel);
   overflow: hidden;
+}
+
+/* Phase 13 sub-step 13.7 — flowchart + inspector side-by-side row. */
+.execution-flow-row {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 12px;
+  width: 100%;
 }
 
 /* React Flow's default stylesheet uses light colors; pin the
@@ -6897,5 +6912,262 @@ code { color: var(--accent); }
 .execution-flow-edge-label-unverdicted {
   color: var(--muted);
   font-style: italic;
+}
+
+/* ===========================================================================
+ * Phase 13 sub-step 13.7 — Inspector pane (DEC-029).
+ *
+ * Right-side fixed-360px panel that opens on ``ExecutionFlow`` node
+ * click. Five sections: signature / summary / source line /
+ * predicate origin / bypass plans. Action row at the bottom with
+ * three buttons (Hook / Trace / Open source). Visual family
+ * matches the rest of the trace UI: ``var(--panel-2)`` background,
+ * ``var(--border)`` borders, accent color for interactive elements.
+ * =========================================================================== */
+
+.inspector {
+  flex: 0 0 360px;
+  min-width: 360px;
+  max-width: 360px;
+  height: 560px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow: hidden;
+}
+
+.inspector-empty {
+  align-items: stretch;
+}
+
+.inspector-empty-body {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+}
+
+.inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.inspector-head-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.inspector-close {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 3px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.inspector-close:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.inspector-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.inspector-section {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.inspector-section-title {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.inspector-section-count {
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.inspector-signature {
+  display: block;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.inspector-signature-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.inspector-overload-pill,
+.inspector-inlined-pill {
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 500;
+}
+
+.inspector-inlined-pill {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.inspector-inlined-callout {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg);
+  border-left: 2px solid var(--warn);
+  border-radius: 3px;
+}
+
+.inspector-source-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  align-self: flex-start;
+}
+
+.inspector-source-link:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.inspector-source-link:hover:not(:disabled) code {
+  color: var(--accent);
+}
+
+.inspector-source-link:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.inspector-source-link code {
+  background: transparent;
+  padding: 0;
+  color: var(--text);
+}
+
+.inspector-source-note {
+  margin: 0;
+}
+
+.inspector-predicate-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inspector-predicate-note {
+  margin: 0;
+}
+
+.inspector-plans {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* The Inspector reuses ``BypassPlanCard`` verbatim; we slim down
+ * the card chrome so the 360px column doesn't feel cramped.
+ * Single-class targeting keeps specificity matched against the
+ * canonical ``.trace-bypass-plan-card`` rule body. */
+.inspector-plans .trace-bypass-plan-card {
+  padding: 8px;
+  font-size: 11px;
+}
+
+.inspector-plans .trace-bypass-plan-stage {
+  font-size: 10px;
+  padding: 3px 6px;
+}
+
+.inspector-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 10px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.inspector-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 3px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 100ms ease-out, color 100ms ease-out;
+}
+
+.inspector-action:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.inspector-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.inspector-action-source {
+  /* Open source spans the full row so it lines up with the canvas
+   * mockup's primary call-to-action layout (Hook + Trace on top,
+   * Open Source as a secondary full-width row). */
+  grid-column: 1 / -1;
 }
 
