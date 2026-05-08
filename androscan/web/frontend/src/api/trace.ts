@@ -6,7 +6,7 @@
  * the canonical ``BehaviorAnchor`` JSON shape produced by
  * ``androscan.internal.trace_cache.anchor_to_json`` (i.e.
  * ``dataclasses.asdict(anchor)`` with stable key ordering). 10.7's
- * ``BehaviorAnchorCard`` / ``DecisionTimeline`` / ``BypassPlanCard``
+ * ``BehaviorAnchorCard`` / ``BehaviorTrace`` (legacy: ``DecisionTimeline``) / ``BypassPlanCard``
  * consume that shape via the typed surface below.
  *
  * The four pure functions mirror the four route shapes — kept thin

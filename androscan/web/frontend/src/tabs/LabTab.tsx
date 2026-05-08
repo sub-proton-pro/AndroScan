@@ -46,10 +46,12 @@ import {
  *
  * Hosts three modes selectable via a thin left-edge rail:
  *
- *   * **Trace** (default, NEW) — UI element ➜ decision-point timeline
- *     ➜ bypass plans. Placeholder for 10.6 (pinned to ``LabTraceMode``);
- *     full ``BehaviorAnchorCard`` / ``DecisionTimeline`` / ``BypassPlanCard``
- *     UI lands in 10.7.
+ *   * **Trace** (default, NEW) — UI element ➜ Behavior Trace ➜ bypass
+ *     plans. Placeholder for 10.6 (pinned to ``LabTraceMode``); full
+ *     ``BehaviorAnchorCard`` / ``BehaviorTrace`` / ``BypassPlanCard``
+ *     UI lands in 10.7. Phase 13 sub-step 13.5 renamed
+ *     ``DecisionTimeline`` → ``BehaviorTrace`` behind a one-release
+ *     ``VITE_BEHAVIOR_TRACE_LEGACY`` rollback flag.
  *   * **Manual Hooks** — the legacy Hook Lab 3-column layout
  *     (CallGraph | CodeView+HookBuilder+Chat | Sessions+Trace/Hooks/Scope).
  *     Unchanged from the pre-10.6 surface; operators with established

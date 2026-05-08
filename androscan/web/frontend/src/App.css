@@ -5635,8 +5635,22 @@ code { color: var(--accent); }
 }
 
 /* ----- DecisionTimeline + DecisionCard ----- */
+/* Phase 13 sub-step 13.5 — rename "Decision Timeline" → "Behavior
+   Trace". The new ``.behavior-trace-*`` namespace is paired into
+   each existing rule via comma-grouped selectors so the CSS works
+   for both the new ``BehaviorTrace`` component (default render
+   path) AND the legacy ``DecisionTimeline`` (gated behind
+   ``import.meta.env.VITE_BEHAVIOR_TRACE_LEGACY=1`` for one-release
+   rollback). The legacy halves of every selector group + the
+   legacy file itself are removed at sub-step 13.10's docs sweep.
 
-.trace-decision-timeline {
+   No semantic CSS change — pure namespace mirror. Specificity is
+   identical (single-class selectors throughout). The disclosure
+   block + action hint + verify button + DOM-id-anchored
+   ``aria-controls`` body all paired the same way. */
+
+.trace-decision-timeline,
+.behavior-trace-list {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -5645,7 +5659,8 @@ code { color: var(--accent); }
   gap: 0.5rem;
 }
 
-.trace-decision-card {
+.trace-decision-card,
+.behavior-trace-card {
   border: 1px solid var(--border);
   border-left: 3px solid var(--border-strong);
   border-radius: 3px;
@@ -5656,31 +5671,36 @@ code { color: var(--accent); }
   gap: 0.4rem;
 }
 
-.trace-decision-card-flagged {
+.trace-decision-card-flagged,
+.behavior-trace-card-flagged {
   border-left-color: var(--warn);
   background: color-mix(in srgb, var(--warn) 6%, var(--panel-2));
 }
 
-.trace-decision-header {
+.trace-decision-header,
+.behavior-trace-header {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
 }
 
-.trace-decision-header-line {
+.trace-decision-header-line,
+.behavior-trace-header-line {
   display: flex;
   gap: 0.5rem;
   align-items: center;
   flex-wrap: wrap;
 }
 
-.trace-decision-method {
+.trace-decision-method,
+.behavior-trace-method {
   font-size: 0.85rem;
   color: var(--text);
   word-break: break-all;
 }
 
-.trace-decision-kind {
+.trace-decision-kind,
+.behavior-trace-kind {
   display: inline-block;
   padding: 0.05rem 0.4rem;
   border-radius: 3px;
@@ -5692,7 +5712,8 @@ code { color: var(--accent); }
   letter-spacing: 0.04em;
 }
 
-.trace-decision-pill {
+.trace-decision-pill,
+.behavior-trace-pill {
   display: inline-block;
   padding: 0.05rem 0.4rem;
   border-radius: 3px;
@@ -5702,31 +5723,36 @@ code { color: var(--accent); }
   letter-spacing: 0.04em;
 }
 
-.trace-decision-pill-flagged {
+.trace-decision-pill-flagged,
+.behavior-trace-pill-flagged {
   background: color-mix(in srgb, var(--warn) 20%, transparent);
   color: var(--warn);
   border: 1px solid color-mix(in srgb, var(--warn) 50%, transparent);
 }
 
-.trace-decision-pill-llm {
+.trace-decision-pill-llm,
+.behavior-trace-pill-llm {
   background: var(--accent-soft);
   color: var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
 }
 
-.trace-decision-pill-warning {
+.trace-decision-pill-warning,
+.behavior-trace-pill-warning {
   background: color-mix(in srgb, var(--err) 12%, transparent);
   color: var(--err);
   border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
 }
 
-.trace-decision-verdicts {
+.trace-decision-verdicts,
+.behavior-trace-verdicts {
   display: flex;
   gap: 0.4rem;
   flex-wrap: wrap;
 }
 
-.trace-decision-expand {
+.trace-decision-expand,
+.behavior-trace-expand {
   background: transparent;
   color: var(--accent);
   border: none;
@@ -5737,27 +5763,33 @@ code { color: var(--accent); }
   text-align: left;
 }
 
-.trace-decision-expand:hover {
+.trace-decision-expand:hover,
+.behavior-trace-expand:hover {
   text-decoration: underline;
 }
 
-.trace-decision-body {
+.trace-decision-body,
+.behavior-trace-body {
   padding-top: 0.4rem;
   border-top: 1px dashed var(--border);
 }
 
 /* Phase 11 sub-step 11.1 — operator-UX clarity polish on the
-   Decision timeline. Three namespaces:
-   - `.trace-decision-timeline-disclosure` — inline disclosure block
-     above the <ol>, accent-blue tinted, clarifies the static-traversal
-     ordering contract (operators in v1 mistook visual order for
-     runtime execution order).
-   - `.trace-decision-action-hint` — one-line operator-action hint
-     above each high-confidence card body, soft-green filled.
-   - `.trace-decision-verify-btn` — "Verify with runtime trace" button
-     in the actions row, accent-blue outlined to mirror the
-     `.trace-bypass-plan-stage` affordance density. */
-.trace-decision-timeline-disclosure {
+   Decision timeline (behaviorally identical under the 13.5
+   rename). Three namespaces:
+   - `.trace-decision-timeline-disclosure` / `.behavior-trace-disclosure`
+     — inline disclosure block above the <ol>, accent-blue tinted,
+     clarifies the static-traversal ordering contract (operators in
+     v1 mistook visual order for runtime execution order).
+   - `.trace-decision-action-hint` / `.behavior-trace-action-hint`
+     — one-line operator-action hint above each high-confidence
+     card body, soft-green filled.
+   - `.trace-decision-verify-btn` / `.behavior-trace-verify-btn` —
+     "Verify with runtime trace" button in the actions row, accent-
+     blue outlined to mirror the ``.trace-bypass-plan-stage``
+     affordance density. */
+.trace-decision-timeline-disclosure,
+.behavior-trace-disclosure {
   font-size: 0.75rem;
   color: var(--muted);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
@@ -5768,7 +5800,8 @@ code { color: var(--accent); }
   border-radius: 0 3px 3px 0;
 }
 
-.trace-decision-action-hint {
+.trace-decision-action-hint,
+.behavior-trace-action-hint {
   font-size: 0.78rem;
   color: var(--text);
   background: color-mix(in srgb, var(--ok) 12%, transparent);
@@ -5780,7 +5813,8 @@ code { color: var(--accent); }
   border-radius: 3px;
 }
 
-.trace-decision-action-hint code {
+.trace-decision-action-hint code,
+.behavior-trace-action-hint code {
   font-size: 0.72rem;
   padding: 0.05rem 0.25rem;
   background: var(--panel);
@@ -5788,14 +5822,16 @@ code { color: var(--accent); }
   border-radius: 2px;
 }
 
-.trace-decision-actions {
+.trace-decision-actions,
+.behavior-trace-actions {
   display: flex;
   gap: 0.75rem;
   align-items: center;
   flex-wrap: wrap;
 }
 
-.trace-decision-verify-btn {
+.trace-decision-verify-btn,
+.behavior-trace-verify-btn {
   background: transparent;
   color: var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
@@ -5806,16 +5842,19 @@ code { color: var(--accent); }
   font-size: 0.78rem;
 }
 
-.trace-decision-verify-btn:hover:not(:disabled) {
+.trace-decision-verify-btn:hover:not(:disabled),
+.behavior-trace-verify-btn:hover:not(:disabled) {
   background: var(--accent-soft);
 }
 
-.trace-decision-verify-btn:disabled {
+.trace-decision-verify-btn:disabled,
+.behavior-trace-verify-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
 
-.trace-decision-details {
+.trace-decision-details,
+.behavior-trace-details {
   display: grid;
   grid-template-columns: max-content 1fr;
   gap: 0.3rem 0.75rem;
@@ -5823,16 +5862,19 @@ code { color: var(--accent); }
   font-size: 0.82rem;
 }
 
-.trace-decision-details dt {
+.trace-decision-details dt,
+.behavior-trace-details dt {
   color: var(--muted);
   font-weight: 600;
 }
 
-.trace-decision-details dd {
+.trace-decision-details dd,
+.behavior-trace-details dd {
   margin: 0;
 }
 
-.trace-decision-register {
+.trace-decision-register,
+.behavior-trace-register {
   display: inline-block;
   margin-right: 0.35rem;
   padding: 0.05rem 0.3rem;
@@ -5843,7 +5885,9 @@ code { color: var(--accent); }
 }
 
 .trace-decision-branch-list,
-.trace-decision-reasons {
+.trace-decision-reasons,
+.behavior-trace-branch-list,
+.behavior-trace-reasons {
   margin: 0;
   padding-left: 1rem;
 }
