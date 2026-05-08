@@ -225,6 +225,11 @@ import { BehaviorTrace } from "../components/trace/BehaviorTrace";
 import { DecisionTimeline } from "../components/trace/DecisionTimeline";
 import { ExecutionFlow } from "../components/trace/ExecutionFlow";
 import { Inspector } from "../components/trace/Inspector";
+import {
+  TraceModeToggle,
+  initialTraceMode,
+  type TraceMode,
+} from "../components/trace/TraceModeToggle";
 import type { ExecutionFlowNode } from "../components/trace/executionFlowGraph";
 
 // Phase 13 sub-step 13.5 — legacy-rollback flag for the "Decision
@@ -254,6 +259,7 @@ import {
   listTraceAnchors,
   normaliseTraceEntry,
   suggestSimilarClasses,
+  useDynamicTrace,
   useTraceAnchor,
   type BehaviorAnchor,
   type NormaliseEntryResponse,
@@ -1299,8 +1305,8 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   // Phase 13 sub-step 13.6 — Execution Flow flowchart collapse state.
   // Defaults open so the operator sees the new visual surface on
   // first paint; collapses with the same chevron pattern as the
-  // Behavior Trace list below it. 13.7's Inspector pane will live
-  // inside this section (right-side fixed-width pane); 13.8 adds the
+  // Behavior Trace list below it. 13.7's Inspector pane lives inside
+  // this section (right-side fixed-width pane); 13.8 adds the
   // Static / Dynamic / Both mode toggle + live-value chips.
   const [executionFlowCollapsed, setExecutionFlowCollapsed] = useState(false);
   // Phase 13 sub-step 13.6 / 13.7 — selected ExecutionFlow node,
@@ -1313,6 +1319,35 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   const [selectedFlowNode, setSelectedFlowNode] =
     useState<ExecutionFlowNode | null>(null);
 
+  // Phase 13 sub-step 13.8 — dynamic-trace lifecycle owned by the
+  // shared :func:`useDynamicTrace` hook. The hook's state drives
+  // (a) the fired-edge / fired-node accent in ``ExecutionFlow``, (b)
+  // the per-method live-value chips on edges + depth pills on
+  // nodes, (c) the Inspector's Summary section + Live observation
+  // panel, and (d) the Run / Stop button + status copy below the
+  // section header. The hook owns its WebSocket lifecycle; we just
+  // call ``start()`` / ``stop()`` from the button handlers and read
+  // ``state`` for the read-only views.
+  const dynamic = useDynamicTrace(appId);
+
+  // Phase 13 sub-step 13.8 — overlay mode (Static / Dynamic / Both).
+  // The default is computed against ``hasDynamicData`` (set once
+  // any entry event lands) per DEC-029's locked auto-default rule —
+  // see :func:`initialTraceMode` for the lookup priority
+  // (localStorage → hasDynamicData → "static").
+  const hasDynamicData = dynamic.state.firedMethods.size > 0;
+  const [mode, setMode] = useState<TraceMode>(() =>
+    initialTraceMode(appId, hasDynamicData),
+  );
+
+  // Re-evaluate the initial mode when the active app changes —
+  // a different app has its own localStorage key and its own
+  // hasDynamicData (which resets to false because the hook clears
+  // its state on appId change too).
+  useEffect(() => {
+    setMode(initialTraceMode(appId, false));
+  }, [appId]);
+
   // Clear the Inspector selection whenever the active anchor changes
   // (operator seeds a new entry, runs a new build, or the anchor's
   // method set changes underneath us). Without this, a stale
@@ -1321,12 +1356,25 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   // ``BehaviorAnchor`` — :func:`Inspector.resolveSelection` returns
   // ``null`` in that case, but the empty-state UX is cleaner than
   // showing the empty placeholder under a "selected" header.
+  //
+  // Phase 13.8 — the same guard ALSO resets the dynamic-trace
+  // accumulators (firedMethods / liveValues / summaries) by
+  // calling ``dynamic.reset()``. The previous anchor's runtime
+  // state shouldn't bleed into a different anchor's overlay (the
+  // overload keys could even collide across anchors for
+  // unrelated methods that happen to share a class+method
+  // namespace).
   const anchorKey =
     state.kind === "loaded"
       ? `${state.anchor.entry_method.class_name}#${state.anchor.entry_method.method_name}#${state.anchor.hops}`
       : null;
   useEffect(() => {
     setSelectedFlowNode(null);
+    dynamic.reset();
+    // ``dynamic.reset`` is a stable callback per the hook's
+    // useCallback definition; intentional partial deps to avoid
+    // re-firing on every state change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [anchorKey]);
 
   if (state.kind === "idle") {
@@ -1381,13 +1429,16 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
     <div className="trace-result">
       <BehaviorAnchorCard anchor={anchor} source={from} />
 
-      {/* Phase 13 sub-step 13.6 — Execution Flow flowchart. New
+      {/* Phase 13 sub-step 13.6 / 13.7 / 13.8 — Execution Flow
+          flowchart + Inspector + dynamic-trace overlay surface. New
           primary visual surface for the active anchor; sits above
           the (legacy-shaped) Behavior Trace list during the 13.6 →
-          13.8 build-out so operators can dogfood the flowchart
-          alongside the familiar linear list. 13.7 will add the
-          right-side Inspector pane; 13.8 will add the Static /
-          Dynamic / Both mode toggle and live-value chips. */}
+          13.10 build-out so operators can dogfood the flowchart
+          alongside the familiar linear list. 13.8 added: mode toggle
+          (Static / Dynamic / Both), Run / Stop dynamic-trace button
+          in the section head, fired-edge / fired-node accent
+          rendering, per-method live values + LLM summaries fed by
+          the dynamic-trace WebSocket. */}
       <section className="trace-section">
         <header className="trace-section-head">
           <button
@@ -1416,6 +1467,22 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
               {anchor.decisions.length === 1 ? "" : "s"})
             </span>
           </h3>
+          {/* 13.8 — section-head right cluster. Mode toggle pills +
+              Run / Stop dynamic-trace button + live status copy
+              when a session is active. Run button is the basic
+              v1; threshold-based color coding lands in 13.9. */}
+          <div className="trace-section-head-actions">
+            <TraceModeToggle
+              appId={appId}
+              hasDynamicData={hasDynamicData}
+              mode={mode}
+              onModeChange={setMode}
+            />
+            <DynamicTraceRunControl
+              dynamic={dynamic}
+              anchor={anchor}
+            />
+          </div>
         </header>
         {!executionFlowCollapsed && (
           <div id="execution-flow-body" className="execution-flow-row">
@@ -1423,6 +1490,9 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
               anchor={anchor}
               selectedNodeId={selectedFlowNode?.id ?? null}
               onNodeClick={(node) => setSelectedFlowNode(node)}
+              mode={mode}
+              firedMethods={dynamic.state.firedMethods}
+              liveValues={dynamic.state.liveValues}
             />
             <Inspector
               anchor={anchor}
@@ -1430,6 +1500,9 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
               selectedNodeData={selectedFlowNode}
               appId={appId}
               onClear={() => setSelectedFlowNode(null)}
+              summaries={dynamic.state.summaries}
+              liveValues={dynamic.state.liveValues}
+              mode={mode}
             />
           </div>
         )}
@@ -1527,6 +1600,129 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
           </details>
         )}
       </section>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DynamicTraceRunControl — Phase 13 sub-step 13.8.
+//
+// Compact Run / Stop control + live status copy that lives in the
+// Execution Flow section header. Wraps the :func:`useDynamicTrace`
+// hook's ``start()`` / ``stop()`` actions and renders the
+// connection state (idle / starting / running / stopping /
+// disconnected / error) as operator-readable copy.
+//
+// Wire shape: the button posts the active anchor's
+// ``entry_method.smali_signature`` + ``hops`` to
+// ``POST /api/trace/{app_id}/dynamic`` (Phase 13.2). The BE looks
+// up the cached ``BehaviorAnchor`` by ``(entry, hops)``, extracts
+// the closure, and spins up a Frida session. The hook then opens
+// the multiplexed ``/ws/trace/{app_id}/{session_id}`` WebSocket
+// (Phase 13.3) and starts streaming events.
+//
+// Threshold-based color coding (≤20 green / 21-50 yellow / etc.)
+// lands in 13.9; the v1 button is uncolored — operator just sees
+// the ``hook_count`` from the ``ready`` event in the status copy
+// after the trace starts. ``hop_cap`` defaults to 50 (the BE's
+// default); 13.9 may grow a stepper.
+// ---------------------------------------------------------------------------
+
+type DynamicTraceRunControlProps = {
+  dynamic: ReturnType<typeof useDynamicTrace>;
+  anchor: BehaviorAnchor;
+};
+
+function DynamicTraceRunControl({ dynamic, anchor }: DynamicTraceRunControlProps) {
+  const { state, start, stop } = dynamic;
+  // Build the entry-method Smali signature from the anchor's
+  // entry_method MethodRef. The BE's ``StartDynamicTraceBody.entry``
+  // accepts the same signature shape ``trace_cache.read_anchor``
+  // looks up under, so this is byte-equal to what the cache POST
+  // path already wrote (the anchor we're rendering). Synthesised
+  // inline to avoid a cross-module import for ``MethodRef`` →
+  // smali-signature; mirrors :func:`Inspector.methodSig`.
+  const entry = useMemo(() => {
+    const m = anchor.entry_method;
+    const cn = (m.class_name || "").replace(/\./g, "/");
+    return `L${cn};->${m.method_name}(${(m.param_descriptors || []).join("")})${m.return_descriptor || "V"}`;
+  }, [anchor]);
+
+  const onRun = useCallback(() => {
+    void start({ entry, hops: anchor.hops });
+  }, [start, entry, anchor.hops]);
+
+  const onStop = useCallback(() => {
+    void stop();
+  }, [stop]);
+
+  const isRunning = state.connection === "running";
+  const isBusy = state.connection === "starting" || state.connection === "stopping";
+  const showStop = isRunning || isBusy;
+  const buttonLabel = (() => {
+    if (state.connection === "starting") return "Starting…";
+    if (state.connection === "stopping") return "Stopping…";
+    if (isRunning) return "Stop dynamic trace";
+    return "Run dynamic trace";
+  })();
+
+  const statusCopy = (() => {
+    if (state.connection === "running" && state.readyStats) {
+      const r = state.readyStats;
+      return `${r.methods_hooked} hooked / ${r.methods_attempted} attempted${
+        r.methods_failed > 0 ? ` · ${r.methods_failed} failed` : ""
+      }`;
+    }
+    if (state.connection === "running") return "hooks installing…";
+    if (state.connection === "disconnected") return "WebSocket dropped — re-run to resume";
+    if (state.connection === "stopped") return "trace stopped";
+    if (state.connection === "error") return state.error ?? "error";
+    return null;
+  })();
+
+  return (
+    <div className="lab-dynamic-trace-controls">
+      <button
+        type="button"
+        className={[
+          "lab-dynamic-trace-button",
+          isRunning && "lab-dynamic-trace-button-running",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+        onClick={showStop ? onStop : onRun}
+        disabled={isBusy}
+        title={
+          isRunning
+            ? "Stop the active dynamic trace and detach the Frida session"
+            : "Start a dynamic Frida trace on the closure of methods reachable from this anchor"
+        }
+      >
+        {buttonLabel}
+      </button>
+      {statusCopy && (
+        <span
+          className={[
+            "lab-dynamic-trace-status",
+            state.connection === "error" && "lab-dynamic-trace-status-err",
+            state.connection === "disconnected" && "lab-dynamic-trace-status-warn",
+          ]
+            .filter(Boolean)
+            .join(" ")}
+          role="status"
+          aria-live="polite"
+        >
+          {statusCopy}
+        </span>
+      )}
+      {state.dropCount > 0 && (
+        <span
+          className="lab-dynamic-trace-drops"
+          title="The session's ring buffer overflowed; some events were dropped before they reached the UI"
+        >
+          {state.dropCount} drop{state.dropCount === 1 ? "" : "s"}
+        </span>
+      )}
     </div>
   );
 }

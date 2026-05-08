@@ -72,11 +72,37 @@
  * ``setSelectedFlowNodeId(null)``. The whole panel renders an
  * empty-state placeholder when ``selectedNodeId === null``.
  *
+ * **Phase 13 sub-step 13.8 update:** the Summary section now
+ * consumes the live ``summary_pending`` / ``summary_ready`` /
+ * ``summary_failed`` events from :func:`useDynamicTrace` (via the
+ * ``summary`` prop). The four states the section renders:
+ *
+ *   * ``undefined`` — no summary event has landed for this method
+ *     yet. v1 copy: "Summary not yet generated. Run a dynamic
+ *     trace to generate per-method LLM summaries."
+ *   * ``pending`` — summary in flight (LLM call started). Renders
+ *     a small spinner + "Generating summary…" copy.
+ *   * ``ready`` — summary text rendered as a paragraph. The
+ *     ``cached: true`` flavour gets a small "(cached)" muted
+ *     suffix so the operator knows whether the summary came from
+ *     the warm cache or a fresh LLM call.
+ *   * ``failed`` — error message rendered with a small ⚠ icon and
+ *     a "Re-run dynamic trace to retry" hint.
+ *
+ * The Live observation panel (latest ``args`` / ``ret`` / thread
+ * info from the runtime) lands in 13.8 too — appended below the
+ * Source section as a small grid that's only visible when the
+ * selected method has actually fired (``live`` is non-null) and
+ * the operator's mode is ``"dynamic"`` / ``"both"``.
+ *
  * Out of scope for v1 (defer to later sub-steps):
- *   * Live observation panel (param values + return value from
- *     the dynamic-trace WebSocket) → 13.8.
  *   * Bootstrap fetch of cached summaries from
- *     ``skill_results_cache.json`` → 13.8.
+ *     ``skill_results_cache.json`` for methods that fired in a
+ *     prior session — operator currently sees the cached summary
+ *     only on the first ``entry`` of the new session (the BE's
+ *     replay-on-late-join handles that path). Pure-static
+ *     inspection (no dynamic trace) doesn't surface the cache;
+ *     13.9 may add a route for explicit lookups.
  *   * Line-aware ``Open source`` (extend ``PendingCodeNav`` with
  *     a ``line`` field) → 13.9 candidate.
  */
@@ -87,14 +113,20 @@ import type {
   BehaviorAnchor,
   BypassPlan,
   DecisionPoint,
+  LiveValueRecord,
   MethodRef,
   PredicateOrigin,
+  SummaryState,
 } from "../../api/trace";
 import { useWorkbench } from "../../context/WorkbenchContext";
 import { classNameToJavaRelPath } from "../../util/smaliClassToFile";
 import { BypassPlanCard } from "./BypassPlanCard";
 import { PredicateOriginView } from "./PredicateOriginView";
-import type { ExecutionFlowNode } from "./executionFlowGraph";
+import {
+  overloadKey as graphOverloadKey,
+  type ExecutionFlowNode,
+} from "./executionFlowGraph";
+import type { TraceMode } from "./TraceModeToggle";
 
 
 // ---------------------------------------------------------------------------
@@ -225,6 +257,23 @@ type Props = {
   /** Operator-clicked Close (``×``); the consumer wires this to
    *  ``setSelectedFlowNodeId(null)``. */
   onClear: () => void;
+  /** Phase 13 sub-step 13.8 — per-method LLM summary state, fed by
+   *  the ``summary_pending`` / ``summary_ready`` / ``summary_failed``
+   *  events from the dynamic-trace WebSocket. Keyed by overload key
+   *  (descriptor-stripped Smali) so multiple overloads of the same
+   *  method share one summary. ``undefined`` lookup → empty-state
+   *  placeholder. */
+  summaries?: ReadonlyMap<string, SummaryState>;
+  /** Phase 13 sub-step 13.8 — latest fire's args + return + thread
+   *  info for the selected method, fed by the ``entry`` / ``exit``
+   *  events. ``undefined`` / not-found lookup → live-observation
+   *  panel doesn't render. */
+  liveValues?: ReadonlyMap<string, LiveValueRecord>;
+  /** Phase 13 sub-step 13.8 — current trace overlay mode. The Live
+   *  observation panel only renders in ``"dynamic"`` / ``"both"``
+   *  to keep the Inspector compact when the operator has explicitly
+   *  asked for the static-only view. */
+  mode?: TraceMode;
 };
 
 
@@ -234,6 +283,9 @@ export function Inspector({
   selectedNodeData,
   appId,
   onClear,
+  summaries,
+  liveValues,
+  mode = "static",
 }: Props) {
   const { setPendingHookPrefill, setPendingTraceEntry, setPendingCodeNav, setLabMode, setTab } =
     useWorkbench();
@@ -285,6 +337,13 @@ export function Inspector({
   const { overloadCount, possiblyInlined } = selectedNodeData;
   const sigDisplay = formatSignature(canonical);
   const sourceFile = `${(canonical.class_name || "").split(".").pop() || canonical.class_name}.java`;
+  // 13.8 — per-method summary + live-value lookup. Both keyed on
+  // overload key (descriptor-stripped Smali) so multiple overloads
+  // collapse onto the same Inspector view.
+  const oKey = graphOverloadKey(canonical);
+  const summary = summaries?.get(oKey);
+  const live = liveValues?.get(oKey) ?? null;
+  const showLiveObservation = (mode === "dynamic" || mode === "both") && live != null;
 
   const onHookThisMethod = () => {
     if (!appId) return;
@@ -367,14 +426,102 @@ export function Inspector({
           )}
         </section>
 
-        {/* 2. Summary (placeholder; 13.8 wires the event consumer) */}
+        {/* 2. Summary — 13.8 consumes the live ``summary_*`` events
+            from useDynamicTrace via the ``summary`` lookup. Four
+            states: undefined (no event yet) / pending (in flight) /
+            ready (text rendered) / failed (error + retry hint). */}
         <section className="inspector-section">
           <h4 className="inspector-section-title">Summary</h4>
-          <p className="muted small">
-            Summary not yet generated. Run a dynamic trace to generate
-            per-method LLM summaries (cached for the active app SHA).
-          </p>
+          {!summary && (
+            <p className="muted small">
+              Summary not yet generated. Run a dynamic trace to generate
+              per-method LLM summaries (cached for the active app SHA).
+            </p>
+          )}
+          {summary?.state === "pending" && (
+            <div className="inspector-summary inspector-summary-pending" role="status" aria-live="polite">
+              <span className="trace-entry-spinner" aria-hidden="true" />
+              <span className="muted small">Generating summary…</span>
+            </div>
+          )}
+          {summary?.state === "ready" && (
+            <div className="inspector-summary inspector-summary-ready">
+              <p className="inspector-summary-text">{summary.text}</p>
+              {summary.cached && (
+                <span className="inspector-summary-cached-pill" title="Loaded from skill_results_cache.json (no fresh LLM call)">
+                  cached
+                </span>
+              )}
+            </div>
+          )}
+          {summary?.state === "failed" && (
+            <div className="inspector-summary inspector-summary-failed">
+              <p className="inspector-summary-error" role="alert">
+                <span aria-hidden="true">⚠</span>
+                {" "}Summary generation failed — {summary.error}.
+              </p>
+              <p className="muted small">
+                Re-run the dynamic trace to retry. Failed summaries are
+                not cached.
+              </p>
+            </div>
+          )}
         </section>
+
+        {/* 13.8 — Live observation panel. Only renders when the
+            operator's mode includes the dynamic overlay AND the
+            method has actually fired (entry recorded → liveValues
+            populated). Shows the latest fire's args, return value
+            (when exit landed), thread + depth context, and fire
+            count. The grid is sized for the 360px column; long
+            arg / ret values are truncated by the chip CSS rather
+            than wrapped, with a hover-tooltip carrying the full
+            value. */}
+        {showLiveObservation && live && (
+          <section className="inspector-section inspector-live">
+            <h4 className="inspector-section-title">
+              Live observation
+              {live.fireCount > 1 && (
+                <span className="muted small inspector-section-count">
+                  {" "}(latest of {live.fireCount} fires)
+                </span>
+              )}
+            </h4>
+            <dl className="inspector-live-grid">
+              <dt>Args</dt>
+              <dd>
+                {live.args.length === 0 ? (
+                  <span className="muted small">(no args)</span>
+                ) : (
+                  <ul className="inspector-live-args">
+                    {live.args.map((a, i) => (
+                      <li key={i} title={a}>
+                        <code>{a}</code>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </dd>
+              <dt>Return</dt>
+              <dd>
+                {live.ret == null ? (
+                  <span className="muted small">(exit not yet recorded)</span>
+                ) : (
+                  <code className="inspector-live-ret" title={live.ret}>
+                    {live.ret}
+                  </code>
+                )}
+              </dd>
+              <dt>Thread</dt>
+              <dd>
+                <code>tid {live.threadId}</code>
+                <span className="muted small">
+                  {" "}· depth {live.threadDepth}
+                </span>
+              </dd>
+            </dl>
+          </section>
+        )}
 
         {/* 3. Source line */}
         <section className="inspector-section">

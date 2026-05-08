@@ -474,6 +474,833 @@ export type UseTraceAnchorReturn = {
   clear: () => void;
 };
 
+// ---------------------------------------------------------------------------
+// Phase 13 sub-step 13.8 — dynamic-trace surface
+// ---------------------------------------------------------------------------
+//
+// Wraps the Phase 13.2 ``POST /api/trace/{app_id}/dynamic`` start +
+// Phase 13.2 ``DELETE /api/trace/{app_id}/dynamic/{session_id}`` stop
+// REST endpoints, plus the Phase 13.3 ``WS /ws/trace/{app_id}/{session_id}``
+// multiplexed event channel that streams Frida trace events
+// (``send`` envelope + ``payload.phase`` of ``"entry" | "exit" |
+// "ready" | "hook_failed" | "error"``) alongside LLM summary events
+// (``summary_pending`` / ``summary_ready`` / ``summary_failed`` —
+// these top-level ``kind``s are the multiplexer's invention; Frida
+// itself only emits ``send`` / ``error`` / ``log``).
+//
+// Wire-shape gotchas the BE explorer report flagged that this hook
+// has to handle:
+//
+//   1. The ``ws_url`` field on the start response still points at
+//      ``/ws/frida/{session_id}`` (the legacy pre-13.3 path); we
+//      derive the multiplexed URL ``/ws/trace/{app_id}/{session_id}``
+//      ourselves from the response's ``session_id`` + the caller-
+//      supplied ``app_id``. The 13.10 docs sweep may rewrite the
+//      backend's ``ws_url`` to the new shape; until then the FE owns
+//      the URL.
+//   2. ``kind`` is ``"send"`` (Frida transport) for trace events; the
+//      operator-facing ``"entry"`` / ``"exit"`` / etc. lives in
+//      ``payload.phase``. The hook normalises this into a discriminated
+//      ``DynamicTraceMessage`` union so consumers can ``switch`` on
+//      one field instead of remembering the ``kind`` + ``phase``
+//      double-discriminator.
+//   3. ``summary_ready`` carries its text as ``payload.summary``
+//      (NOT ``payload.text`` — easy mis-spell that 13.4's tests pin
+//      down on the BE side).
+//   4. ``entry`` events use ``payload.thread_depth`` (NOT ``depth``)
+//      and ``payload.seq`` (NOT ``entry_seq``); ``entry_seq`` lives
+//      on ``exit`` / ``error`` events as the back-reference.
+//   5. ``exit`` events use the literal JSON key ``"return"`` for the
+//      return value — TS reserved-word, so we read via bracket
+//      access.
+//   6. ``payload.class`` is Java-dotted (``com.example.Foo``); the
+//      ``ExecutionFlow`` node ids are Smali (``Lcom/example/Foo;->...``).
+//      :func:`smaliKeyFromEvent` does the conversion.
+//
+// State machine:
+//
+//   idle → starting → running → stopping → stopped
+//                            ↘ disconnected (WS dropped while running)
+//                            ↘ error (POST failed / WS failed to open)
+//
+// The hook owns its WebSocket lifecycle — caller writes ``start()`` /
+// ``stop()`` and reads ``state``. Disconnect is observed via
+// ``WebSocket.onclose``; the hook DOESN'T auto-reconnect (the BE's
+// ring-buffer replay means a fresh ``start()`` would spin up a new
+// session, which isn't what the operator wants — they wanted the
+// trace to continue, not restart). 13.9 may revisit if dogfooding
+// shows reconnect demand.
+
+export type StartDynamicTraceRequest = {
+  /** Smali signature of the entry method (must match a cached anchor
+   *  built via 10.6 / 10.7's ``trace_behavior`` skill — the start
+   *  endpoint reads the closure from the cache, doesn't re-build). */
+  entry: string;
+  /** Anchor hops to look up. Defaults to ``3`` server-side; the
+   *  ``LabTraceMode`` consumer always passes the active anchor's
+   *  hops so the lookup is exact. */
+  hops?: number;
+  /** Hard cap on methods to hook — server clamps to ``[1, 500]``;
+   *  default ``50``. 13.9 will color-code the run-trace button by
+   *  ``hop_cap`` thresholds (≤20 green / 21–50 yellow / etc.). */
+  hop_cap?: number;
+  /** Spawn-on-attach flag — passes through to the Frida client.
+   *  Default ``false`` (attach to running process). Spawn is only
+   *  useful when the operator wants to see ``onCreate`` / ``onResume``
+   *  level events that fire before they could attach manually. */
+  spawn?: boolean;
+  /** Operator-readable label for logcat / persisted JSONL filenames.
+   *  Defaults to ``"behavior-trace-<8 hex>"`` server-side. */
+  event_label?: string;
+};
+
+export type StartDynamicTraceResponse = {
+  session_id: string;
+  app_id: string;
+  template_id: "behavior_trace_multi";
+  package: string;
+  pid: number | null;
+  /** ISO-8601 string from the Frida session's ``started_at``. */
+  started_at: string;
+  /** Number of methods actually hooked (after closure extraction +
+   *  hop-cap truncation). */
+  hook_count: number;
+  /** Total methods in the closure before the cap was applied. */
+  closure_size: number;
+  hop_cap: number;
+  event_label: string;
+  /** **Legacy.** Currently points at ``/ws/frida/{session_id}``;
+   *  consumers should ignore this field and use the ``/ws/trace/...``
+   *  shape via :func:`buildTraceWsUrl` instead. The field is kept
+   *  for 13.10 backwards-compat; will be rewritten to the new shape
+   *  in a future BE pass. */
+  ws_url: string;
+  persist_path: string | null;
+  anchor: {
+    /** Smali signature of the active anchor's entry method. */
+    entry_method: string;
+    hops: number;
+  };
+};
+
+/** Frida ``send`` envelope (matches :type:`TraceEvent` in
+ *  ``api/frida.ts`` byte-for-byte). Renamed here to avoid a
+ *  cross-module import cycle. */
+type FridaTransportEvent = {
+  ts: number;
+  session_id: string;
+  kind: "send" | "error" | "log";
+  payload: unknown;
+  raw: Record<string, unknown> | null;
+};
+
+/** Multiplexed summary event — the BE's invention; Frida itself
+ *  doesn't emit these top-level kinds. Same envelope shape as the
+ *  Frida event for code-path symmetry; ``raw`` is always ``null``. */
+type SummaryTransportEvent = {
+  ts: number;
+  session_id: string;
+  kind: "summary_pending" | "summary_ready" | "summary_failed";
+  payload: {
+    /** Java-dotted class name (the ``trace_summary`` helper converts
+     *  to Smali for cache keys, but the WS payload stays Java). */
+    class: string;
+    method: string;
+    descriptor: string;
+    /** Only on ``summary_ready``. */
+    summary?: string;
+    /** Only on ``summary_ready``; ``true`` when the summary was
+     *  served from ``skill_results_cache`` rather than freshly
+     *  generated. */
+    cached?: boolean;
+    /** Only on ``summary_failed``; one of ``"summary_timeout"`` /
+     *  ``"empty_summary"`` / arbitrary exception text. */
+    error?: string;
+  };
+  raw: null;
+};
+
+/** Top-level WS message — discriminated by ``kind``. */
+export type DynamicTraceWsMessage =
+  | FridaTransportEvent
+  | SummaryTransportEvent
+  /** Drop notice when the session's ring buffer overflows. */
+  | { type: "drop"; session_id: string }
+  /** Pre-close error (``frida_unavailable`` / ``unknown_session``). */
+  | { type: "error"; error: string; message?: string; app_id?: string; session_id?: string };
+
+/** Normalised event shape the consumers see — a flat discriminated
+ *  union keyed on ``phase`` (for trace events) or summary kind. The
+ *  hook does the ``kind === "send"`` → ``payload.phase`` unwrap so
+ *  the consumer doesn't have to.
+ *
+ *  Each variant carries the operator-facing fields; the raw
+ *  envelope is preserved as ``raw`` for the future debug log
+ *  surface. */
+export type NormalisedTraceEvent =
+  | {
+      phase: "entry";
+      ts: number;
+      class: string;
+      method: string;
+      descriptor: string;
+      args: string[];
+      seq: number;
+      thread_id: number;
+      thread_name: string;
+      thread_depth: number;
+      parent_call_seq: number | null;
+    }
+  | {
+      phase: "exit";
+      ts: number;
+      class: string;
+      method: string;
+      descriptor: string;
+      ret: string;
+      seq: number;
+      entry_seq: number | null;
+      thread_id: number;
+      thread_depth: number;
+    }
+  | {
+      phase: "error";
+      ts: number;
+      class: string;
+      method: string;
+      seq: number;
+      entry_seq: number | null;
+      thread_id: number;
+      error: string;
+    }
+  | {
+      phase: "ready";
+      ts: number;
+      methods_attempted: number;
+      methods_hooked: number;
+      methods_failed: number;
+      error: string | null;
+    }
+  | {
+      phase: "hook_failed";
+      ts: number;
+      class: string;
+      method: string;
+      descriptor: string;
+      reason: "class_not_found" | "method_not_found" | "impl_set_failed" | string;
+      error: string | null;
+    }
+  | {
+      phase: "summary_pending";
+      ts: number;
+      class: string;
+      method: string;
+      descriptor: string;
+    }
+  | {
+      phase: "summary_ready";
+      ts: number;
+      class: string;
+      method: string;
+      descriptor: string;
+      summary: string;
+      cached: boolean;
+    }
+  | {
+      phase: "summary_failed";
+      ts: number;
+      class: string;
+      method: string;
+      descriptor: string;
+      error: string;
+    };
+
+/** Java-dotted ``class`` + Smali ``descriptor`` → full Smali
+ *  signature key matching :mod:`executionFlowGraph.methodKey`. */
+export function smaliSignatureFromEvent(
+  classJava: string,
+  method: string,
+  descriptor: string,
+): string {
+  return `L${classJava.replace(/\./g, "/")};->${method}${descriptor}`;
+}
+
+/** Java-dotted ``class`` + method name → overload-stripped Smali
+ *  key matching :mod:`executionFlowGraph.overloadKey`. Multiple
+ *  overloads of the same method collapse onto the same node, so
+ *  the FE indexes ``firedMethods`` / ``liveValues`` / ``summaries``
+ *  by overload key. */
+export function overloadKeyFromEvent(
+  classJava: string,
+  method: string,
+): string {
+  return `L${classJava.replace(/\./g, "/")};->${method}`;
+}
+
+/** Construct the ``/ws/trace/...`` URL for the multiplexed channel.
+ *  Honors ``window.location.protocol`` so HTTPS hosts get ``wss://``
+ *  for free. */
+function buildTraceWsUrl(appId: string, sessionId: string): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/ws/trace/${encodeURIComponent(appId)}/${encodeURIComponent(sessionId)}`;
+}
+
+/** Pure helper: map the WS envelope into a flat event for the
+ *  consumer reducers. Returns ``null`` for transport-shape messages
+ *  the hook handles separately (drop notices / pre-close errors /
+ *  Frida ``error`` / ``log`` channels). Exported for test seam +
+ *  for any 13.x consumer that wants to replay buffered events. */
+export function normaliseTraceMessage(
+  msg: DynamicTraceWsMessage,
+): NormalisedTraceEvent | null {
+  if ("type" in msg) return null;
+  if (msg.kind === "summary_pending" || msg.kind === "summary_ready" || msg.kind === "summary_failed") {
+    const p = msg.payload;
+    if (msg.kind === "summary_ready") {
+      return {
+        phase: "summary_ready",
+        ts: msg.ts,
+        class: p.class,
+        method: p.method,
+        descriptor: p.descriptor,
+        summary: p.summary ?? "",
+        cached: !!p.cached,
+      };
+    }
+    if (msg.kind === "summary_failed") {
+      return {
+        phase: "summary_failed",
+        ts: msg.ts,
+        class: p.class,
+        method: p.method,
+        descriptor: p.descriptor,
+        error: p.error ?? "unknown",
+      };
+    }
+    return {
+      phase: "summary_pending",
+      ts: msg.ts,
+      class: p.class,
+      method: p.method,
+      descriptor: p.descriptor,
+    };
+  }
+  if (msg.kind !== "send") return null;
+  const payload = msg.payload as Record<string, unknown> | null;
+  if (!payload || typeof payload !== "object") return null;
+  const phase = (payload as { phase?: string }).phase;
+  if (!phase) return null;
+  if (phase === "entry") {
+    return {
+      phase: "entry",
+      ts: msg.ts,
+      class: String((payload as { class?: unknown }).class ?? ""),
+      method: String((payload as { method?: unknown }).method ?? ""),
+      descriptor: String((payload as { descriptor?: unknown }).descriptor ?? ""),
+      args: Array.isArray((payload as { args?: unknown }).args)
+        ? ((payload as { args: unknown[] }).args.map((a) => String(a)))
+        : [],
+      seq: Number((payload as { seq?: unknown }).seq ?? 0),
+      thread_id: Number((payload as { thread_id?: unknown }).thread_id ?? 0),
+      thread_name: String((payload as { thread_name?: unknown }).thread_name ?? ""),
+      thread_depth: Number((payload as { thread_depth?: unknown }).thread_depth ?? 0),
+      parent_call_seq:
+        (payload as { parent_call_seq?: number | null }).parent_call_seq ?? null,
+    };
+  }
+  if (phase === "exit") {
+    // The BE emits ``"return"`` (literal JSON key) for the return
+    // value — reserved word in TS, so we read via bracket access.
+    const ret = (payload as Record<string, unknown>)["return"];
+    return {
+      phase: "exit",
+      ts: msg.ts,
+      class: String((payload as { class?: unknown }).class ?? ""),
+      method: String((payload as { method?: unknown }).method ?? ""),
+      descriptor: String((payload as { descriptor?: unknown }).descriptor ?? ""),
+      ret: ret == null ? "" : String(ret),
+      seq: Number((payload as { seq?: unknown }).seq ?? 0),
+      entry_seq:
+        (payload as { entry_seq?: number | null }).entry_seq ?? null,
+      thread_id: Number((payload as { thread_id?: unknown }).thread_id ?? 0),
+      thread_depth: Number((payload as { thread_depth?: unknown }).thread_depth ?? 0),
+    };
+  }
+  if (phase === "error") {
+    return {
+      phase: "error",
+      ts: msg.ts,
+      class: String((payload as { class?: unknown }).class ?? ""),
+      method: String((payload as { method?: unknown }).method ?? ""),
+      seq: Number((payload as { seq?: unknown }).seq ?? 0),
+      entry_seq:
+        (payload as { entry_seq?: number | null }).entry_seq ?? null,
+      thread_id: Number((payload as { thread_id?: unknown }).thread_id ?? 0),
+      error: String((payload as { error?: unknown }).error ?? ""),
+    };
+  }
+  if (phase === "ready") {
+    return {
+      phase: "ready",
+      ts: msg.ts,
+      methods_attempted: Number(
+        (payload as { methods_attempted?: unknown }).methods_attempted ?? 0,
+      ),
+      methods_hooked: Number(
+        (payload as { methods_hooked?: unknown }).methods_hooked ?? 0,
+      ),
+      methods_failed: Number(
+        (payload as { methods_failed?: unknown }).methods_failed ?? 0,
+      ),
+      error: ((payload as { error?: string | null }).error ?? null) || null,
+    };
+  }
+  if (phase === "hook_failed") {
+    return {
+      phase: "hook_failed",
+      ts: msg.ts,
+      class: String((payload as { class?: unknown }).class ?? ""),
+      method: String((payload as { method?: unknown }).method ?? ""),
+      descriptor: String((payload as { descriptor?: unknown }).descriptor ?? ""),
+      reason: String((payload as { reason?: unknown }).reason ?? "unknown") as
+        | "class_not_found"
+        | "method_not_found"
+        | "impl_set_failed"
+        | string,
+      error: ((payload as { error?: string | null }).error ?? null) || null,
+    };
+  }
+  return null;
+}
+
+export function startDynamicTrace(
+  appId: string,
+  body: StartDynamicTraceRequest,
+): Promise<ApiResult<StartDynamicTraceResponse>> {
+  return _request<StartDynamicTraceResponse>(
+    `/api/trace/${encodeURIComponent(appId)}/dynamic`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export function stopDynamicTrace(
+  appId: string,
+  sessionId: string,
+): Promise<ApiResult<{ ok: boolean; session_id: string }>> {
+  return _request<{ ok: boolean; session_id: string }>(
+    `/api/trace/${encodeURIComponent(appId)}/dynamic/${encodeURIComponent(sessionId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// useDynamicTrace — owns the POST → WS → DELETE lifecycle.
+//
+// State per running session:
+//
+//   * ``firedMethods: Set<string>`` of overload-keys (descriptor-
+//     stripped Smali) — populated on every ``entry`` event. The
+//     ``ExecutionFlow`` consumer uses this to render the fired-
+//     edge / fired-node accent (DEC-029 locks accent-blue solid for
+//     fired in Dynamic / Both modes).
+//   * ``liveValues: Map<overloadKey, LiveValueRecord>`` — per-method
+//     latest fire's args / return / thread_depth + a fire count.
+//     Multiple overloads of the same method collapse onto the same
+//     node so the latest fire across all overloads wins (v1
+//     simplification; 13.9 may grow per-overload fan-out).
+//   * ``summaries: Map<overloadKey, SummaryState>`` — per-method LLM
+//     summary state, fed by the ``summary_pending`` /
+//     ``summary_ready`` / ``summary_failed`` events. Cache hits
+//     skip ``pending`` and land directly as ``ready`` with
+//     ``cached: true`` per the 13.3 contract.
+//   * ``hookFailed: Map<overloadKey, HookFailureRecord>`` — populated
+//     on ``hook_failed`` events. v1 consumer surface is the
+//     ``ExecutionFlow`` "possibly inlined" pill turning red on
+//     ``method_not_found`` / ``impl_set_failed``; the full surface
+//     lands in 13.9.
+//   * ``readyStats`` — final hook counts from the ``ready`` event;
+//     the ``LabTraceMode`` consumer renders this as a "N hooked / M
+//     attempted" summary in the run-trace button's title.
+//
+// Reducer-style updaters keep the state immutable per render so
+// React Flow's ``useMemo`` dependencies stay simple.
+
+export type LiveValueRecord = {
+  args: string[];
+  ret: string | null;
+  threadId: number;
+  threadDepth: number;
+  fireCount: number;
+  /** ts of the most recent ``entry`` event. */
+  lastFireTs: number;
+};
+
+export type SummaryState =
+  | { state: "pending"; ts: number }
+  | { state: "ready"; text: string; cached: boolean; ts: number }
+  | { state: "failed"; error: string; ts: number };
+
+export type HookFailureRecord = {
+  reason: string;
+  error: string | null;
+  ts: number;
+};
+
+export type DynamicTraceConnection =
+  | "idle"
+  | "starting"
+  | "running"
+  | "stopping"
+  | "stopped"
+  | "disconnected"
+  | "error";
+
+export type DynamicTraceState = {
+  connection: DynamicTraceConnection;
+  sessionId: string | null;
+  /** Latest start-response metadata; ``null`` until the first
+   *  successful ``start()``. Operator-facing fields (hook count,
+   *  package, started_at) live here. */
+  meta: StartDynamicTraceResponse | null;
+  firedMethods: ReadonlySet<string>;
+  liveValues: ReadonlyMap<string, LiveValueRecord>;
+  summaries: ReadonlyMap<string, SummaryState>;
+  hookFailed: ReadonlyMap<string, HookFailureRecord>;
+  readyStats: {
+    methods_attempted: number;
+    methods_hooked: number;
+    methods_failed: number;
+  } | null;
+  /** Operator-readable error from the most recent failure (POST
+   *  rejected / WS dropped with a server-side ``type: "error"``
+   *  message / WS construction failed). ``null`` in healthy
+   *  states. */
+  error: string | null;
+  /** Drop-notice counter (matches ``useFridaTrace``'s pattern); the
+   *  consumer can render a "N events dropped" badge if non-zero. */
+  dropCount: number;
+};
+
+export type UseDynamicTraceReturn = {
+  state: DynamicTraceState;
+  start: (req: StartDynamicTraceRequest) => Promise<void>;
+  stop: () => Promise<void>;
+  /** Reset the local state without touching the server (useful when
+   *  the operator changes anchors and the consumer wants to clear
+   *  the carried-over fired-method accents). The ``stop()`` happy
+   *  path already calls this internally. */
+  reset: () => void;
+};
+
+const INITIAL_DYNAMIC_TRACE_STATE: DynamicTraceState = {
+  connection: "idle",
+  sessionId: null,
+  meta: null,
+  firedMethods: new Set<string>(),
+  liveValues: new Map<string, LiveValueRecord>(),
+  summaries: new Map<string, SummaryState>(),
+  hookFailed: new Map<string, HookFailureRecord>(),
+  readyStats: null,
+  error: null,
+  dropCount: 0,
+};
+
+export function useDynamicTrace(appId: string | null): UseDynamicTraceReturn {
+  const [state, setState] = useState<DynamicTraceState>(
+    INITIAL_DYNAMIC_TRACE_STATE,
+  );
+
+  // WebSocket handle — kept in a ref so ``stop()`` can close it
+  // synchronously without racing the open. The ref is the source of
+  // truth; the state's ``connection`` field is the consumer-visible
+  // mirror.
+  const wsRef = useRef<WebSocket | null>(null);
+  // Session id ref — kept in a ref so the ``stop()`` callback closes
+  // over a stable handle without needing the latest state in its
+  // deps (which would re-create the callback on every event).
+  const sessionRef = useRef<string | null>(null);
+  // Generation counter — incremented on every ``start()`` /
+  // ``stop()`` so a stale WS message arriving after the operator
+  // reset doesn't clobber the new generation's state.
+  const genRef = useRef<number>(0);
+
+  // Reset when ``appId`` flips — a new app always starts a fresh
+  // dynamic-trace surface (the previous app's session is the
+  // previous session's problem; the BE's per-session ``stop`` GC
+  // cleans it up via timeout). Mirrors ``useTraceAnchor``'s
+  // appId-clear semantics.
+  useEffect(() => {
+    genRef.current += 1;
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {
+        /* ignore */
+      }
+      wsRef.current = null;
+    }
+    sessionRef.current = null;
+    setState(INITIAL_DYNAMIC_TRACE_STATE);
+  }, [appId]);
+
+  const reset = useCallback(() => {
+    genRef.current += 1;
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {
+        /* ignore */
+      }
+      wsRef.current = null;
+    }
+    sessionRef.current = null;
+    setState(INITIAL_DYNAMIC_TRACE_STATE);
+  }, []);
+
+  const handleMessage = useCallback(
+    (raw: MessageEvent, gen: number) => {
+      if (genRef.current !== gen) return;
+      let parsed: DynamicTraceWsMessage;
+      try {
+        parsed = JSON.parse(raw.data as string) as DynamicTraceWsMessage;
+      } catch {
+        return;
+      }
+      // Drop notice — bump the counter, no normalisation.
+      if ("type" in parsed && parsed.type === "drop") {
+        setState((s) => ({ ...s, dropCount: s.dropCount + 1 }));
+        return;
+      }
+      // Pre-close error — surface as the connection error, the
+      // server will close the socket immediately after.
+      if ("type" in parsed && parsed.type === "error") {
+        const errStr = parsed.message || parsed.error || "server error";
+        setState((s) => ({ ...s, error: errStr }));
+        return;
+      }
+      const ev = normaliseTraceMessage(parsed);
+      if (!ev) return;
+      setState((s) => updateForEvent(s, ev));
+    },
+    [],
+  );
+
+  const start = useCallback(
+    async (req: StartDynamicTraceRequest) => {
+      if (!appId) return;
+      // Bump generation BEFORE any async work so a stale response
+      // from a previous start doesn't clobber the new state.
+      const myGen = ++genRef.current;
+      // Close any prior WS.
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {
+          /* ignore */
+        }
+        wsRef.current = null;
+      }
+      sessionRef.current = null;
+      setState({
+        ...INITIAL_DYNAMIC_TRACE_STATE,
+        connection: "starting",
+      });
+      const r = await startDynamicTrace(appId, req);
+      if (genRef.current !== myGen) return;
+      if (!r.ok) {
+        setState((s) => ({
+          ...s,
+          connection: "error",
+          error: r.status > 0 ? `${r.status}: ${r.error}` : r.error,
+        }));
+        return;
+      }
+      const sessionId = r.data.session_id;
+      sessionRef.current = sessionId;
+      setState((s) => ({
+        ...s,
+        connection: "running",
+        sessionId,
+        meta: r.data,
+      }));
+      // Open the WS. We DON'T await — onmessage will fire as
+      // events come in. WS construction can throw on malformed
+      // URLs; we surface that as ``connection: "error"``.
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(buildTraceWsUrl(appId, sessionId));
+      } catch (e) {
+        if (genRef.current !== myGen) return;
+        setState((s) => ({
+          ...s,
+          connection: "error",
+          error: e instanceof Error ? e.message : String(e),
+        }));
+        return;
+      }
+      wsRef.current = ws;
+      ws.onmessage = (msg) => handleMessage(msg, myGen);
+      ws.onclose = () => {
+        if (genRef.current !== myGen) return;
+        // Distinguish operator-initiated close (handled in stop()
+        // which sets ``connection`` first) from a server-side drop.
+        setState((s) =>
+          s.connection === "stopping" || s.connection === "stopped"
+            ? { ...s, connection: "stopped" }
+            : { ...s, connection: "disconnected" },
+        );
+      };
+      ws.onerror = () => {
+        if (genRef.current !== myGen) return;
+        setState((s) => ({
+          ...s,
+          error: s.error ?? "WebSocket error",
+        }));
+      };
+    },
+    [appId, handleMessage],
+  );
+
+  const stop = useCallback(async () => {
+    if (!appId) return;
+    const sid = sessionRef.current;
+    if (!sid) return;
+    setState((s) => ({ ...s, connection: "stopping" }));
+    // Close the WS first so we don't keep processing events while
+    // the BE tears down the Frida session.
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch {
+        /* ignore */
+      }
+      wsRef.current = null;
+    }
+    const r = await stopDynamicTrace(appId, sid);
+    setState((s) => ({
+      ...s,
+      connection: "stopped",
+      error: r.ok ? s.error : r.error,
+    }));
+  }, [appId]);
+
+  // Cleanup on unmount — close the WS but DON'T fire ``stop()`` (the
+  // BE's session-timeout GC catches the abandoned session; firing
+  // ``stop()`` from cleanup races the unmount and leaves the
+  // operator with an unhandled-rejection if the DELETE fails).
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {
+          /* ignore */
+        }
+        wsRef.current = null;
+      }
+    };
+  }, []);
+
+  return { state, start, stop, reset };
+}
+
+/** State-update reducer — splits out of the hook so it's testable
+ *  and so the ``setState(s => ...)`` callbacks aren't a ~80 LOC
+ *  inline lambda. Pure: doesn't mutate ``s``. */
+function updateForEvent(
+  s: DynamicTraceState,
+  ev: NormalisedTraceEvent,
+): DynamicTraceState {
+  if (ev.phase === "ready") {
+    return {
+      ...s,
+      readyStats: {
+        methods_attempted: ev.methods_attempted,
+        methods_hooked: ev.methods_hooked,
+        methods_failed: ev.methods_failed,
+      },
+      error: ev.error ?? s.error,
+    };
+  }
+  if (ev.phase === "hook_failed") {
+    const key = overloadKeyFromEvent(ev.class, ev.method);
+    const next = new Map(s.hookFailed);
+    next.set(key, { reason: ev.reason, error: ev.error, ts: ev.ts });
+    return { ...s, hookFailed: next };
+  }
+  if (ev.phase === "entry") {
+    const key = overloadKeyFromEvent(ev.class, ev.method);
+    const fired = new Set(s.firedMethods);
+    fired.add(key);
+    const live = new Map(s.liveValues);
+    const prior = live.get(key);
+    live.set(key, {
+      args: ev.args,
+      ret: prior?.ret ?? null,
+      threadId: ev.thread_id,
+      threadDepth: ev.thread_depth,
+      fireCount: (prior?.fireCount ?? 0) + 1,
+      lastFireTs: ev.ts,
+    });
+    return { ...s, firedMethods: fired, liveValues: live };
+  }
+  if (ev.phase === "exit") {
+    const key = overloadKeyFromEvent(ev.class, ev.method);
+    const live = new Map(s.liveValues);
+    const prior = live.get(key);
+    if (!prior) {
+      // Exit without a matching entry — possible if the operator
+      // late-joined and the entry is in the replay-but-already-
+      // sent window. v1 ignores; 13.9 may surface.
+      return s;
+    }
+    live.set(key, { ...prior, ret: ev.ret });
+    return { ...s, liveValues: live };
+  }
+  if (ev.phase === "error") {
+    // v1: surface as the global error string; per-method runtime
+    // errors land in 13.9 with an inline ⚠ pill on the node.
+    return { ...s, error: `${ev.class}.${ev.method}: ${ev.error}` };
+  }
+  if (ev.phase === "summary_pending") {
+    const key = overloadKeyFromEvent(ev.class, ev.method);
+    const next = new Map(s.summaries);
+    // Don't overwrite an already-ready summary with pending — the
+    // BE replays cached summaries as ``ready`` immediately, so a
+    // late ``pending`` here would be the operator's perception of
+    // a regression.
+    if (next.get(key)?.state === "ready") return s;
+    next.set(key, { state: "pending", ts: ev.ts });
+    return { ...s, summaries: next };
+  }
+  if (ev.phase === "summary_ready") {
+    const key = overloadKeyFromEvent(ev.class, ev.method);
+    const next = new Map(s.summaries);
+    next.set(key, {
+      state: "ready",
+      text: ev.summary,
+      cached: ev.cached,
+      ts: ev.ts,
+    });
+    return { ...s, summaries: next };
+  }
+  if (ev.phase === "summary_failed") {
+    const key = overloadKeyFromEvent(ev.class, ev.method);
+    const next = new Map(s.summaries);
+    next.set(key, { state: "failed", error: ev.error, ts: ev.ts });
+    return { ...s, summaries: next };
+  }
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 v2 hook (preserved verbatim below — useTraceAnchor)
+// ---------------------------------------------------------------------------
+
 export function useTraceAnchor(
   appId: string | null,
   entry: string | null,

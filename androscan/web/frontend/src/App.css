@@ -7171,3 +7171,328 @@ code { color: var(--accent); }
   grid-column: 1 / -1;
 }
 
+/* ===========================================================================
+ * Phase 13 sub-step 13.8 — dynamic-overlay surface for the Behavior
+ * Trace v3 flowchart (DEC-029). Adds:
+ *
+ *   * ``.trace-mode-toggle*`` — Static / Dynamic / Both pill row.
+ *   * ``.lab-dynamic-trace-*`` — Run / Stop button + live status copy
+ *     in the Execution Flow section header.
+ *   * ``.execution-flow-edge-fired`` — accent-blue solid emphasis on
+ *     fired edges in Dynamic / Both modes.
+ *   * ``.execution-flow-edge-untaken-dynamic`` — gray-dashed 55%-
+ *     opacity fade for untaken edges in Dynamic mode.
+ *   * ``.execution-flow-edge-live-chip`` — per-edge live-value chip
+ *     (args → ret) on fired edges.
+ *   * ``.execution-flow-node-fired`` + ``.execution-flow-node-depth-pill``
+ *     — accent-blue node border + bottom-right depth pill on fired
+ *     nodes.
+ *   * ``.inspector-summary-*`` + ``.inspector-live*`` — Summary
+ *     section state rendering + Live observation panel.
+ *
+ * All variables sourced from the workbench dark-theme tokens
+ * (``--accent`` / ``--panel-2`` / ``--border`` / ``--err`` etc.) so
+ * the new chrome lives in the same palette as the surrounding pane.
+ * =========================================================================== */
+
+/* --- TraceModeToggle pills ------------------------------------------------ */
+
+.trace-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.trace-mode-toggle-pill {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background-color 100ms ease-out, color 100ms ease-out;
+}
+
+.trace-mode-toggle-pill:last-child {
+  border-right: none;
+}
+
+.trace-mode-toggle-pill:hover:not(:disabled):not(.trace-mode-toggle-pill-active) {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+}
+
+.trace-mode-toggle-pill-active {
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 500;
+}
+
+.trace-mode-toggle-pill-disabled,
+.trace-mode-toggle-pill:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* --- DynamicTraceRunControl ----------------------------------------------- */
+
+.trace-section-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.lab-dynamic-trace-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lab-dynamic-trace-button {
+  appearance: none;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background-color 100ms ease-out, border-color 100ms ease-out, color 100ms ease-out;
+}
+
+.lab-dynamic-trace-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.lab-dynamic-trace-button:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+
+.lab-dynamic-trace-button-running {
+  border-color: var(--accent);
+  background: rgba(64, 156, 255, 0.12);
+  color: var(--accent);
+}
+
+.lab-dynamic-trace-button-running:hover:not(:disabled) {
+  background: rgba(64, 156, 255, 0.2);
+}
+
+.lab-dynamic-trace-status {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.lab-dynamic-trace-status-warn {
+  color: var(--warn);
+}
+
+.lab-dynamic-trace-status-err {
+  color: var(--err);
+}
+
+.lab-dynamic-trace-drops {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  background: rgba(210, 153, 34, 0.12); /* var(--warn) tinted */
+  color: var(--warn);
+  cursor: help;
+}
+
+/* --- ExecutionFlow — fired-edge / fired-node accent ----------------------- */
+
+/* DEC-029 lock: fired = accent-blue solid stroke at the same locked
+ * 1.5px width as every other edge. Color-only emphasis; no thicker
+ * stroke (three plan-mode iterations rejected the thicker variant).
+ * The selector applies a stroke-color override that wins over the
+ * verdict-kind color (allow / deny / neutral / unverdicted). */
+.execution-flow-edge-fired {
+  stroke: var(--accent) !important;
+}
+
+/* The marker arrow inherits ``currentColor`` from the path's stroke,
+ * so we set it on the path's container too. React Flow's ``BaseEdge``
+ * is the SVG ``<path>`` itself so the stroke is enough. */
+
+.execution-flow-edge-untaken-dynamic {
+  stroke: #6a6a6a !important;
+  stroke-dasharray: 4 3;
+  opacity: 0.55;
+}
+
+.execution-flow-edge-label-fired {
+  /* Verdict-color labels stay readable on the accent-blue fired
+   * stroke; we just bold them slightly so the operator's eye lands
+   * on fired paths first. */
+  font-weight: 500;
+}
+
+.execution-flow-edge-label-untaken-dynamic {
+  opacity: 0.55;
+}
+
+.execution-flow-edge-live-chip {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(64, 156, 255, 0.14);
+  color: var(--accent);
+  border: 1px solid rgba(64, 156, 255, 0.45);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-family: var(--mono, monospace);
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- ExecutionFlow — fired-node depth pill -------------------------------- */
+
+.execution-flow-node-fired {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 1px rgba(64, 156, 255, 0.3) inset;
+}
+
+.execution-flow-node-depth-pill {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  background: rgba(64, 156, 255, 0.12);
+  color: var(--accent);
+  border: 1px solid rgba(64, 156, 255, 0.4);
+  border-radius: 2px;
+  padding: 1px 5px;
+  font-size: 9px;
+  font-family: var(--mono, monospace);
+  line-height: 1.2;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
+.execution-flow-node-depth-pill-count {
+  font-weight: 500;
+}
+
+/* --- Inspector — Summary section states ----------------------------------- */
+
+.inspector-summary {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.inspector-summary-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inspector-summary-ready {
+  border-left: 2px solid var(--accent);
+  padding-left: 8px;
+}
+
+.inspector-summary-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
+.inspector-summary-cached-pill {
+  display: inline-block;
+  align-self: flex-start;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  letter-spacing: 0.02em;
+}
+
+.inspector-summary-failed {
+  border-left: 2px solid var(--err);
+  padding-left: 8px;
+}
+
+.inspector-summary-error {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--err);
+}
+
+/* --- Inspector — Live observation panel ----------------------------------- */
+
+.inspector-live {
+  border-top: 1px dashed var(--border);
+  padding-top: 12px;
+}
+
+.inspector-live-grid {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 4px 10px;
+  margin: 0;
+  font-size: 11px;
+}
+
+.inspector-live-grid dt {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.inspector-live-grid dd {
+  margin: 0;
+  font-family: var(--mono, monospace);
+  word-break: break-all;
+}
+
+.inspector-live-args {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.inspector-live-args li {
+  font-size: 11px;
+  font-family: var(--mono, monospace);
+  word-break: break-all;
+  /* Prevent the cell from blowing past the 360px column for
+   * pathological arg strings — single-line ellipsis with the full
+   * value reachable via the title-tooltip. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+}
+
+.inspector-live-ret {
+  display: inline-block;
+  max-width: 280px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+

@@ -183,8 +183,10 @@ const HIGH_CONFIDENCE_THRESHOLD = 0.85;
 
 /** Smali signature shape — used as the stable node id + dedup key.
  *  Matches :attr:`MethodRef.smali_signature` on the Python side
- *  byte-equally (``Lcom/example/Foo;->bar(I)Z``). */
-function methodKey(m: MethodRef): string {
+ *  byte-equally (``Lcom/example/Foo;->bar(I)Z``). Exported in 13.8
+ *  for consumers that need to derive the same key from a
+ *  ``MethodRef`` (e.g. :func:`Inspector.resolveSelection`). */
+export function methodKey(m: MethodRef): string {
   const className = (m.class_name || "").replace(/\./g, "/");
   const sig = `L${className};->${m.method_name}(${(m.param_descriptors || []).join("")})${m.return_descriptor || "V"}`;
   return sig;
@@ -193,10 +195,22 @@ function methodKey(m: MethodRef): string {
 /** Collapse-key for overload merging — drops the descriptor portion
  *  so methods with the same name on the same class but different
  *  param descriptors land on the same node (the node's
- *  ``overloadCount`` then carries the count). */
-function overloadKey(m: MethodRef): string {
+ *  ``overloadCount`` then carries the count). Exported in 13.8 so
+ *  consumers (``ExecutionFlow``'s fired-edge styling, ``Inspector``'s
+ *  summary lookup) can derive the same key from a ``MethodRef`` /
+ *  node id without redefining the function. */
+export function overloadKey(m: MethodRef): string {
   const className = (m.class_name || "").replace(/\./g, "/");
   return `L${className};->${m.method_name}`;
+}
+
+/** ``methodKey`` shape but starting from a node id — strips the
+ *  trailing ``(...)return-descriptor`` to recover the overload key.
+ *  Used by ``ExecutionFlow`` to look up firedMethods / liveValues
+ *  by overload key without knowing the underlying ``MethodRef``. */
+export function overloadKeyFromNodeId(nodeId: string): string {
+  const parenIdx = nodeId.indexOf("(");
+  return parenIdx > 0 ? nodeId.slice(0, parenIdx) : nodeId;
 }
 
 /** Java-form ``class.method`` for the card title. */

@@ -40,11 +40,30 @@
  * sink nodes don't fire the click handler (they don't carry a
  * MethodRef).
  *
+ * **Phase 13 sub-step 13.8 update:** the component now accepts
+ * ``mode``, ``firedMethods``, and ``liveValues`` props that drive
+ * the dynamic-overlay rendering. ``mode === "static"`` keeps the
+ * 13.6 default (every edge in its verdict color). ``"dynamic"``
+ * fades the verdict palette to gray-dashed at 55% opacity and
+ * accents the fired edges with the locked accent-blue solid
+ * stroke (DEC-029). ``"both"`` keeps the verdict colors but still
+ * accents the fired edges in accent blue on top.
+ *
+ * Fired nodes (``firedMethods.has(overloadKey(node))``) get an
+ * accent-blue border emphasis + a depth pill ("d:N · t:M") in the
+ * top-right corner showing the most recent thread + depth from
+ * ``liveValues``. Fired edges (whose source AND target are both
+ * fired) carry a small live-value chip rendered as part of the
+ * EdgeLabelRenderer — args / return values from ``liveValues`` so
+ * the operator can see "what flowed through this edge" at a glance
+ * (e.g. ``pin="1234" → false``).
+ *
  * Out of scope for v1:
- *   * Live-value chips on edges (e.g. ``pin="1234" → false``) —
- *     wired up in 13.8 from the dynamic-trace WebSocket.
- *   * Mode toggle between ``Static`` / ``Dynamic`` / ``Both`` —
- *     13.8.
+ *   * Per-thread depth visualization beyond the corner pill — full
+ *     layout reshape into thread lanes deferred to 13.9.
+ *   * Marching-ants animation on fired edges — DEC-029 explicitly
+ *     locked the static stroke; the animation would need its own
+ *     planning checkpoint.
  *   * Pan-to-fit on selection — v2 candidate.
  */
 
@@ -69,12 +88,14 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
-import type { BehaviorAnchor } from "../../api/trace";
+import type { BehaviorAnchor, LiveValueRecord } from "../../api/trace";
 import {
   buildExecutionFlowGraph,
+  overloadKeyFromNodeId,
   type ExecutionFlowEdge,
   type ExecutionFlowNode,
 } from "./executionFlowGraph";
+import type { TraceMode } from "./TraceModeToggle";
 
 
 // ---------------------------------------------------------------------------
@@ -93,6 +114,35 @@ const ROW_PITCH = NODE_HEIGHT + ROW_GAP;
 const ARROWHEAD_SIZE = 6;
 const EDGE_STROKE_WIDTH = 1.5;
 
+// 13.8 — live-value chip budget. The chip sits inside a 220px-
+// wide column slot, so a ~56-char total budget keeps it readable
+// at the locked font size (12px ui font) without wrapping.
+const LIVE_LABEL_BUDGET_CHARS = 56;
+const LIVE_LABEL_ARG_BUDGET = 24; // per-arg cap before ellipsis
+
+/** Pre-format the per-edge live-value chip from the source method's
+ *  latest LiveValueRecord. Returns ``null`` when nothing useful can
+ *  be shown (no record yet, or both args + ret empty). The formatter
+ *  is conservative: each arg is truncated to 24 chars + ellipsis,
+ *  joined with ``, `` (and capped at 4 args), then a ``→ ret``
+ *  suffix when the exit landed. The whole label is hard-truncated
+ *  to ``LIVE_LABEL_BUDGET_CHARS`` as a safety net for pathological
+ *  return values. */
+function composeLiveLabel(live: LiveValueRecord | null): string | null {
+  if (!live) return null;
+  const truncate = (s: string, n: number) =>
+    s.length <= n ? s : s.slice(0, Math.max(0, n - 1)) + "…";
+  const args = (live.args ?? [])
+    .slice(0, 4)
+    .map((a) => truncate(a, LIVE_LABEL_ARG_BUDGET));
+  const argsPart = args.length > 0 ? args.join(", ") : "";
+  const moreArgs = (live.args?.length ?? 0) > 4 ? `, +${(live.args?.length ?? 0) - 4} more` : "";
+  const retPart = live.ret != null ? ` → ${truncate(live.ret, LIVE_LABEL_ARG_BUDGET)}` : "";
+  const out = `${argsPart}${moreArgs}${retPart}`.trim();
+  if (!out) return null;
+  return truncate(out, LIVE_LABEL_BUDGET_CHARS);
+}
+
 
 // ---------------------------------------------------------------------------
 // Public props
@@ -108,6 +158,22 @@ type Props = {
    *  13.7 wires this to ``setSelectedNodeId`` in ``LabTraceMode``.
    *  v1 default = no-op. */
   onNodeClick?: (node: ExecutionFlowNode) => void;
+  /** Phase 13 sub-step 13.8 — overlay mode. Drives the fired-edge
+   *  / fired-node accent rendering plus the untaken-edge fade in
+   *  ``"dynamic"`` mode. Default ``"static"`` so the 13.6 / 13.7
+   *  call sites that don't yet pass the prop keep their original
+   *  rendering. */
+  mode?: TraceMode;
+  /** Phase 13 sub-step 13.8 — set of overload keys (descriptor-
+   *  stripped Smali) that have fired during the current dynamic
+   *  trace. Empty in ``"static"`` mode (or when no trace has run
+   *  yet). */
+  firedMethods?: ReadonlySet<string>;
+  /** Phase 13 sub-step 13.8 — per-method live values (latest fire's
+   *  args / return / thread + fire count) keyed by overload key.
+   *  Used to populate the depth pill on fired nodes + the live-
+   *  value chip on fired edges. Empty in ``"static"`` mode. */
+  liveValues?: ReadonlyMap<string, LiveValueRecord>;
 };
 
 
@@ -164,11 +230,23 @@ function layoutNodes(nodes: ExecutionFlowNode[]): PositionedNodes {
 // can read the operator-facing fields without type gymnastics.
 
 
-type NodeData = ExecutionFlowNode;
+/** Per-node overlay decoration baked at build time so the custom
+ *  node renderer doesn't need a separate React context. ``mode`` is
+ *  carried so the renderer can check whether to show the fired
+ *  emphasis at all (``"static"`` suppresses); ``fired`` flips on
+ *  per the consumer's ``firedMethods`` lookup; ``live`` is the
+ *  latest ``LiveValueRecord`` for the depth pill. */
+type NodeData = ExecutionFlowNode & {
+  mode?: TraceMode;
+  fired?: boolean;
+  live?: LiveValueRecord | null;
+};
 
 
 function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
   const n = data;
+  const isFiredEmphasis =
+    !!n.fired && (n.mode === "dynamic" || n.mode === "both");
 
   // Class chip (last segment of the FQCN). Synthetic sinks have an
   // empty class so we just render the title.
@@ -202,6 +280,7 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
     n.possiblyInlined && "execution-flow-node-inlined",
     n.overloadCount > 1 && "execution-flow-node-stacked",
     n.isSynthetic && "execution-flow-node-synthetic",
+    isFiredEmphasis && "execution-flow-node-fired",
   ]
     .filter(Boolean)
     .join(" ");
@@ -235,6 +314,32 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
       {cornerPill && (
         <span className={`execution-flow-pill ${cornerPillKind}`}>
           {cornerPill}
+        </span>
+      )}
+
+      {/* Phase 13 sub-step 13.8 — depth pill on fired nodes (when
+          mode allows the fired emphasis). Sits in the bottom-right
+          corner so it doesn't collide with the top-right corner pill
+          (GATE / ALLOW / etc.). Renders ``d:N · t:M`` where ``N`` is
+          the most recent thread_depth and ``M`` is the thread_id of
+          the latest fire; the ``× count`` suffix renders only when
+          the method fired more than once. */}
+      {isFiredEmphasis && n.live && (
+        <span
+          className="execution-flow-node-depth-pill"
+          title={`Latest fire: depth ${n.live.threadDepth} on thread ${n.live.threadId}${
+            n.live.fireCount > 1
+              ? ` · fired ${n.live.fireCount} times this session`
+              : ""
+          }`}
+        >
+          d:{n.live.threadDepth} · t:{n.live.threadId}
+          {n.live.fireCount > 1 && (
+            <span className="execution-flow-node-depth-pill-count">
+              {" "}
+              ×{n.live.fireCount}
+            </span>
+          )}
         </span>
       )}
 
@@ -286,7 +391,16 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
 //      that matches the verdict palette.
 
 
-type EdgeData = ExecutionFlowEdge;
+/** Per-edge overlay decoration baked at build time. ``mode`` drives
+ *  the untaken-edge fade ("dynamic"-only); ``fired`` flips on when
+ *  both endpoints are in ``firedMethods``; ``liveLabel`` is the
+ *  pre-formatted "args → ret" chip rendered alongside the verdict
+ *  label on fired edges. */
+type EdgeData = ExecutionFlowEdge & {
+  mode?: TraceMode;
+  fired?: boolean;
+  liveLabel?: string | null;
+};
 
 
 function VerdictEdge({
@@ -308,10 +422,24 @@ function VerdictEdge({
     targetPosition: Position.Left,
     borderRadius: 6,
   });
+  const isDynamic = e.mode === "dynamic";
+  const isBoth = e.mode === "both";
+  const isFired = !!e.fired && (isDynamic || isBoth);
+  // Untaken-edge fade: in "dynamic" mode every non-fired edge fades
+  // to gray-dashed at 55% opacity (the static palette would compete
+  // with the runtime emphasis); in "both" mode the verdict palette
+  // stays visible at full opacity (operator wants to see the static
+  // plan AND the runtime confirmation in one view), only the fade
+  // suffix differs.
+  const isFadedUntaken = isDynamic && !isFired;
   const className = [
     "execution-flow-edge",
     `execution-flow-edge-${e.kind}`,
-  ].join(" ");
+    isFired && "execution-flow-edge-fired",
+    isFadedUntaken && "execution-flow-edge-untaken-dynamic",
+  ]
+    .filter(Boolean)
+    .join(" ");
   return (
     <>
       <BaseEdge
@@ -324,12 +452,38 @@ function VerdictEdge({
       {e.label && (
         <EdgeLabelRenderer>
           <div
-            className={`execution-flow-edge-label execution-flow-edge-label-${e.kind}`}
+            className={[
+              "execution-flow-edge-label",
+              `execution-flow-edge-label-${e.kind}`,
+              isFired && "execution-flow-edge-label-fired",
+              isFadedUntaken && "execution-flow-edge-label-untaken-dynamic",
+            ]
+              .filter(Boolean)
+              .join(" ")}
             style={{
               transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
             }}
           >
             {e.label}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+      {/* Phase 13 sub-step 13.8 — live-value chip on fired edges.
+          Renders the latest fire's ``args → ret`` summary so the
+          operator can see what flowed through the gate at a glance.
+          Positioned slightly below the verdict label so the two
+          don't collide; suppressed when ``liveLabel`` is empty
+          (e.g. exit hadn't fired yet, or the args were empty). */}
+      {isFired && e.liveLabel && (
+        <EdgeLabelRenderer>
+          <div
+            className="execution-flow-edge-live-chip"
+            style={{
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY + 18}px)`,
+            }}
+            title={e.liveLabel}
+          >
+            {e.liveLabel}
           </div>
         </EdgeLabelRenderer>
       )}
@@ -370,46 +524,95 @@ export function ExecutionFlow({
   anchor,
   selectedNodeId = null,
   onNodeClick,
+  mode = "static",
+  firedMethods,
+  liveValues,
 }: Props) {
   const { rfNodes, rfEdges } = useMemo(() => {
     const graph = buildExecutionFlowGraph(anchor);
     const positions = layoutNodes(graph.nodes);
+    // 13.8 dynamic-overlay decoration baked into ``data`` so the
+    // custom MethodNode / VerdictEdge components don't need a
+    // separate React context. ``firedMethods`` indexes by overload
+    // key (descriptor-stripped); we strip the descriptor from the
+    // node id via ``overloadKeyFromNodeId``. Synthetic sink nodes
+    // never fire — guard explicitly so a stray ``allow`` sink id
+    // matching a fired Smali key (impossible in practice; defensive)
+    // doesn't accent.
+    const fired = firedMethods ?? null;
+    const live = liveValues ?? null;
 
-    const rfNodes: Node<NodeData>[] = graph.nodes.map((n) => ({
-      id: n.id,
-      type: "method",
-      data: n,
-      position: positions.get(n.id) ?? { x: 0, y: 0 },
-      // 220×72 fixed; React Flow uses these for hit-testing.
-      width: NODE_WIDTH,
-      height: NODE_HEIGHT,
-      // Synthetic sinks aren't operator-clickable.
-      selectable: !n.isSynthetic,
-      draggable: false,
-      connectable: false,
-      // ``selected`` is computed by React Flow against the
-      // ``selectedNodeId`` consumer state; we pre-seed via a
-      // controlled-component pattern below.
-    }));
+    const rfNodes: Node<NodeData>[] = graph.nodes.map((n) => {
+      const oKey = n.isSynthetic ? "" : overloadKeyFromNodeId(n.id);
+      const isFired = !n.isSynthetic && !!fired?.has(oKey);
+      const liveRecord = !n.isSynthetic && live ? (live.get(oKey) ?? null) : null;
+      return {
+        id: n.id,
+        type: "method",
+        data: { ...n, mode, fired: isFired, live: liveRecord },
+        position: positions.get(n.id) ?? { x: 0, y: 0 },
+        // 220×72 fixed; React Flow uses these for hit-testing.
+        width: NODE_WIDTH,
+        height: NODE_HEIGHT,
+        // Synthetic sinks aren't operator-clickable.
+        selectable: !n.isSynthetic,
+        draggable: false,
+        connectable: false,
+        // ``selected`` is computed by React Flow against the
+        // ``selectedNodeId`` consumer state; we pre-seed via a
+        // controlled-component pattern below.
+      };
+    });
 
-    const rfEdges: Edge<EdgeData>[] = graph.edges.map((e) => ({
-      id: e.id,
-      source: e.source,
-      target: e.target,
-      type: "verdict",
-      data: e,
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        width: ARROWHEAD_SIZE,
-        height: ARROWHEAD_SIZE,
-        // The marker color is set via CSS (the SVG ``<marker>``
-        // inherits ``currentColor`` from the parent path), so we
-        // don't need to specify the color here.
-      },
-    }));
+    // Edge fired-ness: an edge is "fired" iff BOTH endpoints fired.
+    // The fired source means the gate executed; the fired target
+    // means the path actually flowed through. Synthetic-sink targets
+    // never fire on their own — a fired source + a synthetic sink
+    // target reads as "this branch was taken" which is the operator
+    // intuition we want; we treat synthetic sinks as fired-iff-source-
+    // fired for the v1 emphasis (an entry that fired into a deny
+    // sink should light up the path even though the sink has no
+    // backing MethodRef).
+    const rfEdges: Edge<EdgeData>[] = graph.edges.map((e) => {
+      const sourceOKey = overloadKeyFromNodeId(e.source);
+      const targetOKey = overloadKeyFromNodeId(e.target);
+      const sourceFired = !!fired?.has(sourceOKey);
+      const targetIsSynthetic = e.target.startsWith("__sink_");
+      const targetFired = targetIsSynthetic
+        ? sourceFired // synthetic sinks ride on the source's fired flag
+        : !!fired?.has(targetOKey);
+      const edgeFired = sourceFired && targetFired;
+      // Compose the live-value chip from the source method's latest
+      // args + (when ready) ret. Format: ``arg0, arg1 → ret`` with a
+      // 56-char total budget so the chip stays readable on a 220px-
+      // wide column. Empty when the source hasn't recorded an exit
+      // yet (entry-only chip would just be ``args``).
+      const sourceLive = live?.get(sourceOKey) ?? null;
+      const liveLabel = composeLiveLabel(sourceLive);
+      return {
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        type: "verdict",
+        data: {
+          ...e,
+          mode,
+          fired: edgeFired,
+          liveLabel,
+        },
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          width: ARROWHEAD_SIZE,
+          height: ARROWHEAD_SIZE,
+          // The marker color is set via CSS (the SVG ``<marker>``
+          // inherits ``currentColor`` from the parent path), so we
+          // don't need to specify the color here.
+        },
+      };
+    });
 
     return { rfNodes, rfEdges };
-  }, [anchor]);
+  }, [anchor, mode, firedMethods, liveValues]);
 
   // Honor the controlled selectedNodeId.
   const styledNodes = useMemo(() => {
