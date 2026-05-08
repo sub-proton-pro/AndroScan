@@ -1,37 +1,19 @@
 /**
- * Behavior Trace — Phase 13 sub-step 13.5 rename of the
- * ``DecisionTimeline`` component family.
+ * Behavior Trace — linear list view of the active anchor's
+ * ``DecisionPoint``s. Renamed from the historical ``DecisionTimeline``
+ * component in Phase 13 sub-step 13.5 as part of the broader
+ * "Decision Timeline → Behavior Trace" framing shift locked in
+ * DEC-029; the one-release ``VITE_BEHAVIOR_TRACE_LEGACY`` rollback
+ * flag and the legacy ``DecisionTimeline.tsx`` parallel file were
+ * removed at sub-step 13.10's docs sweep (this is now the canonical
+ * declaration).
  *
- * Behavior is BYTE-EQUAL to ``DecisionTimeline.tsx`` — the only
- * differences are the component name (``DecisionTimeline`` →
- * ``BehaviorTrace``) and the CSS namespace (``.trace-decision-*``
- * → ``.behavior-trace-*``). All structural logic, low-confidence /
- * LLM-refined / candidate-gate framing, "Verify with runtime trace"
- * pendingHookPrefill plumbing, and PredicateOriginView mounting is
- * unchanged. The legacy ``DecisionTimeline.tsx`` stays in the tree
- * for one release behind the ``VITE_BEHAVIOR_TRACE_LEGACY`` env
- * flag (off by default — flip on with `VITE_BEHAVIOR_TRACE_LEGACY=1
- * vite build` if an operator hits a rendering regression and needs
- * to fall back); the legacy file + the comma-paired
- * ``.trace-decision-*`` halves of the CSS rules are removed at
- * sub-step 13.10's docs sweep.
- *
- * Why a parallel file rather than a flag-on-flag-off branch inside
- * one component: the spec says "demoted behind a feature flag";
- * keeping the legacy file untouched (rather than mutating it with
- * the new namespace) makes the rollback path BYTE-IDENTICAL to the
- * pre-13.5 render — operators flipping the flag get the v2.1 / v3-
- * pre-rename UI verbatim, with zero risk of accidental behavioral
- * drift sneaking in via the rename PR.
- *
- * Per DEC-029's locked design: the rename is the v1 ship vehicle
- * for the broader "Decision Timeline → Behavior Trace" framing
- * shift. Sub-steps 13.6 (ExecutionFlow flowchart), 13.7 (Inspector
- * pane), and 13.8 (mode toggle + WS consumer) build the new visual
- * surface ON TOP of this rebrand; 13.5 is intentionally a pure
- * rename so the FE diff stays tiny and reviewable in isolation
- * (no semantic CSS change, no behavior change, no schema change,
- * no new tests).
+ * Renders BELOW the ``ExecutionFlow`` flowchart (13.6) + ``Inspector``
+ * pane (13.7) inside ``LabTraceMode``; the flowchart is the primary
+ * visual surface, this list view stays as the per-decision detail
+ * companion (low-confidence / LLM-refined / candidate-gate framing
+ * + "Verify with runtime trace" cross-tab handoff via
+ * ``pendingHookPrefill`` + ``PredicateOriginView`` mounting).
  */
 
 import { useState } from "react";
@@ -42,9 +24,6 @@ import { PredicateOriginView } from "./PredicateOriginView";
 
 const LLM_RECLASSIFIED_CONFIDENCE = 0.75;
 const LOW_CONFIDENCE_THRESHOLD = 0.6;
-// Mirrors the threshold in the legacy ``DecisionTimeline`` —
-// keep in sync until 13.10 removes the legacy file (at which
-// point this becomes the canonical declaration).
 const HIGH_CONFIDENCE_THRESHOLD = 0.85;
 
 type Props = {

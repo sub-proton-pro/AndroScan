@@ -222,7 +222,6 @@ import { ChatDock } from "../components/ChatDock";
 import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { BehaviorTrace } from "../components/trace/BehaviorTrace";
-import { DecisionTimeline } from "../components/trace/DecisionTimeline";
 import { ExecutionFlow } from "../components/trace/ExecutionFlow";
 import { Inspector } from "../components/trace/Inspector";
 import {
@@ -234,20 +233,6 @@ import {
   closureMethodCount,
   type ExecutionFlowNode,
 } from "../components/trace/executionFlowGraph";
-
-// Phase 13 sub-step 13.5 — legacy-rollback flag for the "Decision
-// Timeline" → "Behavior Trace" rename. Off by default; flip on
-// with ``VITE_BEHAVIOR_TRACE_LEGACY=1 vite build`` if an operator
-// hits a regression in the new render path and needs the v2.1 UI
-// verbatim (rollback target = the byte-equal pre-13.5 component
-// + CSS namespace, which 13.5 deliberately leaves untouched).
-// Both the legacy file + this flag are removed at 13.10's docs
-// sweep once the new flowchart UI (13.6 / 13.7 / 13.8) has had
-// one operator-dogfood release to settle in.
-const BEHAVIOR_TRACE_LEGACY =
-  String(import.meta.env.VITE_BEHAVIOR_TRACE_LEGACY ?? "")
-    .toLowerCase()
-    .match(/^(1|true|yes|on)$/) !== null;
 import { ClassMethodTree } from "../components/ClassMethodTree";
 import {
   fetchTree,
@@ -1296,8 +1281,8 @@ type ResultProps = {
 
 function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultProps) {
   // Behavior Trace collapse state (legacy alias: "decision timeline").
-  // Lives at the parent level (rather than inside ``BehaviorTrace`` /
-  // ``DecisionTimeline``) so the toggle can sit next to the section
+  // Lives at the parent level (rather than inside ``BehaviorTrace``)
+  // so the toggle can sit next to the section
   // header — matches the chevron-before-title pattern the HookBuilder
   // / AdbShell / Chat sections use, and keeps the section chrome
   // (count, future actions) co-located with the toggle. Variable name
@@ -1520,58 +1505,23 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
             className="logcat-toggle-btn"
             onClick={() => setDecisionsCollapsed((c) => !c)}
             aria-expanded={!decisionsCollapsed}
-            aria-controls={
-              BEHAVIOR_TRACE_LEGACY
-                ? "trace-decision-timeline-body"
-                : "behavior-trace-body"
-            }
-            aria-label={
-              decisionsCollapsed
-                ? (BEHAVIOR_TRACE_LEGACY
-                    ? "Expand decision timeline"
-                    : "Expand behavior trace")
-                : (BEHAVIOR_TRACE_LEGACY
-                    ? "Collapse decision timeline"
-                    : "Collapse behavior trace")
-            }
-            title={
-              decisionsCollapsed
-                ? (BEHAVIOR_TRACE_LEGACY
-                    ? "Expand decision timeline"
-                    : "Expand behavior trace")
-                : (BEHAVIOR_TRACE_LEGACY
-                    ? "Collapse decision timeline"
-                    : "Collapse behavior trace")
-            }
+            aria-controls="behavior-trace-body"
+            aria-label={decisionsCollapsed ? "Expand behavior trace" : "Collapse behavior trace"}
+            title={decisionsCollapsed ? "Expand behavior trace" : "Collapse behavior trace"}
           >
             {decisionsCollapsed ? <IconChevronUp size={10} /> : <IconChevronDown size={10} />}
           </button>
           <h3>
-            {BEHAVIOR_TRACE_LEGACY ? "Decision timeline" : "Behavior Trace"}
-            {" "}({anchor.decisions.length})
+            Behavior Trace ({anchor.decisions.length})
           </h3>
         </header>
         {!decisionsCollapsed && (
-          <div
-            id={
-              BEHAVIOR_TRACE_LEGACY
-                ? "trace-decision-timeline-body"
-                : "behavior-trace-body"
-            }
-          >
-            {BEHAVIOR_TRACE_LEGACY ? (
-              <DecisionTimeline
-                decisions={anchor.decisions}
-                lowConfidenceIndices={lowConfidenceSet}
-                appId={appId}
-              />
-            ) : (
-              <BehaviorTrace
-                decisions={anchor.decisions}
-                lowConfidenceIndices={lowConfidenceSet}
-                appId={appId}
-              />
-            )}
+          <div id="behavior-trace-body">
+            <BehaviorTrace
+              decisions={anchor.decisions}
+              lowConfidenceIndices={lowConfidenceSet}
+              appId={appId}
+            />
           </div>
         )}
       </section>

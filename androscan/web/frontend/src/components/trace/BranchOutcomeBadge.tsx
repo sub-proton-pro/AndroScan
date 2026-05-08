@@ -1,7 +1,6 @@
 /**
  * Pure presentational pill rendering one ``BranchVerdict`` from a
- * ``DecisionPoint.branch_outcome``. Used by ``BehaviorTrace`` (and the
- * legacy ``DecisionTimeline`` rendered behind ``VITE_BEHAVIOR_TRACE_LEGACY``) to
+ * ``DecisionPoint.branch_outcome``. Used by ``BehaviorTrace`` to
  * surface the per-branch verdict next to each ``Branch.label``.
  *
  * Visual contract (DEC-024 / 10.3):

@@ -781,6 +781,130 @@ auditors do not need to re-derive it from §12.6 + DEC-024.
   reopen with the benefit of operator telemetry from real Trace mode
   use.
 
+### 12.8 Behavior Trace v3 dynamic execution scope (Phase 13 v1 — closed 2026-05-08)
+
+Phase 13 (DEC-029) added **dynamic execution visualization** on top of
+the Phase 10/11 Behavior Trace static substrate: a flowchart-shaped
+`<ExecutionFlow>` view of the closure (replacing the linear
+`DecisionTimeline`), an `<Inspector>` right pane for per-method detail,
+real-time fired-edge highlighting from a multi-method `frida-trace` run,
+asynchronous LLM `summarise_method` cards streamed over the existing
+chat WebSocket, and a runtime `inlined?` confirmation channel from
+`hook_failed` events. This subsection pins the Phase 13 dynamic-trace
+safety posture so auditors do not need to re-derive it from §12.6 +
+§12.7 + DEC-029.
+
+- **Dynamic trace inherits §12.6 + §12.7 device-touching policy verbatim
+  — zero new attack surface.** The new `behavior_trace_multi` adapter
+  (`androscan/web/frida/behavior_trace_multi.py`; sub-step 13.2) runs
+  the same `frida-trace -U -f <pkg>` command shape as §12.6's
+  single-method tracer, but enumerates the active `BehaviorAnchor`'s
+  closure into a `-j 'class!method'` flag list (one flag per overload-
+  collapsed method, capped at `BEHAVIOR_TRACE_MULTI_HOOK_CAP = 30`
+  identical to §12.7's `MAX_TRACE_METHODS`). The hook-target list is
+  passed through the **same server-side
+  `hook_target_package_prefix` allowlist** that §12.6 applies to
+  hand-authored Manual Hooks: every method the closure walker emits is
+  checked against the allowlist before the `frida-trace` command is
+  composed; mismatches are dropped server-side with a visible
+  `hook_blocked` event in the UI's Run-control banner (fail-closed,
+  HTTP 403 on the route, identical wire format to §12.6). The free-form
+  Frida JS path stays gated behind §12.6's `pyjsparser` pre-validation
+  + `requires_confirmation=True` consent class — Phase 13 does **not**
+  open a new free-form-JS escape hatch.
+- **Threshold-color UX is operator-visible consent for closure size,
+  not a security boundary.** `<DynamicTraceRunControl>` (sub-step 13.9)
+  colors the Run button by closure-method count: green (≤10), amber
+  (11-25), red (26-30), with a tooltip explaining what's about to be
+  hooked + the hard cap. The threshold-color is **operator UX only** —
+  the actual hook-count cap is enforced server-side by
+  `BEHAVIOR_TRACE_MULTI_HOOK_CAP` per the previous bullet, regardless
+  of which color the button shows. The color exists so an operator
+  about to run a 28-method trace on a heavyweight anchor sees a red
+  "you're near the cap, narrow the entry method first" cue rather than
+  a silent truncation; it does not gate the run.
+- **`summarise_method` skill is `requires_confirmation=False` per
+  DEC-022, with an explicit "no device-touching surface" invariant.**
+  The new LLM-tier `summarise_method` skill
+  (`androscan/skills/summarise_method.py`; sub-step 13.5) reads
+  decompiled Smali via the existing per-app `<sha>`-keyed cache
+  (DEC-023), composes a one-shot prompt with the method body + class
+  context, runs **one** LLM call per cache-miss method, and emits a
+  `MethodSummaryWidget` (sub-step 13.9). The skill never invokes
+  device commands, never spawns processes, never opens sockets, never
+  writes to shared state outside its own cache slot. **Do not regress
+  this invariant** — `summarise_method` is the only `requires_confirmation=False`
+  skill that sees decompiled code as input AND writes a persistent
+  artifact (the cache slot); the `False` setting is safe **only**
+  because the skill is read-only over decompile output + write-only to
+  its own cache file. Adding any side-effecting work to
+  `summarise_method.execute` requires flipping the skill to
+  `requires_confirmation=True` per DEC-022's confirmation taxonomy
+  and updating this subsection.
+- **Skill-results-cache slots are per-app + per-content-hash, not
+  globally shared.** Cached summaries land in
+  `apps/<app_id>/skill_results_cache.json` keyed by a tuple including
+  the **decompiled-Smali content hash** (mirrors the per-app `<sha>`
+  cache invalidation model from DEC-016 / DEC-018 / DEC-023): a
+  decompile-cache-bust automatically invalidates every cached summary
+  for that app because the content hash changes. Cross-app cache
+  reuse is impossible by construction — there is no global
+  `~/.androscan/summaries.json` and DEC-029 explicitly rejected one
+  for the same reason DEC-023 rejected a global decompile cache:
+  cross-app contamination would let a malicious app's decompiled
+  Smali influence the LLM summary the operator sees for a
+  legitimate app's same-named method. Cache invalidation policy
+  follows the existing "drop the file" rule for the per-app
+  artifact directory.
+- **Dynamic trace events persist as a per-run JSONL, not in
+  `trace.sqlite`.** Phase 13's `frida-trace` runs land
+  `events.jsonl` under
+  `apps/<app_id>/<run_ts>/dynamic_trace/<session>/events.jsonl`
+  (mirrors §12.6's `apps/<app_id>/<run_ts>/frida/<session>.jsonl`
+  per-run-artifact model). **`trace.sqlite` (the §12.7 anchor cache)
+  is not touched by dynamic runs** — DEC-029 deliberately kept the
+  static-anchor cache and the dynamic-event log separated so a
+  corrupted `events.jsonl` cannot poison the static-analysis cache,
+  and so dropping the per-run dynamic data does not require
+  rebuilding the (expensive) static `BehaviorAnchor` payload. The
+  dynamic JSONL inherits §8's logging defaults: same
+  single-user-local file permissions as the rest of
+  `apps/<app_id>/`, no remote upload, no cross-app aggregation, no
+  silent retention beyond `apps/<app_id>/<run_ts>/`. The stored
+  events are: `frida-trace` raw frames (entry/leave, args,
+  return-value), per-method `summary_ready` envelopes (the LLM
+  summary text, generation timestamp, cache-hit flag), and
+  `hook_failed` records (Frida adapter's runtime confirmation that a
+  method couldn't be attached — used for the `inlined?` UI cue, no
+  silent retry).
+- **WebSocket multiplex preserves §12.6 message-shape contract.** The
+  trace WebSocket multiplexes Frida-native frames (existing wire
+  format from §12.6) + new `summary_ready` envelopes + new
+  `hook_failed` envelopes through the same channel; the discriminator
+  union shape on the frontend (`normaliseTraceMessage` in
+  `useDynamicTrace.ts`; sub-step 13.6) ensures unknown-kind messages
+  are dropped silently rather than crashing the consumer — same
+  defensive parsing posture as §4 (input handling) requires of
+  `frida-trace` frame parsing. The new envelopes carry no executable
+  content (summaries are markdown text, hook-failed records are
+  metadata about what didn't attach); they are **not** rendered as
+  raw HTML — `<MethodSummaryWidget>` (sub-step 13.9) renders summary
+  text through React's standard escape-by-default text rendering,
+  not `dangerouslySetInnerHTML`.
+- **Out-of-scope for Phase 13 v1, deferred to v2 candidates per
+  KNOWN_ISSUES ISSUE-017 → ISSUE-021.** Marching-ants animation on
+  fired edges (rejected as chartjunk per DEC-029); branch-outcome
+  inference from dynamic data feeding back into `branch_classifier`
+  (deferred until dogfood shows the static-only verdict precision
+  gap matters); per-thread layout reshape (deferred — corner depth
+  pill scales for 5-30-method anchors); dedicated GET route for
+  cached summaries (deferred — the chat-widget path is the v1
+  discoverability surface); `<MethodSummaryWidget>` "Refresh
+  summary" affordance + flowchart pan-to-fit-on-selection (small
+  UX polish; deferred). None of these are missing *safety* features
+  — they are scope choices that v2 may reopen with operator
+  telemetry from real dynamic-trace use.
+
 ---
 
 ## 13. Summary

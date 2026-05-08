@@ -443,6 +443,118 @@ Use the following format for new entries:
 
 ---
 
+### ISSUE-017: Phase 13 v1 ships static fired-edge styling — marching-ants animation deferred
+- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- impact: Low
+- area: Behavior Trace v3 / `ExecutionFlow` flowchart UX
+- introduced / observed: 2026-05-08 (Phase 13 v1 ship)
+- summary:
+  Phase 13 v1's `ExecutionFlow` flowchart renders fired edges as accent-blue solid 1.5px stroke (vs. the dim/dashed-at-55%-opacity untaken edges) per DEC-029's color-only emphasis lock. A v1-considered alternative was to additionally animate the fired path with a marching-ants `stroke-dashoffset` animation to communicate "live execution" more obviously, but DEC-029 explicitly rejected the animation as chartjunk: the static-color emphasis is enough signal in a 5-30 node graph. Captured here so a future contributor doesn't re-add the animation thinking it's an improvement without operator sign-off.
+- why it matters:
+  If real-app dogfooding on dense graphs (50+ nodes) shows operators don't immediately recognize the fired path against the verdict-colored static edges in `Both` mode, the marching-ants animation becomes a candidate v2 affordance — but ONLY then; speculative addition adds bundle weight + visual noise without measured demand.
+- current workaround:
+  Operators can switch to `Dynamic` mode (untaken edges go gray-dashed-55%-opacity, fired path solid accent-blue at full opacity) for a higher-contrast view of just the runtime-observed call shape; this preserves the call-tree topology context while strongly emphasising what fired.
+- recommended fix:
+  Add a `.execution-flow-edge-fired-animated` CSS variant gated on a Settings toggle (default off) that sets `stroke-dasharray: 4 3` + `stroke-dashoffset` keyframe animation; promote to default-on only if operator demand justifies it. Keep DEC-029's color-only emphasis as the canonical baseline.
+- related tasks:
+  - none (v2 candidate; promote when operator demand surfaces)
+- related docs:
+  - `docs/DECISIONS.md` DEC-029 (locks color-only edge emphasis; documents the iteration history rejecting thicker fired edges + larger arrowheads)
+  - `androscan/web/frontend/src/components/trace/ExecutionFlow.tsx` (`VerdictEdge` custom component)
+  - `androscan/web/frontend/src/App.css` (`.execution-flow-edge-fired` namespace)
+
+---
+
+### ISSUE-018: Phase 13 v1 ships static heuristic verdicts — branch-outcome inference from dynamic data deferred
+- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- impact: Medium
+- area: Behavior Trace v3 / `branch_classifier` precision
+- introduced / observed: 2026-05-08 (Phase 13 v1 ship)
+- summary:
+  Phase 11 v2's `branch_classifier.classify_branch_outcomes` heuristically classifies each `DecisionPoint`'s branches as `deny` / `allow` / `neutral` with a 4-tier confidence score per the locked verdict catalog from 10.3 + DEC-024. Phase 13 v1 ships a multi-method dynamic tracer that observes which branches *actually* fire at runtime — but the dynamic data does NOT feed back into the static verdict classification. A "neutral"-classified branch that fires consistently as `deny` on real input keeps its static "neutral" label; the dynamic overlay just paints it accent-blue without re-classifying it. DEC-029 deferred this as out-of-scope-for-v1 because the static heuristic verdicts are already operator-actionable enough; revisit when dogfood shows a measurable gap.
+- why it matters:
+  The Inspector's "Predicate origin" + bypass-plan suggestions are driven by the static verdict — a "neutral" branch the planner skipped over might in fact be the actual deny gate on the real input the operator captured. Without re-classification, operators who run a dynamic trace don't get bypass-plan refinements from the runtime data; they only see *which* of the existing plans corresponds to the path that fired.
+- current workaround:
+  Operators can manually identify gates via the dynamic-trace overlay (the fired path with a return value of `false` flowing into a deny sink is observably the deny gate, regardless of the static verdict label) and use the existing `[Hook this method]` / `[Trace this gate]` action-row affordances in the Inspector to investigate further. The chat dock's `summarise_method` widget can also clarify intent on a per-method basis.
+- recommended fix:
+  Add a `branch_outcome_dynamic` field to `DecisionPoint` (additive, no schema bump on `trace.sqlite` — populated lazily from `dynamic_trace.jsonl` on read) carrying a `tuple[BranchVerdict, ConfidenceTier, ObservationCount]`. UI surfaces the dynamic verdict alongside the static one when both exist; bypass planner re-runs against the dynamic verdict when confidence > 0.85 + observation count >= N (N TBD via dogfood).
+- related tasks:
+  - none (v2 candidate; gates on dogfood telemetry showing the precision gap matters in practice)
+- related docs:
+  - `docs/DECISIONS.md` DEC-029 (alternatives considered: "Branch-outcome inference from dynamic data — rejected for v1")
+  - `androscan/analysis/branch_classifier.py` (the static classifier; v1 surface)
+  - `apps/<app_id>/<run>/dynamic_trace.jsonl` (the dynamic-data source the future inference would consume)
+
+---
+
+### ISSUE-019: Phase 13 v1 ships per-thread depth pill — full per-thread layout reshape deferred
+- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- impact: Low
+- area: Behavior Trace v3 / `ExecutionFlow` layout
+- introduced / observed: 2026-05-08 (Phase 13 v1 ship; sub-step 13.8)
+- summary:
+  Phase 13 v1's `ExecutionFlow` renders ALL methods in the active anchor's closure on a single left-to-right column-rank layout regardless of which thread they fire on at runtime; thread context is communicated via a corner depth pill (`d:N · t:M`) on each fired node. The canvas mockup envisioned an alternative "per-thread lane" layout where methods fired on Thread A render in one horizontal swim-lane and methods fired on Thread B render in a parallel one below, making cross-thread call patterns visually obvious. Sub-step 13.8 deferred the reshape on operator-dogfood-driven judgment that the corner pill preserves the call-tree mental model adequately for the typical 5-30-method anchor without the layout-substrate change cost.
+- why it matters:
+  Multi-threaded apps where callbacks fire on a worker thread and UI updates fire on the main thread (the dominant Android pattern) currently render as a single visual graph where the operator has to mentally diff `t:1` vs `t:13` corner pills to reconstruct the threading topology. For 5-30-method anchors this is feasible; for 50+-method anchors with 3+ threads the corner pill stops scaling.
+- current workaround:
+  Operators can hover the depth pill for a tooltip showing the full `threadId` + `threadDepth` + `lastFireTs` from the `LiveValueRecord`. The Inspector's "Live observation" section also surfaces the thread context. For complex anchors, operators can narrow the entry method to scope the closure tighter before running the dynamic trace.
+- recommended fix:
+  Add a `layoutMode: "single-column" | "per-thread-lanes"` prop on `<ExecutionFlow>` (default `"single-column"` matching v1); promote to operator-controllable Settings toggle if dogfood shows demand. Per-thread lanes would route nodes by `liveValues.get(overloadKey)?.threadId` into separate Y-bands with the existing column-rank layout preserved within each band.
+- related tasks:
+  - none (v2 candidate; gates on dogfood telemetry showing the corner-pill view insufficient on multi-threaded anchors)
+- related docs:
+  - `docs/DECISIONS.md` DEC-029 (locks per-thread depth visualization as a v1 deliverable; sub-step 13.8 closing note records the corner-pill-vs-lane-reshape decision)
+  - `androscan/web/frontend/src/components/trace/ExecutionFlow.tsx` (`MethodNode` depth pill rendering)
+  - `androscan/web/frontend/src/api/trace.ts` (`useDynamicTrace` hook populates `threadId` + `threadDepth` on every `LiveValueRecord`; the data is there for either layout)
+
+---
+
+### ISSUE-020: Phase 13 v1 surfaces cached summaries only via chat dock, not dedicated GET route
+- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- impact: Low
+- area: Behavior Trace v3 / `Inspector` cached-summary discoverability
+- introduced / observed: 2026-05-08 (Phase 13 v1 ship; sub-step 13.9)
+- summary:
+  Phase 13 v1's `Inspector` Summary section shows a generated summary ONLY when the corresponding method has fired during the active dynamic-trace session OR the operator clicks the "Discuss in chat" button which fires the `summarise_method` skill via the agentic loop (cache-hit returns the cached summary verbatim; cache-miss generates a fresh one). On a static-only inspection of a never-fired-this-session method that DOES have a cached summary in `skill_results_cache.json` from a previous run, the Inspector renders the empty-state placeholder ("Summary not yet generated. Run a dynamic trace…") instead of the cached summary. The chat-widget path is the operator-discoverable workaround but adds one click + one chat-dock round-trip vs. an in-place Inspector render.
+- why it matters:
+  Operators returning to a previously-inspected app and clicking through Inspector nodes to refresh their memory get the empty-state placeholder for every method until they fire a dynamic trace, even though the summaries are already cached. The chat-widget click works but adds friction.
+- current workaround:
+  Operator clicks "Discuss in chat" on the Inspector → the agentic loop fires `summarise_method` → the skill cache-hit returns `cached=True` widget → the chat dock renders the interactive `<MethodSummaryWidget>` card with the same content the Inspector would show. One extra click vs. an in-place render.
+- recommended fix:
+  Add a small `GET /api/trace/{app_id}/summary?class=...&method=...&descriptor=...` route reading from the existing `skill_results_cache.json` storage with byte-equal cache-key derivation (mirrors `androscan/web/trace_summary.py::summary_cache_params`); Inspector mounts a `useEffect` on selection-change that fires this GET and populates the Summary section's `cached` state directly. No dedicated endpoint authority surface — the route is read-only over the existing cache file. Defer the route until dogfood shows operators routinely want one-click cache lookups without the chat-dock round-trip.
+- related tasks:
+  - none (v2 candidate; operator-demand-gated per the 13.9 closing note)
+- related docs:
+  - `docs/DECISIONS.md` DEC-029 v1 closing note (records this deferral)
+  - `androscan/web/trace_summary.py` (`summary_cache_params` — the byte-equal cache-key derivation a future GET route would reuse)
+  - `androscan/internal/skill_results_cache.py` (the cache layer the future route would read)
+  - `androscan/web/frontend/src/components/trace/Inspector.tsx` ("Discuss in chat" button — the v1 chat-widget path)
+
+---
+
+### ISSUE-021: Phase 13 v1 ships no `<MethodSummaryWidget>` "Refresh summary" + no pan-to-fit-on-selection
+- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- impact: Low
+- area: Behavior Trace v3 / chat widget UX + flowchart UX
+- introduced / observed: 2026-05-08 (Phase 13 v1 ship; sub-step 13.9)
+- summary:
+  Two small UX polish items deferred from Phase 13 v1: (1) the `<MethodSummaryWidget>` chat card has no "Refresh summary" affordance — once a cached summary is rendered, the operator has to either re-run the dynamic trace (which fires `summarise_method` cache-hit and re-emits the same widget) or re-fire the prompt manually (which produces a fresh LLM call). (2) `<ExecutionFlow>` doesn't pan-to-fit on selection — when the operator clicks a node that's currently outside the viewport (panned offscreen on a large graph), the Inspector opens but the flowchart stays parked where it was; the operator has to manually pan to find the node they just clicked.
+- why it matters:
+  (1) Cached summaries that turn out to be stale (e.g. the LLM's summary was wrong, or the operator wants a different summary perspective) require a workflow-level workaround. (2) Large graphs (50+ nodes) make node-finding-after-selection a manual chore.
+- current workaround:
+  (1) Operator drops the `apps/<app_id>/skill_results_cache.json` slot for the affected method (manual JSON edit) OR re-fires `summarise_method` from the chat dock with explicit "ignore cache" prompt language (the LLM may or may not honor it). (2) Operator manually pans the flowchart to the selected node OR uses the React Flow `<MiniMap>` to navigate.
+- recommended fix:
+  (1) Add a "Refresh summary" button to `<MethodSummaryWidget>` that fires `summarise_method` with a `force_refresh: true` param the skill respects (skip cache lookup; overwrite cache on success). (2) Add a `panToFitOnSelection: boolean` prop on `<ExecutionFlow>` (default `true`); fire `reactFlowInstance.fitView({ nodes: [selectedNode], padding: 0.3 })` on `selectedNodeId` change. Both are small additions; defer until operator demand surfaces.
+- related tasks:
+  - none (v2 candidate; operator-demand-gated per the 13.9 closing note)
+- related docs:
+  - `docs/DECISIONS.md` DEC-029 v1 closing note (records both deferrals)
+  - `androscan/web/frontend/src/components/chat/widgets/MethodSummaryWidget.tsx` (current v1 widget — no refresh affordance)
+  - `androscan/web/frontend/src/components/trace/ExecutionFlow.tsx` (current v1 — no pan-to-fit on `selectedNodeId` change)
+  - `androscan/skills/summarise_method.py` (the skill `force_refresh: true` would route through)
+
+---
+
 _(See § 8 Resolved issues — `ISSUE-016` was closed by **LCP.6 (2026-05-06)**: GBNF grammar enforcement for llama.cpp + JSON-schema mode for Ollama 0.5.0+ now constrain the response envelope at the model's logits-sampling level. The fail-soft retry path in `androscan/internal/workflow.py` is still in place but is no longer the primary defense; operators on Q4_K_M / IQ4_XS quants regain reliable structured-JSON output.)_
 
 ---
