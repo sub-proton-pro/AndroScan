@@ -309,7 +309,7 @@ def test_default_summary_callable_returns_complete_content(monkeypatch) -> None:
 
     callable_ = default_summary_callable(lambda: Config.default())
     result = asyncio.run(
-        callable_("Lcom/example/Foo;", "bar", "(I)Z")
+        callable_("test-app", "Lcom/example/Foo;", "bar", "(I)Z")
     )
     assert result == "foo() validates the int input is non-negative."
     assert len(captured) == 1
@@ -340,7 +340,7 @@ def test_default_summary_callable_strips_whitespace(monkeypatch) -> None:
     )
 
     callable_ = default_summary_callable(lambda: Config.default())
-    result = asyncio.run(callable_("Lcom/example/Foo;", "bar", "(I)Z"))
+    result = asyncio.run(callable_("test-app", "Lcom/example/Foo;", "bar", "(I)Z"))
     assert result == "foo() does X."
 
 
@@ -363,7 +363,7 @@ def test_default_summary_callable_propagates_timeout(monkeypatch) -> None:
     monkeypatch.setattr("androscan.llm.client.complete", _slow_complete)
     callable_ = default_summary_callable(lambda: Config.default(), timeout_s=0.05)
     with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(callable_("Lcom/example/Foo;", "bar", "(I)Z"))
+        asyncio.run(callable_("test-app", "Lcom/example/Foo;", "bar", "(I)Z"))
 
 
 def test_default_summary_callable_propagates_exception(monkeypatch) -> None:
@@ -377,7 +377,7 @@ def test_default_summary_callable_propagates_exception(monkeypatch) -> None:
     monkeypatch.setattr("androscan.llm.client.complete", _boom)
     callable_ = default_summary_callable(lambda: Config.default())
     with pytest.raises(RuntimeError, match="ollama gone"):
-        asyncio.run(callable_("Lcom/example/Foo;", "bar", "(I)Z"))
+        asyncio.run(callable_("test-app", "Lcom/example/Foo;", "bar", "(I)Z"))
 
 
 # ---------------------------------------------------------------------------

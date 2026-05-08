@@ -93,14 +93,28 @@ SUMMARY_READY_KIND = "summary_ready"
 SUMMARY_FAILED_KIND = "summary_failed"
 
 
-#: Async callable that produces a per-method summary. Inputs are the
-#: three fields the ``behavior_trace_multi`` event payload carries
-#: at ``phase: "entry"`` (``class`` Java-form / ``method`` /
-#: ``descriptor``). Output is the operator-facing summary text. May
-#: raise :class:`asyncio.TimeoutError` (caller wraps this in
+#: Async callable that produces a per-method summary. Inputs are
+#: the four fields the WS handler has in scope at the
+#: ``phase: "entry"`` dispatch site:
+#:
+#:   1. ``app_id`` — the per-app id from the WS URL (extends the
+#:      13.3 contract; required by 13.4's skill-tier callable to
+#:      read the decompiled source from
+#:      ``apps/<app_id>/.decompiled/...``). The default
+#:      :func:`default_summary_callable` ignores this argument
+#:      since its name-based prompt doesn't need source context;
+#:      tests injecting stubs may also ignore it.
+#:   2. ``class_java`` — Java-form class name from the
+#:      ``behavior_trace_multi`` event payload's ``class`` field.
+#:   3. ``method_name`` — method name (e.g. ``onClick``).
+#:   4. ``descriptor`` — Smali descriptor (e.g.
+#:      ``(Landroid/view/View;)V``).
+#:
+#: Output is the operator-facing summary text. May raise
+#: :class:`asyncio.TimeoutError` (caller wraps this in
 #: ``asyncio.wait_for``) or any exception — the WS handler
 #: translates both into a ``summary_failed`` event.
-SummaryCallable = Callable[[str, str, str], Awaitable[str]]
+SummaryCallable = Callable[[str, str, str, str], Awaitable[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +312,19 @@ def default_summary_callable(
     where this default plugs in today.
     """
 
-    async def _call(class_smali: str, method_name: str, descriptor: str) -> str:
+    async def _call(
+        app_id: str, class_smali: str, method_name: str, descriptor: str
+    ) -> str:
+        # ``app_id`` is part of the seam contract per 13.4 — the
+        # default callable's name-based prompt doesn't need it
+        # (the LLM never sees it), but accepting it keeps the
+        # signature uniform across the production
+        # ``summarise_method`` skill (which DOES need it for the
+        # decompile-cache read) and the tests' deterministic
+        # stubs. Marked as ``del app_id`` for a clean
+        # "intentionally unused" signal.
+        del app_id
+
         # Lazy import — keeps :mod:`androscan.web.trace_summary`
         # importable in test contexts that haven't installed the
         # full LLM client surface yet (mirrors the

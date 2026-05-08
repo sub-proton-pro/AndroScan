@@ -25,6 +25,7 @@ _SKILL_MODULES = [
     "androscan.skills.resolve_ui_element",
     "androscan.skills.query_call_graph",
     "androscan.skills.trace_behavior",
+    "androscan.skills.summarise_method",
     "androscan.skills.suggest_trace_entry",
     "androscan.skills.generate_frida_hook",
     "androscan.skills.app_env_check",

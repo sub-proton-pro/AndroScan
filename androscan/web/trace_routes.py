@@ -1577,11 +1577,17 @@ def build_trace_router(
         ) -> None:
             """Background task — invoke the summary callable and
             emit ``summary_ready`` (success) or ``summary_failed``
-            (timeout / exception). Caches successful results."""
+            (timeout / exception). Caches successful results.
+
+            Passes ``app_id`` from the WS URL through to the
+            callable per the 13.4-extended :data:`SummaryCallable`
+            seam — the default name-based callable ignores it,
+            the skill-tier callable uses it to read decompiled
+            source from ``apps/<app_id>/.decompiled/...``."""
             assert _resolved_summary_callable is not None
             try:
                 summary_text = await _resolved_summary_callable(
-                    cls_java, method_name, descriptor
+                    app_id, cls_java, method_name, descriptor
                 )
             except asyncio.TimeoutError:
                 try:

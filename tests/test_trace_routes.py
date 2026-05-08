@@ -1616,13 +1616,14 @@ def test_ws_trace_route_registered() -> None:
 
 
 async def _stub_summary_unused(
-    cls_java: str, method_name: str, descriptor: str
+    app_id: str, cls_java: str, method_name: str, descriptor: str
 ) -> str:
     """Stub callable that fails loudly if invoked — used by tests
     that assert the summary multiplex stays QUIET (e.g. for events
     that aren't ``phase: "entry"``)."""
     raise AssertionError(
-        f"summary callable should not have been invoked for {cls_java}.{method_name}"
+        f"summary callable should not have been invoked for "
+        f"{app_id}/{cls_java}.{method_name}"
     )
 
 
@@ -1713,7 +1714,7 @@ def test_ws_entry_event_fires_pending_then_ready(tmp_path: Path) -> None:
     fresh results from cache hits (UI uses the flag to grey out
     a "(cached)" badge)."""
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         return f"{method}() summary text"
 
     client, _fake, session = _ws_app_with_summary_stub(
@@ -1775,7 +1776,7 @@ def test_ws_cache_hit_skips_pending_emits_ready_with_cached_true(tmp_path: Path)
 
     callable_invocations = 0
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         nonlocal callable_invocations
         callable_invocations += 1
         return "(should not reach here)"
@@ -1816,7 +1817,7 @@ def test_ws_same_method_fires_summary_only_once(tmp_path: Path) -> None:
 
     callable_invocations = 0
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         nonlocal callable_invocations
         callable_invocations += 1
         return "summary v1"
@@ -1872,7 +1873,7 @@ def test_ws_summary_callable_raises_emits_summary_failed(tmp_path: Path) -> None
     frontend can render the failure inline in the Inspector pane
     without parsing a generic 5xx."""
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         raise RuntimeError("ollama gone")
 
     client, _fake, session = _ws_app_with_summary_stub(
@@ -1907,7 +1908,7 @@ def test_ws_summary_callable_timeout_emits_summary_failed(tmp_path: Path) -> Non
     30 s; tests use a stub that raises it directly to keep the
     test fast (no real wait)."""
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         raise asyncio.TimeoutError()
 
     client, _fake, session = _ws_app_with_summary_stub(
@@ -1939,7 +1940,7 @@ def test_ws_summary_callable_returns_empty_emits_summary_failed(tmp_path: Path) 
     treat-empty-as-miss discipline (we'd rather flag the failure
     than emit a useless empty ``summary_ready``)."""
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         return "   "
 
     client, _fake, session = _ws_app_with_summary_stub(
@@ -2037,7 +2038,7 @@ def test_ws_no_summary_callable_skips_multiplex_but_streams_events(tmp_path: Pat
     # "should not reach here" guard.
     callable_invocations = 0
 
-    async def _never_called(cls_java: str, method: str, descriptor: str) -> str:
+    async def _never_called(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         nonlocal callable_invocations
         callable_invocations += 1
         return "(should never be reached)"
@@ -2074,7 +2075,7 @@ def test_ws_live_event_fires_summary_after_replay(tmp_path: Path) -> None:
     replay drain) trigger the same summary multiplex. Mirrors the
     replay-buffer test case but exercises the live-pump path."""
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         return "live summary"
 
     client, _fake, session = _ws_app_with_summary_stub(
@@ -2116,7 +2117,7 @@ def test_ws_successful_summary_is_cached_for_next_session(tmp_path: Path) -> Non
 
     invocations = 0
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         nonlocal invocations
         invocations += 1
         return f"summary turn {invocations}"
@@ -2183,7 +2184,7 @@ def test_ws_failed_summary_is_not_cached(tmp_path: Path) -> None:
 
     raise_count = [2]
 
-    async def _stub(cls_java: str, method: str, descriptor: str) -> str:
+    async def _stub(app_id: str, cls_java: str, method: str, descriptor: str) -> str:
         if raise_count[0] > 0:
             raise_count[0] -= 1
             raise RuntimeError("transient")

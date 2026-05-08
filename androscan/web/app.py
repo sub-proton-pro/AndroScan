@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -255,6 +255,105 @@ async def _resolve_boot_completed() -> bool:
     # ``getprop`` prints just ``1`` (with a trailing newline) once boot is
     # complete; an empty line / ``0`` / anything else means "not yet".
     return (out_b or b"").decode(errors="replace").strip() == "1"
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 sub-step 13.4 — production wiring for the ``summarise_method``
+# skill behind sub-step 13.3's :data:`SummaryCallable` seam.
+#
+# Built as a module-level factory (rather than inline inside
+# :func:`create_app`) so tests + the docstrings can reference the
+# exact adapter shape — and so a future skill-tier evolution
+# (richer source enrichment, multi-shot prompts, etc.) lands here
+# without touching the route layer at all.
+
+
+def _build_summarise_method_callable(
+    config_provider: Callable[[], Config],
+    app_dir_resolver: Callable[[str], Path],
+):
+    """Return the production :data:`SummaryCallable` that wraps the
+    registered ``summarise_method`` skill (sub-step 13.4).
+
+    The returned async callable accepts the four-arg
+    :data:`SummaryCallable` signature locked at sub-step 13.4 —
+    ``(app_id, class_smali, method_name, descriptor) -> str`` —
+    and bounces the sync :func:`androscan.skills.execute` call into
+    the default executor so the WS event loop stays unblocked
+    during the LLM round-trip. The route layer's
+    :func:`asyncio.wait_for` against :data:`SUMMARY_TIMEOUT_S` is
+    the canonical timeout enforcement; this adapter doesn't add a
+    second one (avoids the double-timeout race the
+    ``trace_summary.default_summary_callable`` originally guarded
+    against — under 13.4 the sync skill IS the LLM call, so a
+    single layer of timeout suffices).
+
+    Failure handling: a skill ``SkillResult`` with ``success=False``
+    surfaces as a :exc:`RuntimeError` (the WS handler then emits
+    ``summary_failed`` with the operator-facing reason). A skill
+    that returns ``success=True`` with a fail-open text
+    (e.g. "Source unavailable for summary") is treated as a
+    successful summary — the operator sees the explanation in the
+    Inspector pane rather than a hard failure pill.
+    """
+
+    import asyncio
+    from androscan.skills import SkillContext, execute as execute_skill
+
+    async def _call(
+        app_id: str,
+        class_smali: str,
+        method_name: str,
+        descriptor: str,
+    ) -> str:
+        cfg = config_provider()
+        # Resolve the per-app run-folder synthetically — the
+        # skill's :func:`_resolve_app_dir` walks
+        # ``run_folder.parent.parent`` to find the ``apps/`` root,
+        # so any run-folder-shaped path inside ``apps/<app_id>/``
+        # works. We use a synthetic ``apps/<app_id>/__ws_trace__/``
+        # path: the skill never reads the run folder itself (only
+        # uses it to derive ``apps_root`` + ``app_id``), so the
+        # synthetic path is enough to drive the resolution
+        # without creating a real run folder per WS connection.
+        try:
+            app_dir = app_dir_resolver(app_id)
+        except Exception:
+            # Fall back to a path-shape that lets the skill's
+            # resolver still extract ``apps/`` from the parent
+            # ladder (resolves to ``apps/<app_id>/__ws_trace__/``
+            # → ``apps/<app_id>/`` → ``apps/`` root).
+            apps_dir = Path(cfg.run_folder_root or "apps")
+            app_dir = apps_dir / app_id
+        synthetic_run_folder = app_dir / "__ws_trace__"
+
+        skill_ctx = SkillContext(
+            config=cfg,
+            run_folder=synthetic_run_folder,
+            dossier_dict=None,
+            apk_path=None,
+        )
+        params = {
+            "class_smali": class_smali,
+            "method_name": method_name,
+            "descriptor": descriptor,
+            "app_id": app_id,
+        }
+
+        loop = asyncio.get_running_loop()
+
+        def _do_call() -> str:
+            result = execute_skill("summarise_method", params, skill_ctx)
+            if not result.success:
+                # Surface as exception so the WS handler's
+                # ``summary_failed`` path emits the operator-facing
+                # error message verbatim.
+                raise RuntimeError(result.text or "summarise_method failed")
+            return (result.text or "").strip()
+
+        return await loop.run_in_executor(None, _do_call)
+
+    return _call
 
 
 def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
@@ -1033,8 +1132,24 @@ def create_app(config: Config, *, cwd: Optional[Path] = None) -> FastAPI:
     # multiplexed-events surface as a separate router (mirrors the
     # ``build_frida_router`` (rest, ws) split since the WS prefix
     # differs from the REST prefix).
+    #
+    # Phase 13 sub-step 13.4 — wire the registered ``summarise_method``
+    # skill behind 13.3's :data:`SummaryCallable` seam. The adapter
+    # bounces the sync :func:`execute` into the default executor
+    # (mirrors :func:`androscan.web.trace_summary.default_summary_callable`)
+    # so the WS event loop stays unblocked while the LLM round-trip is
+    # in flight; the timeout enforcement still happens at the WS-handler
+    # layer via :func:`asyncio.wait_for` against
+    # :data:`SUMMARY_TIMEOUT_S` from :mod:`trace_summary`. Cache writes
+    # land in the same ``skill_results_cache.json`` slot 13.3 was
+    # populating (skill_id ``"summarise_method"`` + the same 4-tuple
+    # cache key), so any cached summaries an operator built up under
+    # 13.3's inline-LLM default callable carry forward verbatim.
+    _summary_callable = _build_summarise_method_callable(
+        _current_config, _app_dir
+    )
     _trace_rest, _trace_ws = build_trace_router(
-        _current_config, _app_dir, _frida_provider
+        _current_config, _app_dir, _frida_provider, _summary_callable
     )
     app.include_router(_trace_rest)
     app.include_router(_trace_ws)
