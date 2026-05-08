@@ -16,6 +16,7 @@
  *     This keeps the schema additive at both ends.
  */
 import type { ChatWidget } from "../../../types";
+import { MethodSummaryWidget } from "./MethodSummaryWidget";
 import { TraceEntryCandidateWidget } from "./TraceEntryCandidateWidget";
 
 type Props = {
@@ -26,6 +27,12 @@ export function ChatWidgetRenderer({ widget }: Props) {
   switch (widget.kind) {
     case "trace_entry_candidate":
       return <TraceEntryCandidateWidget widget={widget} />;
+    case "method_summary":
+      // Phase 13 sub-step 13.9 / DEC-029 — chat-rendered LLM
+      // summary card emitted by the ``summarise_method`` skill;
+      // mirrors the Inspector pane's action row for in-chat
+      // operator follow-through.
+      return <MethodSummaryWidget widget={widget} />;
     default:
       // Unknown kind — graceful fallback, no console noise (a soft
       // warn would spam the dev tools on every legacy chat replay

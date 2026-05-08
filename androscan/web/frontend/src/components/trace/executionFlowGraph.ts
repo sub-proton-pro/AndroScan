@@ -213,6 +213,39 @@ export function overloadKeyFromNodeId(nodeId: string): string {
   return parenIdx > 0 ? nodeId.slice(0, parenIdx) : nodeId;
 }
 
+/** Phase 13 sub-step 13.9 — count the unique full Smali signatures
+ *  Frida will hook for ``anchor``. Mirrors
+ *  :func:`androscan.web.trace_dynamic.extract_closure_methods`'s
+ *  dedup-by-``smali_signature`` pass exactly so the FE's pre-run
+ *  threshold-color decision matches what the BE will actually
+ *  attempt (the overload-key collapsing the ``ExecutionFlow`` does
+ *  for visual stacking is a presentation concern; Frida hooks
+ *  EVERY overload, so the hook count is keyed on the full
+ *  signature). The five-source flatten:
+ *
+ *    1. ``anchor.entry_method``
+ *    2. each ``DecisionPoint.method``
+ *    3. each ``BypassPlan.target_method`` + ``source_decision_method``
+ *       (both ``plans`` and ``advanced_plans``)
+ *
+ *  Returns the unique-signature count; the caller bands it against
+ *  DEC-029's threshold colour ladder to decorate the "Run dynamic
+ *  trace" button. */
+export function closureMethodCount(anchor: BehaviorAnchor): number {
+  const seen = new Set<string>();
+  const add = (m: MethodRef | null | undefined) => {
+    if (!m) return;
+    seen.add(methodKey(m));
+  };
+  add(anchor.entry_method);
+  for (const d of anchor.decisions) add(d.method);
+  for (const p of [...anchor.plans, ...anchor.advanced_plans]) {
+    add(p.target_method);
+    add(p.source_decision_method);
+  }
+  return seen.size;
+}
+
 /** Java-form ``class.method`` for the card title. */
 function titleOf(m: MethodRef): string {
   const cls = (m.class_name || "").split(".").pop() || m.class_name;

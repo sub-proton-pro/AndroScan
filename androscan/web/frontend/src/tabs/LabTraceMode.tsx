@@ -230,7 +230,10 @@ import {
   initialTraceMode,
   type TraceMode,
 } from "../components/trace/TraceModeToggle";
-import type { ExecutionFlowNode } from "../components/trace/executionFlowGraph";
+import {
+  closureMethodCount,
+  type ExecutionFlowNode,
+} from "../components/trace/executionFlowGraph";
 
 // Phase 13 sub-step 13.5 — legacy-rollback flag for the "Decision
 // Timeline" → "Behavior Trace" rename. Off by default; flip on
@@ -1493,6 +1496,7 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
               mode={mode}
               firedMethods={dynamic.state.firedMethods}
               liveValues={dynamic.state.liveValues}
+              hookFailed={dynamic.state.hookFailed}
             />
             <Inspector
               anchor={anchor}
@@ -1503,6 +1507,7 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
               summaries={dynamic.state.summaries}
               liveValues={dynamic.state.liveValues}
               mode={mode}
+              hookFailed={dynamic.state.hookFailed}
             />
           </div>
         )}
@@ -1605,7 +1610,8 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
 }
 
 // ---------------------------------------------------------------------------
-// DynamicTraceRunControl — Phase 13 sub-step 13.8.
+// DynamicTraceRunControl — Phase 13 sub-step 13.8 (introduced) +
+// 13.9 (threshold-colored Run button per DEC-029 lock-in).
 //
 // Compact Run / Stop control + live status copy that lives in the
 // Execution Flow section header. Wraps the :func:`useDynamicTrace`
@@ -1621,12 +1627,54 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
 // the multiplexed ``/ws/trace/{app_id}/{session_id}`` WebSocket
 // (Phase 13.3) and starts streaming events.
 //
-// Threshold-based color coding (≤20 green / 21-50 yellow / etc.)
-// lands in 13.9; the v1 button is uncolored — operator just sees
-// the ``hook_count`` from the ``ready`` event in the status copy
-// after the trace starts. ``hop_cap`` defaults to 50 (the BE's
-// default); 13.9 may grow a stepper.
+// 13.9 — threshold-color coding on the idle / running button.
+// DEC-029 locks four bands keyed on the hook count:
+//
+//   * ≤ 20 hooks → green (lightweight; the device should feel
+//     responsive even on a budget Android Go target).
+//   * 21-50 hooks → yellow (acceptable; mid-range devices may
+//     show a brief startup hitch but no perceived lag).
+//   * 51-100 hooks → orange (operator-visible warning band; tooltip
+//     copy "device may stutter" appears here and above).
+//   * > 100 hooks → red (heavy; the BE caps at the operator-tunable
+//     ``hop_cap`` default of 50, so this band only reaches red when
+//     the operator has explicitly raised the cap — but the visual
+//     warning still fires regardless).
+//
+// Pre-run (no ``readyStats`` yet) the count comes from
+// :func:`closureMethodCount` against the loaded ``BehaviorAnchor``
+// (same five-source flatten the BE's
+// :func:`extract_closure_methods` performs); post-run it comes from
+// ``state.readyStats.methods_attempted`` (the actual count the BE
+// attempted to hook, post cap-truncation). Switching mid-flight
+// keeps the operator-visible color stable as the trace progresses
+// from "intent" to "actual".
 // ---------------------------------------------------------------------------
+
+/** Threshold band classifier — pure helper so unit tests can pin
+ *  the boundary semantics if 13.x ever needs them. The four bands
+ *  match DEC-029's locked ladder; values are inclusive of the
+ *  upper bound of the lower band (≤ 20, ≤ 50, ≤ 100, > 100). */
+type ThresholdBand = "green" | "yellow" | "orange" | "red";
+
+function thresholdBand(hookCount: number): ThresholdBand {
+  if (hookCount <= 20) return "green";
+  if (hookCount <= 50) return "yellow";
+  if (hookCount <= 100) return "orange";
+  return "red";
+}
+
+/** Operator-readable tooltip copy for a given hook count + band.
+ *  Green / yellow keep the descriptive copy; orange / red prepend
+ *  the "device may stutter" warning DEC-029 specced. */
+function thresholdTooltip(hookCount: number): string {
+  const band = thresholdBand(hookCount);
+  const summary = `${hookCount} hook${hookCount === 1 ? "" : "s"}`;
+  if (band === "orange" || band === "red") {
+    return `${summary} · device may stutter — Frida overhead grows with the hook count`;
+  }
+  return `${summary} · within the comfortable performance band for most devices`;
+}
 
 type DynamicTraceRunControlProps = {
   dynamic: ReturnType<typeof useDynamicTrace>;
@@ -1648,6 +1696,19 @@ function DynamicTraceRunControl({ dynamic, anchor }: DynamicTraceRunControlProps
     return `L${cn};->${m.method_name}(${(m.param_descriptors || []).join("")})${m.return_descriptor || "V"}`;
   }, [anchor]);
 
+  // 13.9 — threshold-color hook count. Pre-run we use the static
+  // closure count (mirrors BE's ``extract_closure_methods``);
+  // post-run (after the ``ready`` event) we use the actual attempted
+  // count from the BE. The value is stable through the
+  // starting / running transition because both pre- and post- counts
+  // map the same anchor to the same closure (modulo the ``hop_cap``
+  // truncation, which the BE applies AFTER the static count — so
+  // the post-run value can be ≤ pre-run, never greater).
+  const closureSize = useMemo(() => closureMethodCount(anchor), [anchor]);
+  const hookCount = state.readyStats?.methods_attempted ?? closureSize;
+  const band = thresholdBand(hookCount);
+  const tooltipBase = thresholdTooltip(hookCount);
+
   const onRun = useCallback(() => {
     void start({ entry, hops: anchor.hops });
   }, [start, entry, anchor.hops]);
@@ -1663,7 +1724,14 @@ function DynamicTraceRunControl({ dynamic, anchor }: DynamicTraceRunControlProps
     if (state.connection === "starting") return "Starting…";
     if (state.connection === "stopping") return "Stopping…";
     if (isRunning) return "Stop dynamic trace";
-    return "Run dynamic trace";
+    return `Run dynamic trace (${hookCount})`;
+  })();
+
+  const buttonTitle = (() => {
+    if (isRunning) {
+      return "Stop the active dynamic trace and detach the Frida session";
+    }
+    return `${tooltipBase}. Start a dynamic Frida trace on the closure of methods reachable from this anchor.`;
   })();
 
   const statusCopy = (() => {
@@ -1680,23 +1748,30 @@ function DynamicTraceRunControl({ dynamic, anchor }: DynamicTraceRunControlProps
     return null;
   })();
 
+  // 13.9 — threshold-color class list. The base class lives in
+  // App.css; the band-specific class adds the colour-tint overrides.
+  // ``-running`` neutralises the band tint so a Stop button doesn't
+  // shout the colour after the trace is up — the green / yellow /
+  // orange / red signal is operator-targeting, "should I run this".
+  // Once the trace is running the operator wants the calmer Stop
+  // affordance. The disabled-when-busy posture is unchanged from
+  // 13.8.
+  const buttonClass = [
+    "lab-dynamic-trace-button",
+    !isRunning && !isBusy && `lab-dynamic-trace-button-${band}`,
+    isRunning && "lab-dynamic-trace-button-running",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   return (
     <div className="lab-dynamic-trace-controls">
       <button
         type="button"
-        className={[
-          "lab-dynamic-trace-button",
-          isRunning && "lab-dynamic-trace-button-running",
-        ]
-          .filter(Boolean)
-          .join(" ")}
+        className={buttonClass}
         onClick={showStop ? onStop : onRun}
         disabled={isBusy}
-        title={
-          isRunning
-            ? "Stop the active dynamic trace and detach the Frida session"
-            : "Start a dynamic Frida trace on the closure of methods reachable from this anchor"
-        }
+        title={buttonTitle}
       >
         {buttonLabel}
       </button>

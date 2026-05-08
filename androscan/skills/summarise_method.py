@@ -72,7 +72,12 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from androscan.skills.base import SkillContext, SkillMeta, SkillResult
+from androscan.skills.base import (
+    MethodSummaryWidget,
+    SkillContext,
+    SkillMeta,
+    SkillResult,
+)
 from androscan.skills.get_decompiled_method import _extract_method_bodies
 
 
@@ -83,7 +88,9 @@ __all__ = [
     "SKILL_META",
     "execute",
     "smali_to_source_rel_path",
+    "smali_class_to_java_dotted",
     "build_summary_prompt",
+    "build_method_summary_widget",
     "USER_PROMPT_HEAD_TEMPLATE",
     "SOURCE_BODY_BUDGET_BYTES",
 ]
@@ -213,6 +220,61 @@ def smali_to_source_rel_path(class_smali: str) -> Optional[str]:
     if not inner:
         return None
     return f"{inner}.java"
+
+
+def smali_class_to_java_dotted(class_smali: str) -> str:
+    """Translate ``Lcom/example/Foo;`` → ``com.example.Foo``.
+
+    Inner-class suffixes (``$Bar``) are stripped because the
+    Inspector / chat-widget action handlers carry the OUTER class
+    name through ``pendingCodeNav`` (jadx emits inner classes
+    inside the outer-class file; landing on the outer source is
+    correct for cross-tab nav v1).
+
+    Empty / malformed input yields ``""`` so callers can fail-open
+    on bad data without raising. The ``MethodSummaryWidget`` field
+    that consumes this value is documented as best-effort — the
+    widget still renders even with an empty class chip.
+    """
+
+    s = (class_smali or "").strip()
+    if not s.startswith("L") or not s.endswith(";"):
+        return ""
+    inner = s[1:-1]
+    if not inner:
+        return ""
+    if "$" in inner:
+        inner = inner.split("$", 1)[0]
+    return inner.replace("/", ".") if inner else ""
+
+
+def build_method_summary_widget(
+    class_smali: str,
+    method_name: str,
+    descriptor: str,
+    summary_text: str,
+    cached: bool,
+) -> MethodSummaryWidget:
+    """Compose a :class:`MethodSummaryWidget` from the four
+    identifying fields + the LLM-generated summary + the
+    cache-vs-fresh discriminator. Pure helper; the FE's renderer
+    consumes the widget shape verbatim (``dataclasses.asdict`` on
+    the SSE wire, see :func:`androscan.web.chat._widget_to_jsonable`).
+
+    ``class_name`` is derived from ``class_smali`` via
+    :func:`smali_class_to_java_dotted` so the widget is
+    self-contained at the action-handler layer (no FE-side
+    Smali↔Java translation required).
+    """
+
+    return MethodSummaryWidget(
+        class_smali=class_smali,
+        class_name=smali_class_to_java_dotted(class_smali),
+        method_name=method_name,
+        descriptor=descriptor,
+        summary=summary_text,
+        cached=bool(cached),
+    )
 
 
 def build_summary_prompt(
@@ -495,7 +557,21 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
             class_smali, method_name, descriptor,
         )
     if cached is not None:
-        return SkillResult(success=True, data=cached, text=cached)
+        # Phase 13 sub-step 13.9 — emit a MethodSummaryWidget on the
+        # SkillResult so the chat dock renders the cached summary as
+        # an interactive card with action buttons (Hook / Trace /
+        # Open source). The ``cached=True`` discriminator drives the
+        # FE's "(cached)" pill so the operator can tell at a glance
+        # that this was a replay rather than a fresh LLM round-trip.
+        cached_widget = build_method_summary_widget(
+            class_smali, method_name, descriptor, cached, cached=True,
+        )
+        return SkillResult(
+            success=True,
+            data=cached,
+            text=cached,
+            widgets=(cached_widget,),
+        )
 
     # Source enrichment — fail-open on every unavailability path.
     method_source: Optional[str] = None
@@ -552,4 +628,15 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
             summary_text,
         )
 
-    return SkillResult(success=True, data=summary_text, text=summary_text)
+    # Phase 13 sub-step 13.9 — emit the chat-widget alongside the
+    # text so the agentic-loop SSE channel surfaces it on the same
+    # turn. ``cached=False`` flags this as a fresh LLM round-trip.
+    fresh_widget = build_method_summary_widget(
+        class_smali, method_name, descriptor, summary_text, cached=False,
+    )
+    return SkillResult(
+        success=True,
+        data=summary_text,
+        text=summary_text,
+        widgets=(fresh_widget,),
+    )

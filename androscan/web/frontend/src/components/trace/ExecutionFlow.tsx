@@ -88,7 +88,11 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
-import type { BehaviorAnchor, LiveValueRecord } from "../../api/trace";
+import type {
+  BehaviorAnchor,
+  HookFailureRecord,
+  LiveValueRecord,
+} from "../../api/trace";
 import {
   buildExecutionFlowGraph,
   overloadKeyFromNodeId,
@@ -174,6 +178,14 @@ type Props = {
    *  Used to populate the depth pill on fired nodes + the live-
    *  value chip on fired edges. Empty in ``"static"`` mode. */
   liveValues?: ReadonlyMap<string, LiveValueRecord>;
+  /** Phase 13 sub-step 13.9 — runtime ``hook_failed`` confirmations
+   *  keyed by overload key. Drives the warn-orange "inlined
+   *  (runtime-confirmed)" decoration on the affected node — the
+   *  static heuristic ``possiblyInlined`` cool-gray pill upgrades
+   *  to a louder runtime-confirmed state when the dynamic trace
+   *  proves Frida couldn't install the hook. Empty in ``"static"``
+   *  mode (or when no trace has run yet). */
+  hookFailed?: ReadonlyMap<string, HookFailureRecord>;
 };
 
 
@@ -240,6 +252,11 @@ type NodeData = ExecutionFlowNode & {
   mode?: TraceMode;
   fired?: boolean;
   live?: LiveValueRecord | null;
+  /** Phase 13 sub-step 13.9 — runtime ``hook_failed`` record for
+   *  this overload key (or ``null`` when no failure landed). Drives
+   *  the warn-orange runtime-confirmed inlined decoration that
+   *  upgrades the ``possiblyInlined`` cool-gray heuristic state. */
+  runtimeInlined?: HookFailureRecord | null;
 };
 
 
@@ -273,11 +290,19 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
     return "";
   })();
 
+  // 13.9 — runtime-confirmed inlined supersedes the static heuristic
+  // class so the node renders with the warn-orange dashed-border
+  // emphasis the operator can spot at a glance. Both classes can
+  // coexist on the same DOM node (the ``-runtime`` variant overrides
+  // the colour via specificity in App.css), but logically the
+  // runtime confirmation is the louder signal.
+  const isRuntimeInlined = !!n.runtimeInlined;
   const cardClass = [
     "execution-flow-node",
     `execution-flow-node-${n.kind}`,
     selected && "execution-flow-node-selected",
     n.possiblyInlined && "execution-flow-node-inlined",
+    isRuntimeInlined && "execution-flow-node-inlined-runtime",
     n.overloadCount > 1 && "execution-flow-node-stacked",
     n.isSynthetic && "execution-flow-node-synthetic",
     isFiredEmphasis && "execution-flow-node-fired",
@@ -362,10 +387,26 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
                 ×{n.overloadCount} overloads
               </span>
             )}
-            {n.possiblyInlined && (
-              <span className="execution-flow-node-inlined-pill">
-                possibly inlined
+            {/* 13.9 — runtime-confirmed pill takes precedence over
+                the static heuristic pill. ``runtimeInlined`` is
+                truthy iff a ``hook_failed`` event landed for this
+                method's overload key during the active dynamic
+                trace. The ``-runtime`` modifier paints the pill in
+                warn-orange; the title carries the operator-readable
+                Frida reason for hover-context. */}
+            {isRuntimeInlined && n.runtimeInlined ? (
+              <span
+                className="execution-flow-node-inlined-pill execution-flow-node-inlined-pill-runtime"
+                title={`Frida hook_failed: ${n.runtimeInlined.reason}`}
+              >
+                inlined (runtime)
               </span>
+            ) : (
+              n.possiblyInlined && (
+                <span className="execution-flow-node-inlined-pill">
+                  possibly inlined
+                </span>
+              )
             )}
           </div>
         </>
@@ -527,6 +568,7 @@ export function ExecutionFlow({
   mode = "static",
   firedMethods,
   liveValues,
+  hookFailed,
 }: Props) {
   const { rfNodes, rfEdges } = useMemo(() => {
     const graph = buildExecutionFlowGraph(anchor);
@@ -539,17 +581,32 @@ export function ExecutionFlow({
     // never fire — guard explicitly so a stray ``allow`` sink id
     // matching a fired Smali key (impossible in practice; defensive)
     // doesn't accent.
+    //
+    // 13.9 — same indexing pattern for the ``hookFailed`` map; a
+    // hit upgrades the static ``possiblyInlined`` heuristic to a
+    // runtime-confirmed warn-orange pill. Synthetic sinks are
+    // explicitly guarded out (they have no MethodRef so a hit is
+    // impossible by construction; defensive nonetheless).
     const fired = firedMethods ?? null;
     const live = liveValues ?? null;
+    const failed = hookFailed ?? null;
 
     const rfNodes: Node<NodeData>[] = graph.nodes.map((n) => {
       const oKey = n.isSynthetic ? "" : overloadKeyFromNodeId(n.id);
       const isFired = !n.isSynthetic && !!fired?.has(oKey);
       const liveRecord = !n.isSynthetic && live ? (live.get(oKey) ?? null) : null;
+      const runtimeInlined =
+        !n.isSynthetic && failed ? (failed.get(oKey) ?? null) : null;
       return {
         id: n.id,
         type: "method",
-        data: { ...n, mode, fired: isFired, live: liveRecord },
+        data: {
+          ...n,
+          mode,
+          fired: isFired,
+          live: liveRecord,
+          runtimeInlined,
+        },
         position: positions.get(n.id) ?? { x: 0, y: 0 },
         // 220×72 fixed; React Flow uses these for hit-testing.
         width: NODE_WIDTH,
@@ -612,7 +669,7 @@ export function ExecutionFlow({
     });
 
     return { rfNodes, rfEdges };
-  }, [anchor, mode, firedMethods, liveValues]);
+  }, [anchor, mode, firedMethods, liveValues, hookFailed]);
 
   // Honor the controlled selectedNodeId.
   const styledNodes = useMemo(() => {

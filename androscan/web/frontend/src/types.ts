@@ -60,9 +60,9 @@ export type ChatSkillCall = {
 // ``SkillWidget``; future widget kinds add as new union members
 // without breaking the renderer (the ``<ChatWidgetRenderer>``
 // dispatcher gracefully handles unknown ``kind``s by rendering only
-// the assistant text). v2.1.5 ships ONE kind:
-// ``trace_entry_candidate`` — the first consumer of the chat-widget
-// pattern (DEC-025 v2.1 closing-note Q7).
+// the assistant text). v2.1.5 ships the first consumer
+// (``trace_entry_candidate``); Phase 13 sub-step 13.9 adds the
+// second (``method_summary``).
 export type TraceEntryCandidateWidgetData = {
   kind: "trace_entry_candidate";
   smali_id: string;
@@ -70,7 +70,42 @@ export type TraceEntryCandidateWidgetData = {
   confidence: number;
 };
 
-export type ChatWidget = TraceEntryCandidateWidgetData;
+/** Phase 13 sub-step 13.9 / DEC-029 — chat-widget rendering of a
+ *  per-method LLM summary emitted by the ``summarise_method``
+ *  skill. Mirrors the backend
+ *  :class:`androscan.skills.base.MethodSummaryWidget` dataclass
+ *  field-for-field (the SSE wire shape is ``dataclasses.asdict``
+ *  on the BE; the FE union member is the typed receiver). The
+ *  ``<MethodSummaryWidget>`` component renders this as a card
+ *  with the summary paragraph + a ``cached`` pill (when applicable)
+ *  + three action buttons (Hook this method / Trace this gate /
+ *  Open source) that mirror the Inspector pane's action row. */
+export type MethodSummaryWidgetData = {
+  kind: "method_summary";
+  /** ``Lcom/example/Foo;`` — Smali class descriptor. Used as the
+   *  canonical class id by the action handlers' Trace this gate
+   *  affordance (constructs the full Smali signature inline). */
+  class_smali: string;
+  /** ``com.example.Foo`` — Java-dotted class name (inner-class
+   *  suffix stripped by the BE). Drives ``pendingHookPrefill.params
+   *  .class_name`` + ``pendingCodeNav.className``. */
+  class_name: string;
+  /** ``onClick`` — bare method name. */
+  method_name: string;
+  /** ``(Landroid/view/View;)V`` — Smali method descriptor. */
+  descriptor: string;
+  /** The LLM-generated paragraph (3-5 sentences). */
+  summary: string;
+  /** ``true`` when the summary was loaded from
+   *  ``skill_results_cache`` rather than a fresh LLM round-trip;
+   *  drives the FE's ``(cached)`` muted pill so the operator can
+   *  tell at a glance whether the answer is fresh or replayed. */
+  cached: boolean;
+};
+
+export type ChatWidget =
+  | TraceEntryCandidateWidgetData
+  | MethodSummaryWidgetData;
 
 export type ChatMessage = {
   id: string;

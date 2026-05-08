@@ -45,15 +45,17 @@ from androscan.config import Config
 from androscan.internal.app_meta import save_app_meta
 from androscan.internal import skill_results_cache
 from androscan.skills import _REGISTRY, execute as execute_skill
-from androscan.skills.base import SkillContext, SkillResult
+from androscan.skills.base import MethodSummaryWidget, SkillContext, SkillResult
 from androscan.skills.summarise_method import (
     SOURCE_BODY_BUDGET_BYTES,
     SUMMARY_SKILL_ID,
     USER_PROMPT_HEAD_TEMPLATE,
     _normalise_descriptor,
     _summary_cache_params,
+    build_method_summary_widget,
     build_summary_prompt,
     execute,
+    smali_class_to_java_dotted,
     smali_to_source_rel_path,
 )
 from androscan.web.app import _build_summarise_method_callable
@@ -731,3 +733,197 @@ def test_build_summarise_method_callable_failed_skill_raises(monkeypatch) -> Non
     )
     with pytest.raises(RuntimeError, match="LLM down"):
         asyncio.run(cb("test-app", "Lcom/example/Foo;", "bar", "(I)Z"))
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 sub-step 13.9 — MethodSummaryWidget emission on the
+# ``SkillResult.widgets`` channel. The widget is the second consumer
+# of the channel after Phase 11 v2.1.5's
+# :class:`TraceEntryCandidateWidget`; the chat agentic loop forwards
+# it via the ``widget`` SSE event so the chat dock can render an
+# interactive card with the summary text + cached pill + action
+# buttons (Hook this method / Trace this gate / Open source).
+
+
+class TestPhase13_9_MethodSummaryWidget:
+    """Pinned shape for the 13.9 chat-widget extension. v1 invariants:
+    fresh-LLM path → widget with ``cached=False``; cache-hit path →
+    widget with ``cached=True``; ``class_name`` is Java-dotted (not
+    Smali) so the FE's action handlers can populate
+    ``pendingHookPrefill.params.class_name`` +
+    ``pendingCodeNav.className`` directly without a Smali↔Java
+    translation step. ``summary`` field byte-equal to the
+    ``SkillResult.text`` so the FE doesn't need two sources of
+    truth."""
+
+    def test_smali_class_to_java_dotted_top_level(self) -> None:
+        assert (
+            smali_class_to_java_dotted("Lcom/example/Foo;")
+            == "com.example.Foo"
+        )
+
+    def test_smali_class_to_java_dotted_inner_class_strips_suffix(self) -> None:
+        """Inner classes resolve to the OUTER class — jadx emits
+        inner classes inside the outer file, and the FE's
+        ``pendingCodeNav`` carries the outer class for the cross-tab
+        nav to land on the file containing the method body."""
+        assert (
+            smali_class_to_java_dotted("Lcom/example/Foo$Bar;")
+            == "com.example.Foo"
+        )
+
+    def test_smali_class_to_java_dotted_malformed_returns_empty(self) -> None:
+        """Empty / malformed input fail-opens to ``""`` — the widget
+        still renders, just with an empty class chip on the FE."""
+        assert smali_class_to_java_dotted("") == ""
+        assert smali_class_to_java_dotted("not-smali") == ""
+        assert smali_class_to_java_dotted("L;") == ""
+
+    def test_build_method_summary_widget_locks_field_shape(self) -> None:
+        """:func:`build_method_summary_widget` returns a
+        :class:`MethodSummaryWidget` with the v1 field shape pinned —
+        ``kind`` discriminator + the four identifying fields +
+        ``summary`` + ``cached``. Pinned so a future schema change
+        lands in BOTH the dataclass + the FE
+        :type:`MethodSummaryWidgetData` type."""
+        w = build_method_summary_widget(
+            "Lcom/example/Foo;", "validatePin", "(I)Z", "summary text",
+            cached=False,
+        )
+        assert isinstance(w, MethodSummaryWidget)
+        assert w.kind == "method_summary"
+        assert w.class_smali == "Lcom/example/Foo;"
+        assert w.class_name == "com.example.Foo"
+        assert w.method_name == "validatePin"
+        assert w.descriptor == "(I)Z"
+        assert w.summary == "summary text"
+        assert w.cached is False
+
+    def test_build_method_summary_widget_cached_flag_propagates(self) -> None:
+        """``cached=True`` round-trips so the FE can render the
+        ``(cached)`` muted pill alongside the summary paragraph."""
+        w = build_method_summary_widget(
+            "Lcom/example/Foo;", "bar", "()V", "cached prose", cached=True,
+        )
+        assert w.cached is True
+
+    def test_execute_emits_method_summary_widget_on_fresh_llm(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """Fresh-LLM happy path → ``SkillResult.widgets`` contains
+        exactly ONE :class:`MethodSummaryWidget` with ``cached=False``
+        and ``summary == result.text``. The widget is the
+        chat-agentic-loop SSE channel's payload — pinned so the
+        ``<MethodSummaryWidget>`` FE renderer reads the same fields
+        the BE writes."""
+        apps_root, app_dir = _make_app_with_decompile(tmp_path)
+
+        class _StubResult:
+            content = "Validates a 4-digit PIN."
+            thinking = ""
+            metadata = {}
+
+        monkeypatch.setattr(
+            "androscan.llm.client.complete",
+            lambda prompt, **kw: _StubResult(),
+        )
+
+        ctx = _make_skill_context(app_dir)
+        result = execute(
+            {
+                "class_smali": "Lcom/example/Foo;",
+                "method_name": "validatePin",
+                "descriptor": "(I)Z",
+                "app_id": "test-app",
+            },
+            ctx,
+        )
+        assert result.success is True
+        assert len(result.widgets) == 1
+        w = result.widgets[0]
+        assert isinstance(w, MethodSummaryWidget)
+        assert w.kind == "method_summary"
+        assert w.class_smali == "Lcom/example/Foo;"
+        assert w.class_name == "com.example.Foo"
+        assert w.method_name == "validatePin"
+        assert w.descriptor == "(I)Z"
+        assert w.summary == result.text
+        assert w.cached is False
+
+    def test_execute_emits_cached_widget_on_cache_hit(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """Cache-hit branch → widget with ``cached=True``. Pinned so
+        the FE can distinguish a replayed summary from a fresh
+        round-trip without a separate signal."""
+        apps_root, app_dir = _make_app_with_decompile(tmp_path)
+        skill_results_cache.store(
+            apps_root, "test-app", "test-run", "summarise_method",
+            {"app_sha": _APP_SHA, "class_smali": "Lcom/example/Foo;",
+             "method_name": "validatePin", "descriptor": "(I)Z"},
+            "previously cached summary",
+        )
+
+        monkeypatch.setattr(
+            "androscan.llm.client.complete",
+            lambda p, **kw: pytest.fail("LLM should not be called on cache hit"),
+        )
+
+        ctx = _make_skill_context(app_dir)
+        result = execute(
+            {
+                "class_smali": "Lcom/example/Foo;",
+                "method_name": "validatePin",
+                "descriptor": "(I)Z",
+                "app_id": "test-app",
+            },
+            ctx,
+        )
+        assert result.success is True
+        assert result.text == "previously cached summary"
+        assert len(result.widgets) == 1
+        w = result.widgets[0]
+        assert isinstance(w, MethodSummaryWidget)
+        assert w.summary == "previously cached summary"
+        assert w.cached is True
+
+    def test_execute_failed_paths_emit_no_widget(
+        self, monkeypatch, tmp_path: Path,
+    ) -> None:
+        """Fail-soft / fail-open paths (missing args, LLM exception,
+        empty LLM response) DO NOT emit a widget — the chat dock
+        would otherwise render an interactive card on a failed
+        summary which would confuse the operator. Only successful
+        summaries (fresh or cached) carry the widget."""
+        # Missing class_smali → SkillResult(success=False, widgets=())
+        ctx = SkillContext(
+            config=Config.default(), run_folder=Path("apps/test/r"),
+        )
+        result = execute({"method_name": "x", "descriptor": "()V"}, ctx)
+        assert result.success is False
+        assert result.widgets == ()
+
+        # LLM returns empty → SkillResult(success=False, widgets=())
+        apps_root, app_dir = _make_app_with_decompile(tmp_path)
+
+        class _EmptyResult:
+            content = ""
+            thinking = ""
+            metadata = {}
+
+        monkeypatch.setattr(
+            "androscan.llm.client.complete",
+            lambda p, **kw: _EmptyResult(),
+        )
+        ctx2 = _make_skill_context(app_dir)
+        result2 = execute(
+            {
+                "class_smali": "Lcom/example/Foo;",
+                "method_name": "validatePin",
+                "descriptor": "(I)Z",
+                "app_id": "test-app",
+            },
+            ctx2,
+        )
+        assert result2.success is False
+        assert result2.widgets == ()

@@ -7496,3 +7496,230 @@ code { color: var(--accent); }
   vertical-align: bottom;
 }
 
+/* ===========================================================================
+ * Phase 13 sub-step 13.9 — Threshold-color Run dynamic-trace button
+ * (DEC-029 lock-in) + runtime-confirmed inlined emphasis (ExecutionFlow
+ * MethodNode + Inspector callout) + chat-rendered MethodSummaryWidget
+ * card chrome + Inspector summary "Discuss in chat" affordance.
+ * --------------------------------------------------------------------------- */
+
+/* --- Threshold-colored Run button ----------------------------------------- */
+/*
+ * Four bands: green ≤ 20 / yellow 21-50 / orange 51-100 / red > 100.
+ * Colour comes from the existing semantic tokens (var(--ok) / var(--warn)
+ * / var(--err)); orange has no token so we mix warn + err to land on a
+ * 50-50 amber. Each band sets background + border + colour + a soft
+ * inset highlight matching the existing trace-* button surfaces. The
+ * isRunning state's ``-running`` class neutralises the band tint via
+ * specificity (declared after ``-band-*`` rules in source order, which
+ * is enough — same selector strength).
+ */
+
+.lab-dynamic-trace-button-green {
+  background: color-mix(in srgb, var(--ok) 20%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 55%, var(--border));
+  color: var(--ok);
+}
+.lab-dynamic-trace-button-green:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ok) 30%, transparent);
+  border-color: var(--ok);
+}
+
+.lab-dynamic-trace-button-yellow {
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  border-color: color-mix(in srgb, var(--warn) 50%, var(--border));
+  color: var(--warn);
+}
+.lab-dynamic-trace-button-yellow:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--warn) 28%, transparent);
+  border-color: var(--warn);
+}
+
+.lab-dynamic-trace-button-orange {
+  /* Mid-amber blend (warn + err halved) — no dedicated token. */
+  background: color-mix(in srgb,
+    color-mix(in srgb, var(--warn) 50%, var(--err)) 22%,
+    transparent);
+  border-color: color-mix(in srgb,
+    color-mix(in srgb, var(--warn) 50%, var(--err)) 60%,
+    var(--border));
+  color: color-mix(in srgb, var(--warn) 50%, var(--err));
+}
+.lab-dynamic-trace-button-orange:hover:not(:disabled) {
+  background: color-mix(in srgb,
+    color-mix(in srgb, var(--warn) 50%, var(--err)) 32%,
+    transparent);
+  border-color: color-mix(in srgb, var(--warn) 50%, var(--err));
+}
+
+.lab-dynamic-trace-button-red {
+  background: color-mix(in srgb, var(--err) 22%, transparent);
+  border-color: color-mix(in srgb, var(--err) 55%, var(--border));
+  color: var(--err);
+}
+.lab-dynamic-trace-button-red:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--err) 32%, transparent);
+  border-color: var(--err);
+}
+
+/* --- Runtime-confirmed inlined emphasis (ExecutionFlow MethodNode) -------- */
+/*
+ * The static heuristic state (``possiblyInlined``) renders the cool-gray
+ * dashed-border look that 13.6 shipped. The runtime-confirmed state
+ * (``hookFailed`` for this overload key) adds a louder warn-orange dashed
+ * border + a saturated background tint so the operator can spot the
+ * runtime-confirmed nodes at a glance against a busy graph. ``-runtime``
+ * is declared AFTER ``-inlined`` in source order so cascade specificity
+ * promotes the runtime colour over the static colour.
+ */
+
+.execution-flow-node-inlined-runtime {
+  border-style: dashed !important;
+  border-color: var(--warn) !important;
+  background: color-mix(in srgb, var(--warn) 10%, var(--surface)) !important;
+}
+
+.execution-flow-node-inlined-pill-runtime {
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 60%, var(--border));
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* --- Inspector — runtime-confirmed inlined pill + callout ----------------- */
+
+.inspector-inlined-pill-runtime {
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 60%, var(--border));
+  color: var(--warn);
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.inspector-inlined-callout-runtime {
+  /* Stronger emphasis than the muted-small static callout — runtime
+   * confirmation is operator-actionable, not a neutral observation. */
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border-left: 2px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  color: var(--text);
+  line-height: 1.4;
+  border-radius: 2px;
+}
+
+/* --- Inspector — Discuss-in-chat affordance ------------------------------- */
+
+.inspector-summary-discuss-button {
+  appearance: none;
+  margin-top: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.12s ease-out, border-color 0.12s ease-out;
+}
+
+.inspector-summary-discuss-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: var(--accent);
+}
+
+.inspector-summary-discuss-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* --- Chat-widget — MethodSummaryWidget ------------------------------------ */
+/*
+ * Mirrors the .chat-widget-trace-entry-candidate-* namespace (Phase 11
+ * v2.1.5) field-for-field so the two widget kinds read consistently
+ * when they appear back-to-back in the chat dock — same border + same
+ * accent-stripe gestalt, different content layout. The card carries
+ * three action buttons in a row (Hook this method / Trace this gate /
+ * Open source) — DEC-029 keeps these in sync with the Inspector pane's
+ * action row so the operator's mental model is "the chat-card and the
+ * Inspector show the same actions".
+ */
+
+.chat-widget-method-summary {
+  border-left: 3px solid var(--accent);
+}
+
+.chat-widget-method-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.4rem;
+}
+
+.chat-widget-method-summary-sig {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-widget-method-summary-cached-pill {
+  display: inline-block;
+  font-size: 0.65rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+  text-transform: lowercase;
+}
+
+.chat-widget-method-summary-text {
+  margin: 0 0 0.55rem;
+  font-size: 0.78rem;
+  color: var(--text);
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.chat-widget-method-summary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+
+.chat-widget-method-summary-button {
+  appearance: none;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.74rem;
+  font-weight: 600;
+  padding: 0.3rem 0.7rem;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background-color 0.12s ease-out, border-color 0.12s ease-out;
+}
+
+.chat-widget-method-summary-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 25%, var(--surface));
+  border-color: var(--accent);
+}
+
+.chat-widget-method-summary-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+

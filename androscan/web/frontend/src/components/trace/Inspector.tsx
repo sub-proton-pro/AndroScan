@@ -113,6 +113,7 @@ import type {
   BehaviorAnchor,
   BypassPlan,
   DecisionPoint,
+  HookFailureRecord,
   LiveValueRecord,
   MethodRef,
   PredicateOrigin,
@@ -274,6 +275,14 @@ type Props = {
    *  to keep the Inspector compact when the operator has explicitly
    *  asked for the static-only view. */
   mode?: TraceMode;
+  /** Phase 13 sub-step 13.9 — runtime ``hook_failed`` events from
+   *  the dynamic-trace WebSocket, keyed by overload key. When the
+   *  selected method's overload key is present in this map, the
+   *  Inspector upgrades the (previously cool-gray heuristic)
+   *  ``Possibly inlined`` callout to a runtime-confirmed warn-orange
+   *  state — the operator now knows for certain Frida couldn't
+   *  install the hook (R8 inlining is the most common cause). */
+  hookFailed?: ReadonlyMap<string, HookFailureRecord>;
 };
 
 
@@ -286,9 +295,16 @@ export function Inspector({
   summaries,
   liveValues,
   mode = "static",
+  hookFailed,
 }: Props) {
-  const { setPendingHookPrefill, setPendingTraceEntry, setPendingCodeNav, setLabMode, setTab } =
-    useWorkbench();
+  const {
+    setPendingHookPrefill,
+    setPendingTraceEntry,
+    setPendingCodeNav,
+    setPendingChatPrefill,
+    setLabMode,
+    setTab,
+  } = useWorkbench();
 
   const resolved = useMemo<ResolvedMethod | null>(
     () => (selectedNodeId ? resolveSelection(anchor, selectedNodeId) : null),
@@ -344,6 +360,14 @@ export function Inspector({
   const summary = summaries?.get(oKey);
   const live = liveValues?.get(oKey) ?? null;
   const showLiveObservation = (mode === "dynamic" || mode === "both") && live != null;
+  // 13.9 — runtime ``hook_failed`` confirmation. If the active
+  // dynamic trace fired a ``hook_failed`` event for any overload of
+  // this method, surface the runtime-confirmed inlined state. The
+  // ``hookFailed`` map is keyed by overload key, so a single match
+  // is enough to confirm the whole stack. ``null`` when no runtime
+  // confirmation has landed (Inspector falls back to the static
+  // ``possiblyInlined`` heuristic).
+  const runtimeInlined = hookFailed?.get(oKey) ?? null;
 
   const onHookThisMethod = () => {
     if (!appId) return;
@@ -359,6 +383,44 @@ export function Inspector({
       sourceLabel: `Inspector: ${canonical.class_name}.${canonical.method_name}`,
     });
     setLabMode("manual-hooks");
+  };
+
+  // 13.9 — "Discuss in chat" affordance on the Summary section.
+  // Writes ``pendingChatPrefill`` with a method-specific prompt
+  // template that pre-arms the agentic loop with the four
+  // identifying fields the ``summarise_method`` skill needs;
+  // operator reviews / sends, the LLM calls the skill, and the
+  // skill emits a ``MethodSummaryWidget`` (13.9 BE extension)
+  // alongside its text — so the chat dock surfaces the same
+  // summary as an interactive card. When ``app_id`` is missing the
+  // affordance is disabled (matches the Trace / Hook this method
+  // posture).
+  const onDiscussInChat = () => {
+    if (!appId) return;
+    // Prompt template — descriptive enough that the LLM picks the
+    // right skill but free-form enough that the operator can edit
+    // it before sending. The four fields are pre-baked verbatim so
+    // the LLM doesn't have to guess at the Smali shape (the chat
+    // dock's auto-complete on Smali signatures is operator-aided,
+    // not LLM-aided, so a deterministic prefill is the path of
+    // least friction).
+    const params = (canonical.param_descriptors || []).join("");
+    const ret = canonical.return_descriptor || "V";
+    const descriptor = `(${params})${ret}`;
+    const message = [
+      `Tell me more about \`${canonical.class_name}.${canonical.method_name}${descriptor}\`.`,
+      "",
+      "Use the `summarise_method` skill to fetch / generate the summary, then explain what this method does and how a security tester should think about it. Skill params:",
+      `  class_smali = \"L${(canonical.class_name || "").replace(/\./g, "/")};\"`,
+      `  method_name = \"${canonical.method_name}\"`,
+      `  descriptor  = \"${descriptor}\"`,
+      `  app_id      = \"${appId}\"`,
+    ].join("\n");
+    setPendingChatPrefill({
+      tab: "lab",
+      message,
+      sourceLabel: `Inspector → summarise_method (${canonical.class_name}.${canonical.method_name})`,
+    });
   };
 
   const onTraceThisGate = () => {
@@ -410,13 +472,49 @@ export function Inspector({
                 ×{overloadCount} overloads
               </span>
             )}
-            {possiblyInlined && (
-              <span className="inspector-inlined-pill" title="Method appears as a target but not as a decision source — likely R8-inlined">
-                possibly inlined
+            {/* 13.9 — pill state machine. ``runtimeInlined`` (a
+                ``hook_failed`` event for this overload key)
+                upgrades the cool-gray static heuristic pill to a
+                warn-orange runtime-confirmed pill. ``runtimeInlined``
+                takes precedence; we render either the runtime pill
+                OR the static pill, never both. */}
+            {runtimeInlined ? (
+              <span
+                className="inspector-inlined-pill inspector-inlined-pill-runtime"
+                title={`Frida couldn't install this hook at runtime (reason: ${runtimeInlined.reason}) — R8 likely inlined the method`}
+              >
+                inlined (runtime-confirmed)
               </span>
+            ) : (
+              possiblyInlined && (
+                <span
+                  className="inspector-inlined-pill"
+                  title="Method appears as a target but not as a decision source — likely R8-inlined"
+                >
+                  possibly inlined
+                </span>
+              )
             )}
           </div>
-          {possiblyInlined && (
+          {/* 13.9 — callout state machine. Runtime-confirmed
+              callout supersedes the static heuristic copy with a
+              clearer, action-oriented message. */}
+          {runtimeInlined && (
+            <p className="inspector-inlined-callout inspector-inlined-callout-runtime small">
+              <span aria-hidden="true">⚠</span>{" "}Runtime-confirmed:
+              Frida raised{" "}
+              <code>{runtimeInlined.reason}</code>
+              {" "}for this method during the active trace
+              {runtimeInlined.error ? (
+                <>
+                  {" "}(<span className="muted">{runtimeInlined.error}</span>)
+                </>
+              ) : null}
+              . R8 most likely inlined the method into its callers; try
+              hooking the caller method instead.
+            </p>
+          )}
+          {possiblyInlined && !runtimeInlined && (
             <p className="inspector-inlined-callout muted small">
               This method couldn't be located as a decision source — R8
               may have inlined it. Hooking via Frida may fail; check
@@ -466,6 +564,28 @@ export function Inspector({
               </p>
             </div>
           )}
+          {/* 13.9 — "Discuss in chat" affordance. Always visible on
+              non-synthetic methods (the operator may want to ask
+              about a method even before its summary lands or after
+              one fails); writes a method-specific
+              ``pendingChatPrefill`` that pre-arms the agentic loop
+              with the four ``summarise_method`` params. The chat
+              dock auto-opens via the existing
+              ``pendingChatPrefill`` consumer in
+              :mod:`LabTraceMode`. */}
+          <button
+            type="button"
+            className="inspector-summary-discuss-button"
+            onClick={onDiscussInChat}
+            disabled={!appId}
+            title={
+              appId
+                ? "Open the Lab chat dock with a prompt that runs summarise_method for this method"
+                : "Select an app first to discuss this method in chat"
+            }
+          >
+            Discuss in chat
+          </button>
         </section>
 
         {/* 13.8 — Live observation panel. Only renders when the

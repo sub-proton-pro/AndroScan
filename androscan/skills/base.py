@@ -101,12 +101,70 @@ class TraceEntryCandidateWidget:
     visual hierarchy)."""
 
 
-# ``SkillWidget`` is a typed union — ``TraceEntryCandidateWidget`` is
-# the first member; future widget kinds add here. The chat agentic
-# loop's SSE-event payload for a widget is the dataclass's
-# ``__dict__`` (so the JSON wire format mirrors the dataclass shape
-# exactly, ``kind`` field included for the frontend dispatcher).
-SkillWidget = Union[TraceEntryCandidateWidget]
+@dataclass(frozen=True)
+class MethodSummaryWidget:
+    """LLM-emitted method summary card. Phase 13 sub-step 13.9 /
+    DEC-029. Rendered by the chat dock as a compact card with the
+    method's signature header, the LLM-generated summary paragraph,
+    a ``cached`` pill when the summary came from
+    ``skill_results_cache`` (no fresh LLM call), and three action
+    buttons mirroring the Inspector's action row: ``[Hook this
+    method]`` (writes ``pendingHookPrefill`` with the
+    ``entry_exit_log`` template), ``[Trace this gate]`` (writes
+    ``pendingTraceEntry`` with the full Smali signature), and
+    ``[Open source]`` (writes ``pendingCodeNav`` and flips the tab
+    to Inspect).
+
+    The widget is the second consumer of the ``SkillResult.widgets``
+    channel (after :class:`TraceEntryCandidateWidget`); the agentic
+    loop forwards it via the SSE ``widget`` event verbatim. ``kind``
+    discriminator on the FE matches ``"method_summary"``.
+
+    Field shape is deliberately self-contained — the action handlers
+    on the FE construct the cross-tab pendings from the widget's
+    fields directly (no extra round-trip back to the BE), mirroring
+    how :class:`TraceEntryCandidateWidget`'s ``smali_id`` drives the
+    "Trace this" button without needing a round-trip.
+    """
+
+    kind: Literal["method_summary"] = "method_summary"
+    class_smali: str = ""
+    """Smali-form class descriptor (e.g.
+    ``Lcom/example/MainActivity;``). Used as the canonical class id
+    by the FE's action handlers."""
+    class_name: str = ""
+    """Java-dotted class name (e.g. ``com.example.MainActivity``).
+    Inner-class suffix stripped (jadx emits inner classes inside
+    the outer-class file). Drives ``pendingHookPrefill.params.class_name``
+    + ``pendingCodeNav.className``."""
+    method_name: str = ""
+    """Bare method name (e.g. ``onClick``). Drives
+    ``pendingHookPrefill.params.method_name`` +
+    ``pendingCodeNav.method``."""
+    descriptor: str = ""
+    """Smali method descriptor (e.g. ``(Landroid/view/View;)V``).
+    Carried for the chat-side "Trace this gate" affordance which
+    constructs the full Smali signature inline."""
+    summary: str = ""
+    """The LLM-generated paragraph (3-5 sentences). Capped at the
+    skill's :data:`SOURCE_BODY_BUDGET_BYTES`-derived prompt budget
+    so the per-widget envelope stays under DEC-022's per-skill 6 KB
+    output budget."""
+    cached: bool = False
+    """``True`` when the summary was loaded from
+    :mod:`skill_results_cache` rather than a fresh LLM round-trip.
+    Drives the FE's "(cached)" pill so the operator can tell at a
+    glance whether the answer is fresh or replayed."""
+
+
+# ``SkillWidget`` is a typed union — additive-by-design (DEC-022 +
+# DEC-025 v2.1 closing-note Q7 (ii)). New widget kinds add here as
+# new union members; the FE's ``<ChatWidgetRenderer>`` dispatcher
+# gracefully ignores unknown kinds. The chat agentic loop's SSE
+# payload for a widget is the dataclass's ``asdict`` (so the JSON
+# wire format mirrors the dataclass shape exactly, ``kind`` field
+# included for the frontend dispatcher).
+SkillWidget = Union[TraceEntryCandidateWidget, MethodSummaryWidget]
 
 
 @dataclass
