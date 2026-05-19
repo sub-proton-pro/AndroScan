@@ -7837,6 +7837,24 @@ code { color: var(--accent); }
   background: var(--bg);
   border-radius: 0;
   box-shadow: 0 0 0 1px var(--border-strong);
+  /* DEC-030 Q7 (a) v2.0 hotfix 2026-05-19 — the base
+   * ``.execution-flow-container`` rule pins ``width: 100%`` +
+   * ``height: 560px`` so the in-page flowchart sits at a stable
+   * card height. When ``position: fixed`` lands, those rules still
+   * win over ``inset: 0``'s right + bottom offsets (CSS computes
+   * non-auto width/height as the source of truth and ignores the
+   * opposite-side inset). The fullscreen container then renders at
+   * 100% × 560px pinned to (0, 0) — the operator sees the workbench
+   * chrome leaking through below the flowchart. Explicit
+   * ``100vw`` × ``100vh`` overrides the base sizing so the
+   * container actually fills the viewport; the explicit values
+   * win over the ``auto`` route since flex children + complex
+   * cascades have edge cases where ``auto`` resolves to the
+   * intrinsic flowchart height rather than the viewport. The
+   * pre-existing ``flex: 1 1 auto`` doesn't matter here because
+   * ``position: fixed`` removes the element from the flex flow. */
+  width: 100vw;
+  height: 100vh;
 }
 
 /* Panel wraps the toggle button so React Flow's ``<Panel>``
