@@ -11,6 +11,44 @@
  * 13.6 spec — the FE rendering surface is verified by ``tsc
  * --noEmit`` + ``vite build`` only).
  *
+ * **Phase 13 v2.0 update (DEC-030).** Three pure-helper changes
+ * land in this revision; behavior under the v1 lock (DEC-029) is
+ * preserved for every code path not explicitly listed.
+ *
+ *   * **Q1 = (g) — neutral / unverdicted sink emission unchanged
+ *     in shape but tagged for "small de-emphasized" rendering.**
+ *     Per-source ``__sink_neutral__::<sourceId>`` ids stay (operator
+ *     keeps a per-gate anchor for misclassification spotting per
+ *     the false-negative concern that drove the lock). The renderer
+ *     reads ``kind === "sink_neutral"`` to switch to the 110×36
+ *     dashed-border de-emphasized variant.
+ *
+ *   * **Q2 = (a) — ALLOW / DENY sinks coalesce globally.** Source-
+ *     keyed ids ``__sink_allow__::<sourceId>`` / ``__sink_deny__::
+ *     <sourceId>`` flatten to module-level constants ``GLOBAL_ALLOW_
+ *     SINK_ID`` / ``GLOBAL_DENY_SINK_ID``. All allow / deny verdict
+ *     branches from every source in the anchor converge on ONE
+ *     terminal per kind. The classifier is confident on allow / deny
+ *     so per-source anchors aren't worth their visual weight.
+ *
+ *   * **Gate-count fields** ``totalGates`` + ``unclassifiedGates``
+ *     are populated per ``ExecutionFlowNode`` from the anchor's
+ *     decision list. Drives the per-method gate-count badge in the
+ *     renderer's hover-progressive disclosure (Q1 = (g) again —
+ *     badge is rendered always but CSS-hidden until ``:hover`` /
+ *     ``:focus-within``). Both fields land at zero for entry-only
+ *     methods + plan-target-only methods + synthetic sinks.
+ *
+ * The within-column sort (Q5 = (b) — entry first → real methods
+ * alphabetic → synthetics last) lives in the consumer's
+ * ``layoutNodes`` because that's where the rank-grouped sort
+ * happens; this module just exposes ``isSynthetic`` + ``kind`` so
+ * the consumer can implement the lock. The context-stroke
+ * arrowhead fix (Q3 = (a)) lives entirely in ``App.css``. The
+ * within-page fullscreen toggle (Q7 = (a)) lives entirely in
+ * ``ExecutionFlow.tsx`` + ``App.css``. None of those three locks
+ * touch this pure helper.
+ *
  * Translation rules locked at DEC-029's canonical
  * ``phase-13-trace-mockup.canvas.tsx`` mockup:
  *
@@ -144,6 +182,37 @@ export type ExecutionFlowNode = {
   /** Synthetic sinks have no ``MethodRef`` — render lighter +
    *  no inspector click. */
   isSynthetic: boolean;
+  /** Phase 13 v2.0 (DEC-030 Q1 = (g)) — total decision count for
+   *  this method (= number of ``DecisionPoint`` entries on the
+   *  anchor whose ``method`` overload-key matches this node).
+   *  Drives the per-method gate-count badge in the renderer's
+   *  hover-progressive disclosure (CSS-hidden by default, revealed
+   *  on ``:hover`` / ``:focus-within``). Always ``0`` for synthetic
+   *  sinks, plan-target-only methods, and any method that doesn't
+   *  appear as a ``DecisionPoint.method`` source. */
+  totalGates: number;
+  /** Phase 13 v2.0 (DEC-030 Q1 = (g)) — count of this method's
+   *  decisions whose verdict is ``neutral`` OR has no
+   *  ``branch_outcome`` at all (slicer hit max-walk on the
+   *  predicate origin). These are the misclassification-risk
+   *  cases the operator wants to spot at a glance — the
+   *  ``branch_classifier`` is keyword-based and known to false-
+   *  negative on obfuscated strings / non-English deny copy /
+   *  custom-predicate gates (see
+   *  :mod:`androscan.analysis.branch_classifier`'s docstring "Out
+   *  of scope for v1" section for the catalog). ``unclassifiedGates
+   *  <= totalGates`` always. */
+  unclassifiedGates: number;
+  /** Phase 13 v2.0 (DEC-030 Q1 = (g)) — for synthetic
+   *  ``sink_neutral`` nodes only, the list of (source method title,
+   *  decision instruction index, edge kind) tuples that feed this
+   *  sink. Drives the sink-hover tooltip so the operator can see
+   *  which gates feed a given de-emphasized neutral sink without
+   *  having to traverse every edge. Empty array for non-sink
+   *  nodes and for global ALLOW / DENY sinks (those sinks are
+   *  always operator-meaningful as "all paths to allow / deny"
+   *  without per-gate breakdown). */
+  feedingGates: Array<{ sourceTitle: string; instructionIndex: number; verdictKind: ExecutionFlowEdge["kind"] }>;
 };
 
 /** One edge between two nodes. */
@@ -177,6 +246,15 @@ export type ExecutionFlowGraph = {
 // 13.10 may unify the FE constants into a shared module.
 
 const HIGH_CONFIDENCE_THRESHOLD = 0.85;
+
+// Phase 13 v2.0 (DEC-030 Q2 = (a)) — synthetic ALLOW / DENY sinks
+// coalesce into ONE node per kind across the whole anchor.
+// Module-level constants so the renderer can compare against them
+// without re-deriving the id shape. ``sink_neutral`` stays per-source
+// (DEC-030 Q1 = (g) — operator wants a per-gate anchor for
+// misclassification spotting).
+export const GLOBAL_ALLOW_SINK_ID = "__sink_allow__";
+export const GLOBAL_DENY_SINK_ID = "__sink_deny__";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -285,6 +363,45 @@ function hasCandidateGate(
     }
   }
   return false;
+}
+
+/** Phase 13 v2.0 (DEC-030 Q1 = (g)) — count this method's decisions
+ *  and the subset that are unclassified (verdict === ``neutral`` OR
+ *  no ``branch_outcome`` at all). Drives the per-method gate-count
+ *  badge in the renderer. A decision counts as "unclassified" when
+ *  the branch_classifier (heuristic / keyword-based per Phase 10
+ *  sub-step 10.3) failed to confidently land an ``allow`` or
+ *  ``deny`` verdict — the misclassification-risk surface the badge
+ *  surfaces to the operator. */
+function gateCountsFor(
+  decisions: DecisionPoint[],
+  key: string,
+): { total: number; unclassified: number } {
+  let total = 0;
+  let unclassified = 0;
+  for (const d of decisions) {
+    if (overloadKey(d.method) !== key) continue;
+    total += 1;
+    const o: BranchOutcome | null = d.branch_outcome;
+    if (!o || o.verdicts.length === 0) {
+      // No outcome at all — slicer hit max-walk on the predicate
+      // origin. Same operator-uncertainty signal as a neutral
+      // classification.
+      unclassified += 1;
+      continue;
+    }
+    // A decision is "classified" iff at least one of its branches
+    // earned an allow / deny verdict. Mixed verdicts (e.g. one
+    // branch allow + one branch neutral) count as classified
+    // because the classifier landed actionable signal somewhere.
+    const hasActionable = o.verdicts.some(
+      (v) => v.verdict === "allow" || v.verdict === "deny",
+    );
+    if (!hasActionable) {
+      unclassified += 1;
+    }
+  }
+  return { total, unclassified };
 }
 
 /** Walk the bypass-plan list to find a target method whose
@@ -399,6 +516,7 @@ export function buildExecutionFlowGraph(
     const hasGate = hasCandidateGate(anchor.decisions, key);
     const possiblyInlined =
       !c.isDecisionSource && (c.isPlanTarget || c.isDecisionTarget);
+    const gateCounts = gateCountsFor(anchor.decisions, key);
 
     nodes.push({
       id: methodKey(c.canonical),
@@ -412,17 +530,70 @@ export function buildExecutionFlowGraph(
       possiblyInlined,
       layoutRank: -1, // assigned below
       isSynthetic: false,
+      totalGates: gateCounts.total,
+      unclassifiedGates: gateCounts.unclassified,
+      feedingGates: [],
     });
   }
 
   // Phase 3 — emit edges. For each decision, walk every
   // (branch, verdict) pair and route to either a plan-resolved
   // target node or a synthetic verdict-flavored sink.
+  //
+  // Phase 13 v2.0 (DEC-030): ALLOW / DENY sinks coalesce to ONE
+  // global node per kind across the whole anchor (Q2 = (a)); NEUTRAL
+  // sinks stay per-source so the operator keeps a per-gate anchor
+  // for misclassification spotting (Q1 = (g)); per-source NEUTRAL
+  // sinks carry ``feedingGates`` so the renderer can populate a
+  // hover tooltip listing the upstream gates.
   const allPlans: BypassPlan[] = [...anchor.plans, ...anchor.advanced_plans];
+
+  /** Ensure a synthetic sink node exists in ``synthSinks`` and
+   *  return it. Handles the per-kind dispatch (global ALLOW / DENY,
+   *  per-source NEUTRAL) and seeds the operator-facing title at
+   *  creation time. */
+  const ensureSink = (
+    sinkKind: "sink_allow" | "sink_deny" | "sink_neutral",
+    sourceId: string,
+  ): ExecutionFlowNode => {
+    const id =
+      sinkKind === "sink_allow"
+        ? GLOBAL_ALLOW_SINK_ID
+        : sinkKind === "sink_deny"
+          ? GLOBAL_DENY_SINK_ID
+          : `__sink_neutral__::${sourceId}`;
+    const existing = synthSinks.get(id);
+    if (existing) return existing;
+    const title =
+      sinkKind === "sink_allow"
+        ? "ALLOW"
+        : sinkKind === "sink_deny"
+          ? "DENY"
+          : "neutral";
+    const created: ExecutionFlowNode = {
+      id,
+      kind: sinkKind,
+      title,
+      className: "",
+      methodName: "",
+      sourceLine: null,
+      overloadCount: 1,
+      hasGateDecision: false,
+      possiblyInlined: false,
+      layoutRank: -1,
+      isSynthetic: true,
+      totalGates: 0,
+      unclassifiedGates: 0,
+      feedingGates: [],
+    };
+    synthSinks.set(id, created);
+    return created;
+  };
+
   for (const d of anchor.decisions) {
-    const sourceId = methodKey(
-      methods.get(overloadKey(d.method))!.canonical,
-    );
+    const sourceCanonical = methods.get(overloadKey(d.method))!.canonical;
+    const sourceId = methodKey(sourceCanonical);
+    const sourceTitle = titleOf(sourceCanonical);
 
     const planTarget = planTargetFor(d, allPlans);
 
@@ -432,28 +603,23 @@ export function buildExecutionFlowGraph(
       d.branch_outcome.confidence >= HIGH_CONFIDENCE_THRESHOLD;
 
     if (verdicts.length === 0) {
-      // No verdict — emit a single unverdicted edge to a synthetic
-      // neutral sink so the node still has SOMETHING flowing out.
-      const sinkId = `__sink_neutral__::${sourceId}`;
-      if (!synthSinks.has(sinkId)) {
-        synthSinks.set(sinkId, {
-          id: sinkId,
-          kind: "sink_neutral",
-          title: "(unverdicted)",
-          className: "",
-          methodName: "",
-          sourceLine: null,
-          overloadCount: 1,
-          hasGateDecision: false,
-          possiblyInlined: false,
-          layoutRank: -1,
-          isSynthetic: true,
-        });
-      }
+      // No verdict — emit a single unverdicted edge to a per-source
+      // ``sink_neutral`` so the operator keeps a visual anchor for
+      // the unclassified gate (Q1 = (g) misclassification-spotting
+      // affordance). Edge kind stays ``unverdicted`` so the renderer
+      // distinguishes "classifier was unsure" (neutral) from
+      // "slicer hit max-walk" (unverdicted) via the dim-dashed
+      // stroke variant locked at DEC-029.
+      const sink = ensureSink("sink_neutral", sourceId);
+      sink.feedingGates.push({
+        sourceTitle,
+        instructionIndex: d.instruction_index,
+        verdictKind: "unverdicted",
+      });
       edges.push({
-        id: `${sourceId}->${sinkId}#${d.instruction_index}`,
+        id: `${sourceId}->${sink.id}#${d.instruction_index}`,
         source: sourceId,
-        target: sinkId,
+        target: sink.id,
         kind: "unverdicted",
         label: "",
         isCandidateGate: false,
@@ -473,43 +639,33 @@ export function buildExecutionFlowGraph(
       // Resolve target. Plan target wins when the verdict is
       // ``allow`` (the bypass plan's target_method is what the
       // operator wants to see flowing from a denied gate). For
-      // ``deny`` we route to a synthetic sink_deny per source
-      // method so multiple deny branches collapse into one
-      // operator-meaningful "denial" block.
+      // every other case we route to the appropriate synthetic
+      // sink — global per-kind for ALLOW / DENY (Q2 = (a)), per-
+      // source for NEUTRAL (Q1 = (g)).
       let targetId: string;
       if (planTarget && v.verdict === "allow") {
         targetId = methodKey(
           methods.get(overloadKey(planTarget))!.canonical,
         );
       } else {
-        const sinkKind: ExecutionFlowNode["kind"] =
+        const sinkKind: "sink_allow" | "sink_deny" | "sink_neutral" =
           v.verdict === "allow"
             ? "sink_allow"
             : v.verdict === "deny"
               ? "sink_deny"
               : "sink_neutral";
-        const sinkId = `__${sinkKind}__::${sourceId}`;
-        if (!synthSinks.has(sinkId)) {
-          synthSinks.set(sinkId, {
-            id: sinkId,
-            kind: sinkKind,
-            title:
-              sinkKind === "sink_allow"
-                ? "ALLOW"
-                : sinkKind === "sink_deny"
-                  ? "DENY"
-                  : "NEUTRAL",
-            className: "",
-            methodName: "",
-            sourceLine: null,
-            overloadCount: 1,
-            hasGateDecision: false,
-            possiblyInlined: false,
-            layoutRank: -1,
-            isSynthetic: true,
+        const sink = ensureSink(sinkKind, sourceId);
+        if (sinkKind === "sink_neutral") {
+          // Only neutral sinks carry the hover-tooltip feed list —
+          // global ALLOW / DENY sinks are operator-meaningful as
+          // "all paths to allow / deny" without per-gate breakdown.
+          sink.feedingGates.push({
+            sourceTitle,
+            instructionIndex: d.instruction_index,
+            verdictKind,
           });
         }
-        targetId = sinkId;
+        targetId = sink.id;
       }
 
       const label =

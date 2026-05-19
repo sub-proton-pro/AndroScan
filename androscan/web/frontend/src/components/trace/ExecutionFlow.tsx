@@ -65,15 +65,75 @@
  *     locked the static stroke; the animation would need its own
  *     planning checkpoint.
  *   * Pan-to-fit on selection — v2 candidate.
+ *
+ * **Phase 13 v2.0 update (DEC-030).** Four operator-visible
+ * flowchart fixes land in this revision, all driven by post-v1
+ * operator feedback:
+ *
+ *   * **Q1 = (g) — hover-progressive gate-count badge + small
+ *     de-emphasized neutral sinks.** Each method card carries a
+ *     small ``N gates · M unclassified`` badge in the meta row,
+ *     rendered always but CSS-hidden until the card is hovered or
+ *     receives keyboard focus (``:focus-within``). The badge
+ *     surfaces classifier-uncertainty at the source so operators
+ *     can spot misclassifications without traversing the right-
+ *     edge sinks. Per-source ``sink_neutral`` nodes render at
+ *     110×36 with the de-emphasized variant (dashed border, 60%
+ *     opacity, lowercase ``neutral`` label, no corner pill); their
+ *     ``title`` attribute (browser-default tooltip) lists the
+ *     feeding gates so hovering reveals which decisions converge
+ *     into the sink.
+ *   * **Q2 = (a) — global ALLOW / DENY sink coalescing.** All
+ *     allow / deny verdict edges terminate at ONE shared node per
+ *     kind (``GLOBAL_ALLOW_SINK_ID`` / ``GLOBAL_DENY_SINK_ID`` in
+ *     :mod:`executionFlowGraph`). The visual reads as "all paths
+ *     to allow / deny" without the per-source-method clutter of
+ *     the v1 design. The classifier is confident on allow / deny
+ *     so per-source anchors aren't worth their visual weight.
+ *   * **Q3 = (a) — arrowhead fill via ``fill: context-stroke``.**
+ *     The v1 ``fill: currentColor`` on SVG ``marker path`` failed
+ *     because ``currentColor`` in a ``<marker>`` definition
+ *     resolves against the marker's own color context, not the
+ *     referencing path. The SVG2 ``context-stroke`` keyword
+ *     correctly inherits the stroke color of the path that uses
+ *     the marker. Lives entirely in ``App.css`` (Chrome 99+,
+ *     Firefox 90+, Safari 16+). Fixed by 13.6's ``MARKERS``
+ *     registry which was reserved exactly for this case.
+ *   * **Q5 = (b) — within-column sort entry-first.** The
+ *     ``layoutNodes`` sort now puts the entry node first within
+ *     its rank column regardless of alphabetic order, then
+ *     synthetic sinks last (preserved from v1), then real methods
+ *     alphabetic in between (preserved from v1). Fixes the "boxes
+ *     above Entry method" complaint at rank 0 when the entry has
+ *     no own decision edges (real-app dominant case).
+ *   * **Q7 = (a) — within-page fullscreen toggle.** New custom
+ *     button (top-right via React Flow's ``<Panel>``) toggles a
+ *     fullscreen state on the container; CSS flips the container
+ *     to ``position: fixed; inset: 0; z-index: 1000;`` so the
+ *     flowchart fills the viewport without going OS-level
+ *     fullscreen (operator-locked posture — within-page only).
+ *     ``ESC`` key exits via a ``window.keydown`` handler scoped to
+ *     the fullscreen state. Button label flips to "Exit
+ *     fullscreen" + active class indicator when toggled on.
+ *
+ * **Out of scope for v2.0** (deferred to v2.0-tests / v2.1 per
+ * DEC-030's sub-step backlog):
+ *   * Unit tests for the ``executionFlowGraph`` pure helper —
+ *     deferred to v2.0-tests sub-step which lands the frontend
+ *     test infrastructure (vitest) as its own focused decision
+ *     surface.
+ *   * Call-graph caller→callee edge injection for true call-
+ *     hierarchy indentation — deferred to v2.1, dogfood-gated.
  */
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Background,
   Controls,
   Handle,
   MarkerType,
   MiniMap,
+  Panel,
   Position,
   ReactFlow,
   type Edge,
@@ -111,6 +171,14 @@ const COLUMN_GAP = 80;
 const ROW_GAP = 30;
 const COLUMN_PITCH = NODE_WIDTH + COLUMN_GAP;
 const ROW_PITCH = NODE_HEIGHT + ROW_GAP;
+
+// Phase 13 v2.0 (DEC-030 Q1 = (g)) — small de-emphasized variant
+// for per-source ``sink_neutral`` synthetic sinks. ~50% of the
+// standard card dimensions so the sinks visually recede to
+// "footnote" status without losing the per-gate anchor the
+// operator needs for misclassification spotting.
+const SMALL_SINK_WIDTH = 110;
+const SMALL_SINK_HEIGHT = 36;
 
 // React Flow's default arrowhead is 12.5×12.5; DEC-029 locks 6×6
 // for ALL edges. ``markerEnd.width`` and ``markerEnd.height`` set
@@ -210,11 +278,18 @@ function layoutNodes(nodes: ExecutionFlowNode[]): PositionedNodes {
     if (!byRank.has(n.layoutRank)) byRank.set(n.layoutRank, []);
     byRank.get(n.layoutRank)!.push(n);
   }
-  // Sort each rank's nodes so synthetic sinks come last (cleaner
-  // visual: real method nodes line up across ranks, sinks dangle
-  // off to the right).
+  // Sort each rank's nodes per DEC-030 Q5 = (b): entry first → real
+  // methods alphabetic → synthetic sinks last. The entry-first lock
+  // fixes the v1 "boxes above Entry method" complaint at rank 0
+  // when the entry has no own outgoing decision edges and a method
+  // alphabetically prior to the entry's class name would otherwise
+  // sort above it. Synthetic sinks still come last (cleaner visual:
+  // real method nodes line up across ranks, sinks dangle off to the
+  // right) — that rule is preserved verbatim from v1.
   for (const [, list] of byRank) {
     list.sort((a, b) => {
+      if (a.kind === "entry" && b.kind !== "entry") return -1;
+      if (b.kind === "entry" && a.kind !== "entry") return 1;
       if (a.isSynthetic !== b.isSynthetic) return a.isSynthetic ? 1 : -1;
       return a.title.localeCompare(b.title);
     });
@@ -271,10 +346,17 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
     ? n.className.split(".").pop() || n.className
     : null;
 
+  // Phase 13 v2.0 (DEC-030 Q1 = (g)) — per-source ``sink_neutral``
+  // sinks render at 110×36 with the de-emphasized variant, no
+  // corner pill, lowercase ``neutral`` body label. Global ALLOW /
+  // DENY sinks keep the standard size + uppercase pill (Q2 = (a)
+  // global coalescing already collapses them to one per kind).
+  const isSmallSink = n.kind === "sink_neutral";
+
   const cornerPill = (() => {
     if (n.kind === "sink_allow") return "ALLOW";
     if (n.kind === "sink_deny") return "DENY";
-    if (n.kind === "sink_neutral") return "NEUTRAL";
+    if (n.kind === "sink_neutral") return null; // v2.0: no pill on small sinks
     if (n.kind === "entry" && n.hasGateDecision) return "GATE";
     if (n.kind === "gate") return "GATE";
     if (n.kind === "entry") return "ENTRY";
@@ -284,7 +366,6 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
   const cornerPillKind = (() => {
     if (n.kind === "sink_allow") return "execution-flow-pill-allow";
     if (n.kind === "sink_deny") return "execution-flow-pill-deny";
-    if (n.kind === "sink_neutral") return "execution-flow-pill-neutral";
     if (cornerPill === "GATE") return "execution-flow-pill-gate";
     if (cornerPill === "ENTRY") return "execution-flow-pill-entry";
     return "";
@@ -305,22 +386,48 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
     isRuntimeInlined && "execution-flow-node-inlined-runtime",
     n.overloadCount > 1 && "execution-flow-node-stacked",
     n.isSynthetic && "execution-flow-node-synthetic",
+    isSmallSink && "execution-flow-node-sink-small",
     isFiredEmphasis && "execution-flow-node-fired",
   ]
     .filter(Boolean)
     .join(" ");
 
+  // Phase 13 v2.0 (DEC-030 Q1 = (g)) — sink hover tooltip lists the
+  // feeding gates so the operator can see which decisions converge
+  // into a per-source ``sink_neutral`` without clicking through.
+  // Browser-default ``title`` attribute keeps the implementation
+  // dependency-free (no custom popover component); the
+  // ``\n``-separated format renders as a multi-line tooltip in
+  // every browser we care about. Global ALLOW / DENY sinks fall
+  // through to the simple ``n.title`` because they're operator-
+  // meaningful as "all paths to allow / deny" without per-gate
+  // breakdown.
+  const titleAttr = (() => {
+    if (!n.isSynthetic) {
+      return `${n.className}.${n.methodName}${
+        n.sourceLine != null ? ` (line ${n.sourceLine})` : ""
+      }`;
+    }
+    if (n.kind === "sink_neutral" && n.feedingGates.length > 0) {
+      const lines = n.feedingGates.map(
+        (g) =>
+          `  • ${g.sourceTitle} @ instruction ${g.instructionIndex} (${g.verdictKind})`,
+      );
+      return `Fed by ${n.feedingGates.length} unclassified gate${
+        n.feedingGates.length > 1 ? "s" : ""
+      }:\n${lines.join("\n")}`;
+    }
+    return n.title;
+  })();
+
   return (
     <div
       className={cardClass}
-      style={{ width: NODE_WIDTH, height: NODE_HEIGHT }}
-      title={
-        n.isSynthetic
-          ? n.title
-          : `${n.className}.${n.methodName}${
-              n.sourceLine != null ? ` (line ${n.sourceLine})` : ""
-            }`
-      }
+      style={{
+        width: isSmallSink ? SMALL_SINK_WIDTH : NODE_WIDTH,
+        height: isSmallSink ? SMALL_SINK_HEIGHT : NODE_HEIGHT,
+      }}
+      title={titleAttr}
     >
       {/* Source/target handles are required by React Flow for edges
           to attach. Style them as 0×0 invisible anchors so the
@@ -385,6 +492,35 @@ function MethodNode({ data, selected }: NodeProps<Node<NodeData>>) {
             {n.overloadCount > 1 && (
               <span className="execution-flow-node-overload-pill">
                 ×{n.overloadCount} overloads
+              </span>
+            )}
+            {/* Phase 13 v2.0 (DEC-030 Q1 = (g)) — gate-count badge.
+                Rendered always when ``totalGates > 0`` so the DOM
+                node stays stable; CSS hides it by default and
+                reveals on ``.execution-flow-node:hover`` /
+                ``:focus-within`` for keyboard navigation. The
+                ``-warn`` modifier raises visual emphasis when at
+                least one gate is unclassified — operator-spottable
+                signal for potential branch_classifier false-
+                negatives (see :mod:`androscan.analysis.
+                branch_classifier`'s "Out of scope for v1" catalog
+                of known false-negative classes). */}
+            {n.totalGates > 0 && (
+              <span
+                className={[
+                  "execution-flow-node-gate-badge",
+                  n.unclassifiedGates > 0 &&
+                    "execution-flow-node-gate-badge-warn",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                title={
+                  n.unclassifiedGates > 0
+                    ? `${n.totalGates} gate${n.totalGates > 1 ? "s" : ""} on this method · ${n.unclassifiedGates} unclassified by the heuristic classifier (potential false negative — review the predicate origin)`
+                    : `${n.totalGates} gate${n.totalGates > 1 ? "s" : ""} on this method · all classified`
+                }
+              >
+                {n.totalGates}g · {n.unclassifiedGates}?
               </span>
             )}
             {/* 13.9 — runtime-confirmed pill takes precedence over
@@ -597,6 +733,11 @@ export function ExecutionFlow({
       const liveRecord = !n.isSynthetic && live ? (live.get(oKey) ?? null) : null;
       const runtimeInlined =
         !n.isSynthetic && failed ? (failed.get(oKey) ?? null) : null;
+      // Phase 13 v2.0 (DEC-030 Q1 = (g)) — per-source ``sink_neutral``
+      // sinks render small; pass the smaller bounds to React Flow's
+      // hit-testing so click + selection geometry matches the visual.
+      // Global ALLOW / DENY sinks keep the standard bounds.
+      const isSmallSink = n.kind === "sink_neutral";
       return {
         id: n.id,
         type: "method",
@@ -608,9 +749,8 @@ export function ExecutionFlow({
           runtimeInlined,
         },
         position: positions.get(n.id) ?? { x: 0, y: 0 },
-        // 220×72 fixed; React Flow uses these for hit-testing.
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
+        width: isSmallSink ? SMALL_SINK_WIDTH : NODE_WIDTH,
+        height: isSmallSink ? SMALL_SINK_HEIGHT : NODE_HEIGHT,
         // Synthetic sinks aren't operator-clickable.
         selectable: !n.isSynthetic,
         draggable: false,
@@ -696,8 +836,34 @@ export function ExecutionFlow({
   // ``currentColor`` inheritance proves insufficient.
   void MARKERS;
 
+  // Phase 13 v2.0 (DEC-030 Q7 = (a)) — within-page fullscreen
+  // toggle. ``isFullscreen`` flips a CSS class on the container so
+  // it expands to ``position: fixed; inset: 0; z-index: 1000;`` and
+  // fills the viewport without going OS-level fullscreen (operator-
+  // locked posture: within-page only — full-OS fullscreen would
+  // hide the workbench chrome the operator may want to switch back
+  // to mid-trace). ``ESC`` exits via the ``window.keydown`` handler
+  // scoped to the active state; effect cleans up its listener on
+  // toggle-off + on unmount.
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    if (!isFullscreen) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsFullscreen(false);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [isFullscreen]);
+
+  const containerClass = [
+    "execution-flow-container",
+    isFullscreen && "execution-flow-container-fullscreen",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   return (
-    <div className="execution-flow-container">
+    <div className={containerClass}>
       <ReactFlow
         nodes={styledNodes}
         edges={rfEdges}
@@ -724,6 +890,29 @@ export function ExecutionFlow({
           pannable
           zoomable
         />
+        {/* Phase 13 v2.0 (DEC-030 Q7 = (a)) — within-page fullscreen
+            toggle. Mounted via React Flow's <Panel> so the button
+            stays inside the canvas chrome (top-right; bottom-left
+            is reserved for <Controls>, bottom-right for <MiniMap>).
+            Button label flips on toggle so the operator can find
+            their way out; ESC also exits. */}
+        <Panel position="top-right" className="execution-flow-fullscreen-panel">
+          <button
+            type="button"
+            className={[
+              "execution-flow-fullscreen-toggle",
+              isFullscreen && "execution-flow-fullscreen-toggle-active",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+            onClick={() => setIsFullscreen((v) => !v)}
+            title={isFullscreen ? "Exit fullscreen (ESC)" : "Fullscreen"}
+            aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+            aria-pressed={isFullscreen}
+          >
+            {isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          </button>
+        </Panel>
       </ReactFlow>
     </div>
   );

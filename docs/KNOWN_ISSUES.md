@@ -444,7 +444,7 @@ Use the following format for new entries:
 ---
 
 ### ISSUE-017: Phase 13 v1 ships static fired-edge styling — marching-ants animation deferred
-- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- status: Open (Phase 13 v2 candidate; operator-demand-gated; **carried forward verbatim through Phase 13 v2.0 — DEC-030 explicitly preserved DEC-029's color-only edge-emphasis lock; this issue stays operator-demand-gated as a v2.x candidate**)
 - impact: Low
 - area: Behavior Trace v3 / `ExecutionFlow` flowchart UX
 - introduced / observed: 2026-05-08 (Phase 13 v1 ship)
@@ -460,13 +460,14 @@ Use the following format for new entries:
   - none (v2 candidate; promote when operator demand surfaces)
 - related docs:
   - `docs/DECISIONS.md` DEC-029 (locks color-only edge emphasis; documents the iteration history rejecting thicker fired edges + larger arrowheads)
+  - `docs/DECISIONS.md` DEC-030 (Phase 13 v2 UX iteration — cross-link added 2026-05-19; v2.0 preserved DEC-029's color-only lock verbatim; this issue stays open as a v2.x candidate)
   - `androscan/web/frontend/src/components/trace/ExecutionFlow.tsx` (`VerdictEdge` custom component)
   - `androscan/web/frontend/src/App.css` (`.execution-flow-edge-fired` namespace)
 
 ---
 
 ### ISSUE-018: Phase 13 v1 ships static heuristic verdicts — branch-outcome inference from dynamic data deferred
-- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- status: Open (Phase 13 v2 candidate; operator-demand-gated; **carried forward verbatim through Phase 13 v2.0 — DEC-030 was UX-iteration-scoped and did not touch the static `branch_classifier`; this issue stays operator-demand-gated as a v2.x candidate, BUT note that v2.0's hover-progressive gate-count badge with `-warn` modifier on `unclassifiedGates > 0` now surfaces classifier-uncertainty signal at the source method per Q1 = (g), partially mitigating the false-negative discoverability concern that drives this issue's "why it matters" framing**)
 - impact: Medium
 - area: Behavior Trace v3 / `branch_classifier` precision
 - introduced / observed: 2026-05-08 (Phase 13 v1 ship)
@@ -482,13 +483,14 @@ Use the following format for new entries:
   - none (v2 candidate; gates on dogfood telemetry showing the precision gap matters in practice)
 - related docs:
   - `docs/DECISIONS.md` DEC-029 (alternatives considered: "Branch-outcome inference from dynamic data — rejected for v1")
+  - `docs/DECISIONS.md` DEC-030 (Phase 13 v2 UX iteration — cross-link added 2026-05-19; v2.0's gate-count badge with `-warn` modifier surfaces classifier-uncertainty at the source method, partially mitigating the discoverability concern; full dynamic-feedback re-classification stays a v2.x candidate)
   - `androscan/analysis/branch_classifier.py` (the static classifier; v1 surface)
   - `apps/<app_id>/<run>/dynamic_trace.jsonl` (the dynamic-data source the future inference would consume)
 
 ---
 
 ### ISSUE-019: Phase 13 v1 ships per-thread depth pill — full per-thread layout reshape deferred
-- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- status: Open (Phase 13 v2 candidate; operator-demand-gated; **carried forward verbatim through Phase 13 v2.0 — DEC-030 was UX-iteration-scoped and did not change the column-rank layout; this issue stays operator-demand-gated as a v2.x candidate**)
 - impact: Low
 - area: Behavior Trace v3 / `ExecutionFlow` layout
 - introduced / observed: 2026-05-08 (Phase 13 v1 ship; sub-step 13.8)
@@ -504,13 +506,14 @@ Use the following format for new entries:
   - none (v2 candidate; gates on dogfood telemetry showing the corner-pill view insufficient on multi-threaded anchors)
 - related docs:
   - `docs/DECISIONS.md` DEC-029 (locks per-thread depth visualization as a v1 deliverable; sub-step 13.8 closing note records the corner-pill-vs-lane-reshape decision)
+  - `docs/DECISIONS.md` DEC-030 (Phase 13 v2 UX iteration — cross-link added 2026-05-19; v2.0 left the column-rank layout intact; this issue stays operator-demand-gated as a v2.x candidate)
   - `androscan/web/frontend/src/components/trace/ExecutionFlow.tsx` (`MethodNode` depth pill rendering)
   - `androscan/web/frontend/src/api/trace.ts` (`useDynamicTrace` hook populates `threadId` + `threadDepth` on every `LiveValueRecord`; the data is there for either layout)
 
 ---
 
 ### ISSUE-020: Phase 13 v1 surfaces cached summaries only via chat dock, not dedicated GET route
-- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- status: Open (Phase 13 v2 candidate; operator-demand-gated; **carried forward verbatim through Phase 13 v2.0 — DEC-030 was UX-iteration-scoped and did not add a cached-summary GET route; this issue stays operator-demand-gated as a v2.x candidate**)
 - impact: Low
 - area: Behavior Trace v3 / `Inspector` cached-summary discoverability
 - introduced / observed: 2026-05-08 (Phase 13 v1 ship; sub-step 13.9)
@@ -526,6 +529,7 @@ Use the following format for new entries:
   - none (v2 candidate; operator-demand-gated per the 13.9 closing note)
 - related docs:
   - `docs/DECISIONS.md` DEC-029 v1 closing note (records this deferral)
+  - `docs/DECISIONS.md` DEC-030 (Phase 13 v2 UX iteration — cross-link added 2026-05-19; v2.0 did not add a cached-summary GET route; chat-widget path remains the v1 + v2.0 discoverability surface; this issue stays operator-demand-gated as a v2.x candidate)
   - `androscan/web/trace_summary.py` (`summary_cache_params` — the byte-equal cache-key derivation a future GET route would reuse)
   - `androscan/internal/skill_results_cache.py` (the cache layer the future route would read)
   - `androscan/web/frontend/src/components/trace/Inspector.tsx` ("Discuss in chat" button — the v1 chat-widget path)
@@ -533,7 +537,7 @@ Use the following format for new entries:
 ---
 
 ### ISSUE-021: Phase 13 v1 ships no `<MethodSummaryWidget>` "Refresh summary" + no pan-to-fit-on-selection
-- status: Open (Phase 13 v2 candidate; operator-demand-gated)
+- status: Open (Phase 13 v2 candidate; operator-demand-gated; **carried forward verbatim through Phase 13 v2.0 — DEC-030 added the within-page fullscreen toggle which partially addresses the "large-graph navigation" concern that drives the pan-to-fit deferral's "why it matters" framing (operator can now expand the flowchart to viewport size for easier visual scanning) but does NOT close pan-to-fit-on-selection itself; both deferred items stay operator-demand-gated as v2.x candidates**)
 - impact: Low
 - area: Behavior Trace v3 / chat widget UX + flowchart UX
 - introduced / observed: 2026-05-08 (Phase 13 v1 ship; sub-step 13.9)
@@ -549,9 +553,35 @@ Use the following format for new entries:
   - none (v2 candidate; operator-demand-gated per the 13.9 closing note)
 - related docs:
   - `docs/DECISIONS.md` DEC-029 v1 closing note (records both deferrals)
+  - `docs/DECISIONS.md` DEC-030 (Phase 13 v2 UX iteration — cross-link added 2026-05-19; v2.0's within-page fullscreen toggle partially mitigates the large-graph navigation concern but does not close pan-to-fit-on-selection; both items stay operator-demand-gated as v2.x candidates)
   - `androscan/web/frontend/src/components/chat/widgets/MethodSummaryWidget.tsx` (current v1 widget — no refresh affordance)
   - `androscan/web/frontend/src/components/trace/ExecutionFlow.tsx` (current v1 — no pan-to-fit on `selectedNodeId` change)
   - `androscan/skills/summarise_method.py` (the skill `force_refresh: true` would route through)
+
+---
+
+### ISSUE-022: Phase 13 v2.0 lands column-rank flowchart layout with no call-hierarchy indentation — call-graph caller→callee edge injection deferred to v2.1
+- status: Open (Phase 13 v2.1 candidate; operator-demand-gated; **opened 2026-05-19 by DEC-030 ratification**)
+- impact: Medium
+- area: Behavior Trace v3 / `ExecutionFlow` layout
+- introduced / observed: 2026-05-19 (Phase 13 v2.0 ship; one of the four friction signals operator dogfooding 2026-05-08 → 2026-05-19 surfaced on the v1 ship)
+- summary:
+  Phase 13 v1 introduced the column-rank flowchart layout in 13.6 (BFS from the entry method along decision edges → assigns each node a `layoutRank` integer → renderer groups nodes by rank into vertical columns). Without call-graph caller→callee edges in the FE graph builder, methods that don't appear as decision targets (decision SOURCES whose decisions all flow to other-method targets; bypass-plan targets whose source method isn't itself reachable from entry via decision edges) fall through `ranks.get(succ) ?? 0` to rank 0 alongside the entry node, producing a "flat" layout with no clear call hierarchy. Phase 13 v2.0 (DEC-030 Q5 = (b)) added a within-column entry-first sort which fixes the v1 "boxes above Entry method" complaint at rank 0, but does NOT add call-graph edges and therefore does NOT give the flowchart real call-hierarchy indentation. v2.0 left this as a separate v2.1 sub-step, **operator-demand-gated** on dogfood evidence that the v2.0 column-rank layout still feels flat in real-app use.
+- why it matters:
+  Operators reading a flowchart expect "this method called this method which called this method" to read top-down (or left-to-right per the locked horizontal flow); the v2.0 layout's flat rank-0 column for non-decision-reachable methods makes the call topology hard to reconstruct on closure sizes > ~5 methods. The v2.0 within-column entry-first sort partially mitigates by ensuring the entry node is always the top-left anchor, but downstream call hierarchy stays implicit. On real-app anchors with bypass plans targeting helper methods not reached by decisions from the entry, the helper methods land at rank 0 visually peers with the entry, obscuring the "this is downstream" relationship.
+- current workaround:
+  Operators can mentally reconstruct the call hierarchy by clicking through nodes in the Inspector pane and reading the source-line + class+method context. The `<Inspector>`'s "Predicate origin" + "Bypass plans" sections also surface caller-callee relationships textually when they're load-bearing for the operator's task. For complex anchors, narrowing the entry method or reducing the `hops` parameter scopes the closure tighter so the flat layout has fewer competing rank-0 nodes.
+- recommended fix:
+  Wire `androscan/analysis/call_graph.py::neighbors()` (already exists from Phase 4 — walks `call_graph.sqlite` for caller-callee edges) into a new BE route (or extension of `POST /api/trace/{app_id}/anchor`) returning `Array<{ caller: MethodRef, callee: MethodRef }>` for every method in the active anchor's closure. Extend `executionFlowGraph.ts::buildExecutionFlowGraph` to accept the call-graph edges as an additional input + inject them as `kind: "call"` edges before BFS rank computation. Add `"call"` variant to `<VerdictEdge>` rendering: thin 1px gray stroke, no arrowhead, no label — pure layout aid, not operator-actionable (locked at DEC-030's Q4 option breakdown). BFS-from-entry now walks BOTH decision-edges AND call-edges so the rank reflects actual call hierarchy.
+- v2.1 promotion trigger:
+  Subjective / dogfood-based per DEC-030 v2.1 trigger = (a). Operator uses AndroScan with the v2.0 flowchart on real Android apps; if the column-rank layout still feels flat (no clear hierarchy beyond decision flow), v2.1 promotes. No quantitative threshold — UX iteration is qualitative; friction is the go-signal. **v2.0-tests is the committed-follow-up next slot regardless of v2.1 trigger** — it adds the FE test infrastructure that v2.1's executionFlowGraph changes will be tested against.
+- related tasks:
+  - `docs/TASKS.md` § Phase 13 v2 — Behavior Trace Flowchart UX iteration — sub-step backlog (the v2.1 row in this table tracks this issue's resolution)
+- related docs:
+  - `docs/DECISIONS.md` DEC-030 (locks the deferral; documents the v2.1 gating trigger; locks the call-edge styling as "thin gray, no arrowhead, no label")
+  - `androscan/analysis/call_graph.py::neighbors()` (the BE walker the future route would consume — already exists from Phase 4)
+  - `androscan/web/frontend/src/components/trace/executionFlowGraph.ts` (the FE graph builder + BFS-rank computation v2.1 would extend)
+  - `androscan/web/frontend/src/components/trace/ExecutionFlow.tsx` (the renderer + `VerdictEdge` custom component v2.1 would add the `"call"` variant to)
 
 ---
 

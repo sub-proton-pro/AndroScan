@@ -6846,14 +6846,22 @@ code { color: var(--accent); }
   stroke-dasharray: 4 3;
 }
 
-/* React Flow renders one shared marker definition; pin it to the
- * default theme color (the actual color is inherited from the
- * stroke via ``currentColor`` on the marker path). */
+/* React Flow renders one shared marker definition that every edge
+ * path references via ``marker-end``. Phase 13 v2.0 (DEC-030 Q3 =
+ * (a)) fixes the v1 arrowhead-invisibility bug: ``fill:
+ * currentColor`` resolved against the marker's *own* color context
+ * (not the referencing path's stroke) because the SVG ``<marker>``
+ * is defined once at document level and shared across paths. The
+ * SVG2 ``context-stroke`` keyword correctly inherits the stroke
+ * color of whichever path used the marker, so each verdict-coloured
+ * edge gets a matching-coloured arrowhead. Supported in Chrome 99+,
+ * Firefox 90+, Safari 16+ — within AndroScan's desktop-pentester
+ * browser target. */
 .execution-flow-container .react-flow__edge-path {
   stroke-width: 1.5;
 }
 .execution-flow-container svg.react-flow__edges marker path {
-  fill: currentColor;
+  fill: context-stroke;
 }
 
 .execution-flow-edge-label {
@@ -7690,5 +7698,194 @@ code { color: var(--accent); }
 .chat-widget-method-summary-button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ===========================================================================
+ * Phase 13 v2.0 — Flowchart UX iteration (DEC-030).
+ *
+ * Five operator-visible flowchart fixes land in this revision; the
+ * pre-existing v1 styles above (the ``.execution-flow-*`` namespace
+ * from 13.6 / 13.7 / 13.8 / 13.9) stay verbatim. The v2.0 additions:
+ *
+ *   * **Q1 = (g)** — hover-progressive gate-count badge
+ *     (``.execution-flow-node-gate-badge``) + de-emphasized small
+ *     neutral sink (``.execution-flow-node-sink-small``). Badge
+ *     hidden by default, revealed instantly on
+ *     ``.execution-flow-node:hover`` / ``:focus-within`` for
+ *     keyboard discoverability.
+ *   * **Q2 = (a)** — global ALLOW / DENY sinks render at standard
+ *     220×72 (pre-existing v1 styling preserved; no override
+ *     needed). The visual coalescing is enforced by the
+ *     ``executionFlowGraph`` ``GLOBAL_*_SINK_ID`` constants.
+ *   * **Q3 = (a)** — context-stroke arrowhead fix; lives in the
+ *     pre-existing ``.execution-flow-container svg.react-flow__
+ *     edges marker path`` rule (changed ``fill: currentColor`` →
+ *     ``fill: context-stroke`` in place; no new rule needed).
+ *   * **Q5 = (b)** — within-column sort; lives entirely in
+ *     ``ExecutionFlow.tsx::layoutNodes`` (no CSS).
+ *   * **Q7 = (a)** — within-page fullscreen toggle
+ *     (``.execution-flow-container-fullscreen`` +
+ *     ``.execution-flow-fullscreen-panel`` +
+ *     ``.execution-flow-fullscreen-toggle``).
+ *
+ * All additions live under the existing ``.execution-flow-*``
+ * namespace family so cascade specificity matches the v1 rules
+ * without bleeding into adjacent surfaces. =========================== */
+
+/* --- Q1 (g) — Gate-count badge (hover-progressive disclosure) ------------- */
+
+/* Badge is rendered in the DOM whenever ``totalGates > 0`` but
+ * stays invisible until the parent ``.execution-flow-node`` is
+ * hovered or contains keyboard focus. ``opacity`` transition keeps
+ * the reveal smooth without the layout shift a ``display: none``
+ * approach would cause. Instant timing per operator lock (DEC-030
+ * Q7-paired timing decision); no delay between hover and reveal. */
+.execution-flow-node-gate-badge {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 80ms ease-out;
+  pointer-events: auto;
+}
+
+/* The badge becomes visible on ``:hover`` of the parent node OR on
+ * ``:focus-within`` so keyboard tab-through reveals it too. The
+ * ``visibility`` flip is paired with the opacity transition so the
+ * element doesn't intercept pointer events while invisible (the
+ * ``visibility: hidden`` -> ``visible`` transitions instantly; the
+ * opacity transition does the fade). */
+.execution-flow-node:hover .execution-flow-node-gate-badge,
+.execution-flow-node:focus-within .execution-flow-node-gate-badge {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* ``-warn`` modifier raises visual emphasis when at least one gate
+ * on the method is unclassified by the heuristic branch_classifier.
+ * Operator-spottable signal for potential classifier false-
+ * negatives (the branch_classifier docstring catalogues the known
+ * false-negative classes — obfuscated strings, non-English deny
+ * copy, custom-predicate gates). Same warn-orange family as the
+ * pre-existing ``-inlined-pill`` rule so the visual vocabulary
+ * stays consistent across the trace UI. */
+.execution-flow-node-gate-badge-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* --- Q1 (g) — Small de-emphasized variant for per-source sink_neutral ---- */
+
+/* Per-source ``sink_neutral`` synthetic sinks render at 110×36 with
+ * a dashed border + 60% opacity + lowercase body label so they
+ * visually recede to "footnote" status without losing the per-gate
+ * anchor the operator needs for misclassification spotting. The
+ * dimensions are set inline on the React element via JSX (so React
+ * Flow's hit-testing geometry matches the visual); this rule
+ * handles all the cosmetic de-emphasis. */
+.execution-flow-node-sink-small {
+  padding: 4px 8px;
+  font-size: 10px;
+  opacity: 0.6;
+  border-style: dashed;
+  border-color: var(--border);
+  background: var(--panel-2);
+}
+
+/* Re-style the inner synthetic-body so the lowercase "neutral"
+ * label fits the smaller dimensions without overflow. The pre-
+ * existing ``.execution-flow-node-synthetic-body`` rule centres
+ * the text + applies letter-spacing; we override the font-size
+ * + weight + letter-spacing for the small variant so the label
+ * doesn't compete with the real method cards for visual weight. */
+.execution-flow-node-sink-small .execution-flow-node-synthetic-body {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--muted);
+  text-transform: none;
+}
+
+/* Mouse-hover the small sink slightly lifts opacity to confirm
+ * it's interactive (the browser-default tooltip listing feeding
+ * gates appears on hover anyway, so this is just feedback). */
+.execution-flow-node-sink-small:hover {
+  opacity: 0.85;
+  cursor: help;
+}
+
+/* --- Q7 (a) — Within-page fullscreen toggle ------------------------------- */
+
+/* When ``isFullscreen`` is true, the container expands to fill the
+ * viewport via ``position: fixed; inset: 0; z-index: 1000;``. The
+ * background fill ensures the workbench chrome behind the flowchart
+ * doesn't bleed through; the standard panel background matches the
+ * non-fullscreen state for visual continuity. ``z-index: 1000`` is
+ * the same layer the chat dock and notification toasts use, so the
+ * fullscreen view sits above the workbench tabs / sidebar without
+ * needing app-wide z-index orchestration. */
+.execution-flow-container-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: var(--bg);
+  border-radius: 0;
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+
+/* Panel wraps the toggle button so React Flow's ``<Panel>``
+ * placement positions it at the top-right of the canvas. We add no
+ * special chrome — the button itself carries the visual weight. */
+.execution-flow-fullscreen-panel {
+  margin: 8px;
+}
+
+/* Button styling matches the existing React Flow ``<Controls>``
+ * button family so the fullscreen toggle reads as part of the
+ * canvas chrome (not an out-of-place workbench element). Subtle
+ * accent on hover; ``-active`` modifier raises emphasis when the
+ * toggle is engaged so the operator can find their way out via
+ * the same affordance that put them in fullscreen. */
+.execution-flow-fullscreen-toggle {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.12s ease-out, border-color 0.12s ease-out;
+}
+
+.execution-flow-fullscreen-toggle:hover {
+  background: color-mix(in srgb, var(--accent) 15%, var(--panel-2));
+  border-color: var(--accent);
+}
+
+.execution-flow-fullscreen-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Active state — fullscreen is engaged. Distinct visual so the
+ * operator can spot the exit affordance at a glance + matches the
+ * standard active-toggle pattern from the rest of the workbench
+ * UI (mode toggles, expand-all toggles etc.). */
+.execution-flow-fullscreen-toggle-active {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+.execution-flow-fullscreen-toggle-active:hover {
+  background: color-mix(in srgb, var(--accent) 85%, var(--text));
+  border-color: var(--accent);
 }
 
