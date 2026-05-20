@@ -7907,3 +7907,225 @@ code { color: var(--accent); }
   border-color: var(--accent);
 }
 
+/* ===========================================================================
+ * Phase 13 **v3 preview** — top-down Dagre flowchart.
+ *
+ * Scoped under ``.execution-flow-v3-container`` so the v3 styles
+ * never leak into the v2 path. The v2 ``.execution-flow-container``
+ * rules still own the shared chrome (controls / minimap / arrowhead
+ * marker fix) — the v3 container inherits them via the base class
+ * still being present on the same element. Anything that needs to
+ * override v2 lives under ``.execution-flow-v3-container ...`` here.
+ *
+ * **What the v3 styles change**:
+ *   * Entry node accent: thicker (2px) accent-blue border + soft
+ *     accent shadow so the root of the tree reads at a glance.
+ *   * Gate node accent: warn-orange left edge (3px) instead of a
+ *     full warn-orange border, so multiple gate cards in a row
+ *     don't blur into one warn-coloured wall.
+ *   * Return-pill terminals: 96×32 pill, dashed muted border, ret-
+ *     value coloured text (``True`` green, ``False`` red, ``?``
+ *     muted) so the operator can scan the leaves of the tree
+ *     without reading each label.
+ *   * Synthesised ``call`` edges: muted-cool gray, no label, so
+ *     they read as "structural skeleton" rather than as a verdict.
+ *   * Preview chrome: top-left "v3 preview" pill + stats overlay
+ *     so the operator can confirm they're looking at the preview
+ *     path + spot any dangling edges in real-app data.
+ * =========================================================================== */
+
+.execution-flow-v3-container {
+  /* Identical base sizing to the v2 container; the class is just
+   * a hook for v3-only rule overrides. */
+}
+
+/* --- Entry node (v3) — louder root accent than v2's plain accent
+ * border so the tree's root is unmistakable. */
+.execution-flow-node-v3-entry {
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+/* --- Gate node (v3) — warn-orange left edge stripe instead of v2's
+ * full-perimeter warn border. Reads as "this method gates" without
+ * shouting. */
+.execution-flow-node-v3-gate {
+  border-color: var(--border);
+  border-left: 3px solid var(--warn);
+}
+
+/* --- Return-pill terminals --- */
+.execution-flow-node-retpill {
+  background: var(--panel-2);
+  border: 1px dashed var(--border);
+  border-radius: 16px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  font-size: 11px;
+  font-weight: 600;
+  /* Nudge above the underlying card style: rounded chip, no
+   * stacked-card faux shadow, no overload pill, no meta row. */
+  box-shadow: none;
+}
+
+.execution-flow-node-retpill .execution-flow-node-retpill-body {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 10px;
+}
+
+/* Verdict-flavored ret-pill colors — derived from the edge that
+ * feeds the pill (allow → True / deny → False / neutral / unverdicted → ?).
+ * We can't reach the feeding-edge's CSS class from the pill DOM,
+ * so we infer from the textual content via :has(). Older browsers
+ * without :has() fall back to the muted variant; not an issue on
+ * the desktop-pentester browser target. */
+.execution-flow-node-retpill:has(.execution-flow-node-retpill-body):not([title*="?"]) {
+  /* default — overridden below by content-specific selectors. */
+}
+/* Use the ``title`` attribute (which always carries the ret value)
+ * + an attribute selector for cross-browser content matching. */
+.execution-flow-node-retpill[title^="Ret: True"],
+.execution-flow-node-retpill[title*="Ret: True"] {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.execution-flow-node-retpill[title^="Ret: False"],
+.execution-flow-node-retpill[title*="Ret: False"] {
+  border-color: var(--err);
+  color: var(--err);
+}
+.execution-flow-node-retpill[title^="Ret: ?"],
+.execution-flow-node-retpill[title*="Ret: ?"] {
+  border-color: var(--muted);
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* --- Synthesised call edge (entry → decision-source) — muted cool
+ * gray so it reads as structural skeleton rather than verdict. */
+.execution-flow-edge-call {
+  stroke: var(--border-strong);
+  stroke-dasharray: 0;
+  opacity: 0.85;
+}
+
+/* --- Preview panel chrome (top-left) --- */
+.execution-flow-v3-preview-panel {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  pointer-events: auto;
+}
+
+.execution-flow-v3-preview-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.execution-flow-v3-preview-toggle {
+  font-family: inherit;
+  font-size: 10px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.execution-flow-v3-preview-toggle:hover {
+  border-color: var(--accent);
+}
+.execution-flow-v3-preview-toggle[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+/* --- v3.1 verdict-summary chip on gate cards ---
+ *
+ * Replaces v2's ``Ng · M?`` gate-count badge with a per-verdict-kind
+ * breakdown ("2 allow · 1 deny · 8 ?"). Lives in the gate card's
+ * meta row alongside ``line N`` + ``×K overloads``. Sub-spans color
+ * per the v2 edge palette (--ok / --err / --muted / --border-strong)
+ * so the operator's existing verdict-color training carries over.
+ * The chip is always visible (not hover-revealed like v2's badge)
+ * because v3.1 collapses the per-branch pills INTO this chip — the
+ * counts are the primary verdict-distribution surface, not a
+ * secondary hover affordance. */
+.execution-flow-node-v3-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  line-height: 1;
+  margin-top: 1px;
+}
+
+.execution-flow-node-v3-summary > span {
+  padding: 2px 5px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.execution-flow-node-v3-summary-allow {
+  color: var(--ok);
+  border-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 15%, transparent);
+}
+
+.execution-flow-node-v3-summary-deny {
+  color: var(--err);
+  border-color: var(--err);
+  background: color-mix(in srgb, var(--err) 15%, transparent);
+}
+
+.execution-flow-node-v3-summary-neutral {
+  color: var(--muted);
+  border-color: var(--muted);
+}
+
+.execution-flow-node-v3-summary-unv {
+  color: var(--border-strong);
+  border-color: var(--border-strong);
+  font-style: italic;
+}
+
+/* --- Stats overlay (bottom-right) --- */
+.execution-flow-v3-stats {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 10px;
+  font-family: var(--mono, ui-monospace, "SF Mono", monospace);
+  line-height: 1.5;
+  color: var(--muted);
+  pointer-events: auto;
+  /* MiniMap sits in bottom-right too; nudge stats up so they don't
+   * collide. The MiniMap is ~120px tall by default so 130px clears
+   * it. */
+  margin-bottom: 130px;
+}
+.execution-flow-v3-stats div {
+  white-space: nowrap;
+}
+

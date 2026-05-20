@@ -223,6 +223,7 @@ import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { BehaviorTrace } from "../components/trace/BehaviorTrace";
 import { ExecutionFlow } from "../components/trace/ExecutionFlow";
+import { ExecutionFlowV3 } from "../components/trace/ExecutionFlowV3";
 import { Inspector } from "../components/trace/Inspector";
 import {
   TraceModeToggle,
@@ -1297,6 +1298,63 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   // this section (right-side fixed-width pane); 13.8 adds the
   // Static / Dynamic / Both mode toggle + live-value chips.
   const [executionFlowCollapsed, setExecutionFlowCollapsed] = useState(false);
+  // Phase 13 **v3 preview** — URL-gated preview path so the operator
+  // can compare the v2 + v3 visuals side-by-side without touching
+  // production. Parsed once on mount (no re-parse on URL change —
+  // the operator opens a fresh tab / reloads to toggle); all v3-
+  // specific behaviour gates through ``v3Preview.enabled``.
+  //
+  // **v3.1 URL contract** (replaces v3.0's ``pills=hide`` /
+  // ``methods=gates-only`` which were the *off* paths against
+  // permissive defaults):
+  //
+  //   * ``?flow=v3``               — v3.1 defaults: gate-methods
+  //                                  only + verdict-summary chip
+  //                                  on the gate card (no per-
+  //                                  branch ret pills).
+  //   * ``?flow=v3&pills=show``    — escape hatch: bring back the
+  //                                  per-branch ``Ret: X`` terminal
+  //                                  pills (the v3.0 default
+  //                                  behaviour).
+  //   * ``?flow=v3&methods=all``   — escape hatch: include framework
+  //                                  noise (``Intrinsics.*``,
+  //                                  kotlin getters, etc.) that the
+  //                                  default gates-only filter
+  //                                  drops.
+  //
+  // ``hideRetPills`` / ``gatesOnly`` are passed only when the
+  // operator explicitly flipped the escape-hatch param; ``undefined``
+  // otherwise so the emitter's v3.1 defaults (``true`` / ``true``)
+  // win. No DEC entry yet — preview path, will land as part of the
+  // v3 promotion ratification.
+  const v3Preview = useMemo(() => {
+    if (typeof window === "undefined") {
+      return {
+        enabled: false,
+        hideRetPills: undefined as boolean | undefined,
+        gatesOnly: undefined as boolean | undefined,
+      };
+    }
+    const params = new URLSearchParams(window.location.search);
+    const enabled = params.get("flow") === "v3";
+    const pillsParam = params.get("pills");
+    const methodsParam = params.get("methods");
+    return {
+      enabled,
+      hideRetPills:
+        pillsParam === "show"
+          ? false
+          : pillsParam === "hide"
+            ? true
+            : undefined,
+      gatesOnly:
+        methodsParam === "all"
+          ? false
+          : methodsParam === "gates-only"
+            ? true
+            : undefined,
+    };
+  }, []);
   // Phase 13 sub-step 13.6 / 13.7 — selected ExecutionFlow node,
   // lifted to this level so 13.7's Inspector pane (sibling of
   // ``ExecutionFlow``) can read the same selection without prop-
@@ -1474,15 +1532,27 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
         </header>
         {!executionFlowCollapsed && (
           <div id="execution-flow-body" className="execution-flow-row">
-            <ExecutionFlow
-              anchor={anchor}
-              selectedNodeId={selectedFlowNode?.id ?? null}
-              onNodeClick={(node) => setSelectedFlowNode(node)}
-              mode={mode}
-              firedMethods={dynamic.state.firedMethods}
-              liveValues={dynamic.state.liveValues}
-              hookFailed={dynamic.state.hookFailed}
-            />
+            {v3Preview.enabled ? (
+              <ExecutionFlowV3
+                anchor={anchor}
+                selectedNodeId={selectedFlowNode?.id ?? null}
+                onNodeClick={(node) =>
+                  setSelectedFlowNode(node as unknown as ExecutionFlowNode)
+                }
+                hideRetPills={v3Preview.hideRetPills}
+                gatesOnly={v3Preview.gatesOnly}
+              />
+            ) : (
+              <ExecutionFlow
+                anchor={anchor}
+                selectedNodeId={selectedFlowNode?.id ?? null}
+                onNodeClick={(node) => setSelectedFlowNode(node)}
+                mode={mode}
+                firedMethods={dynamic.state.firedMethods}
+                liveValues={dynamic.state.liveValues}
+                hookFailed={dynamic.state.hookFailed}
+              />
+            )}
             <Inspector
               anchor={anchor}
               selectedNodeId={selectedFlowNode?.id ?? null}
