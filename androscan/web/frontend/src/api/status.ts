@@ -66,17 +66,26 @@ export type GlobalStatus = {
        * detection where there's no on-device PID, or ``ps -A`` itself
        * failed).
        *
-       * The Settings card surfaces a yellow warning when this is
-       * anything other than ``"root"``: ``device.attach(<pid>)``
-       * against an app process needs CAP_SYS_PTRACE, which only root
-       * holds on stock Android. A ``"shell"`` server lets ``frida-ps``
-       * succeed (process enumeration is unprivileged) but every
-       * Inject fails with ``unable to connect to remote frida-server:
-       * closed`` once the per-attach helper hits the ptrace barrier.
+       * The Settings card surfaces a yellow warning AND amber-tints
+       * the card dot when this is anything other than ``"root"``,
+       * INCLUDING the ``null`` case (treated as "unverified, presumed
+       * non-root" per v2.1.11): ``device.attach(<pid>)`` against an
+       * app process needs CAP_SYS_PTRACE, which only root holds on
+       * stock Android. A ``"shell"`` server lets ``frida-ps`` succeed
+       * (process enumeration is unprivileged) but every Inject fails
+       * with ``unable to connect to remote frida-server: closed`` once
+       * the per-attach helper hits the ptrace barrier. ``uid == null``
+       * with ``detection === "frida-ps"`` (host-side enumeration only)
+       * can't prove root either, so we defensively assume the worst —
+       * see ``FridaServerStatusCard``'s ``unverifiedRoot`` signal.
        *
        * Drives the visibility of the Start-as-root action button on
-       * the Frida-server card: shown when ``running === false`` OR
-       * ``uid !== "root"``.
+       * the Frida-server card AND a per-mode Diagnose playbook
+       * (``FridaServerDiagnoseHint`` — surfaces the kill command for
+       * the known-non-root case, and the ``ps -A | grep -iE
+       * 'frida|gadget'`` discovery step for the unverified case).
+       * Button + playbook show whenever ``running === false`` OR
+       * (``running`` AND uid is not confirmed ``"root"``).
        */
       uid: string | null;
       /**

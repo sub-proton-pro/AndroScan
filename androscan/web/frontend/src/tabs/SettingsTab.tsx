@@ -1114,6 +1114,7 @@ function StatusCardView({
   extras,
   actions,
   extraClassName,
+  overrideDot,
 }: {
   card: StatusCard;
   extras?: (string | undefined)[];
@@ -1124,12 +1125,25 @@ function StatusCardView({
    *  per-provider badges or accent colors without touching the
    *  generic StatusCardView shape. */
   extraClassName?: string;
+  /** Optional dot/border override (``"ok"`` | ``"warn"`` | ``"fail"``)
+   *  used when the caller knows more about the card's health than the
+   *  backend's ``card.ok`` boolean conveys. v2.1.11 introduced this to
+   *  let ``FridaServerStatusCard`` paint the card amber when the probe
+   *  detected the server via host-side ``frida-ps`` only (so ``uid``
+   *  is ``null`` and root cannot be verified) OR when ``uid`` is known
+   *  but not ``"root"`` — both cases mean app attaches will likely fail
+   *  even though the backend reports ``ok=true``. When omitted, the
+   *  dot derives from ``card.ok`` / ``skipped`` / ``card.error`` as
+   *  before. */
+  overrideDot?: "ok" | "warn" | "fail";
 }) {
   // ``skipped`` cards (e.g. per-app device probes when no device is
   // attached) are not real failures — render them as warn (yellow) so the
   // panel doesn't scream red the moment the emulator isn't booted.
   const skipped = Boolean((card as { skipped?: boolean }).skipped);
-  const dot = card.ok ? "ok" : skipped ? "warn" : card.error ? "fail" : "warn";
+  const dot =
+    overrideDot ??
+    (card.ok ? "ok" : skipped ? "warn" : card.error ? "fail" : "warn");
   const classNames = ["status-card", `status-${dot}`];
   if (extraClassName) classNames.push(extraClassName);
   return (
@@ -1384,26 +1398,70 @@ function FridaServerStatusCard({
   // wire-protocol enumeration, NOT a device-side process scan, so
   // there's no on-device PID to display. Show a label that makes the
   // detection method explicit instead of the misleading "pid ?".
+  //
+  // v2.1.11: the host-confirmed-only branch was previously labelled
+  // "running (host-confirmed via frida-ps — renamed binary or
+  // frida-gadget)" with the card painted green — operator-misleading
+  // because it hid the third cause (non-root server) and gave no
+  // indication that app attaches would likely fail. New copy ties
+  // the label to the amber state (see ``unverifiedRoot`` below).
   const runStatus =
     card.running
       ? card.pid != null
         ? `pid ${card.pid}`
         : card.detection === "frida-ps"
-          ? "running (host-confirmed via frida-ps — renamed binary or frida-gadget)"
+          ? "running (host-side enumeration only — renamed binary, frida-gadget, or non-root server)"
           : "running"
       : "not running";
-  // ``uid`` warning: server is up but as a non-root user (typically
-  // ``shell``, when the operator forgot ``adb root`` or ran the binary
-  // directly without ``su 0``). Process listing works (frida-ps is
-  // unprivileged) but ``device.attach(<pid>)`` against an app fails
-  // with ``unable to connect to remote frida-server: closed`` once
-  // the per-attach helper hits the ptrace barrier on a non-root server.
-  // The Start-as-root button below uses the same signal to decide
-  // whether to show itself.
-  const uidWarning =
-    card.running && card.uid != null && card.uid !== "root"
-      ? `running as ${card.uid} — app attaches will fail unless restarted as root`
-      : "";
+
+  // ``unverifiedRoot`` collapses the two amber states into one
+  // operator-readable signal: the probe saw the server is reachable,
+  // but we can't confirm it's running as root, so app attaches will
+  // likely fail with "unable to connect to remote frida-server:
+  // closed" once the per-attach helper hits the ptrace barrier.
+  //
+  // Two sub-cases share the amber tint:
+  //
+  //   * **Known non-root** (``uid != null && uid !== "root"``) — Layer
+  //     1 or Layer 2 of ``probe_frida_server`` found a process named
+  //     ``frida-server*`` running as e.g. ``shell``. The Start-as-root
+  //     button below will return 409 with the kill command in the
+  //     error detail, because the route deliberately refuses to
+  //     silently kill+promote (see ``frida_routes.start_frida_server``
+  //     doc-block, "Already running as non-root → 409").
+  //
+  //   * **Unverified** (``uid == null && detection === "frida-ps"``) —
+  //     only Layer 3 hit (host-side ``frida-ps -U`` succeeded), so
+  //     there's no on-device PID and we can't read ``/proc/<pid>/status``
+  //     to determine the uid. Likely causes: renamed binary (e.g.
+  //     ``/data/local/tmp/srv``), ``frida-gadget`` injected into the
+  //     target app (which can't ptrace OTHER apps), or a non-root
+  //     ``frida-server`` whose process name happens not to match
+  //     Layer 1/2's prefix filter.
+  //
+  // Pre-v2.1.11 the implementation treated ``uid == null`` as "no
+  // warning" — silent green for the unverified case, which is the
+  // operator-misleading bug v2.1.11 fixes. The status.ts doc-block
+  // for ``uid`` already specified the spec ("yellow warning when this
+  // is anything other than 'root'") — v2.1.11 brings the
+  // implementation in line, treating ``null`` as "unverified, presumed
+  // non-root".
+  const unverifiedRoot =
+    card.running && (card.uid == null || card.uid !== "root");
+
+  // Two distinct warning lines for the two amber sub-cases so the
+  // operator can tell at a glance whether the issue is "unverified"
+  // (host-side enumeration only — root cannot be checked) or
+  // "verified non-root" (Layer 1/2 reported a uid that isn't root).
+  // Same amber tint either way, but the diagnostic playbook below
+  // branches on this same signal.
+  let uidWarning = "";
+  if (card.running && card.uid != null && card.uid !== "root") {
+    uidWarning = `running as ${card.uid} — app attaches will fail unless restarted as root`;
+  } else if (card.running && card.uid == null && card.detection === "frida-ps") {
+    uidWarning = "uid: unknown — host-side enumeration only; root cannot be verified, app attaches may fail";
+  }
+
   const extras: (string | undefined)[] = [
     runStatus,
     card.uid ? `uid ${card.uid}` : "",
@@ -1423,24 +1481,65 @@ function FridaServerStatusCard({
   // that share the same fix (``adb shell "su 0 frida-server -D"``):
   //   1. Server is down entirely (``!running``) — most common after
   //      an emulator reboot or a version-skew handshake crashed it.
-  //   2. Server is up but as non-root (``uid !== "root"``) — operator
-  //      forgot the privilege escalation step.
-  // Both states leave Inject broken in identical ways.
-  const needsStart = !card.running || (card.uid != null && card.uid !== "root");
+  //   2. Server is up but unverified or known non-root (``unverifiedRoot``)
+  //      — operator forgot the privilege escalation step, or a stealth
+  //      binary / gadget is occupying the wire-protocol surface.
+  // Both states leave Inject broken in identical ways. v2.1.11
+  // collapsed the two amber sub-cases into a single ``unverifiedRoot``
+  // signal so the button visibility matches the dot color exactly.
+  const needsStart = !card.running || unverifiedRoot;
+
+  // Diagnose playbook is gated to the two amber sub-cases (running +
+  // unverifiedRoot). Each sub-case gets a tailored playbook because
+  // the kill step differs:
+  //
+  //   * known-non-root: ``pgrep -f frida-server`` matches because we
+  //     KNOW the binary is named ``frida-server*`` (Layer 1/2 hit) —
+  //     single command kills it.
+  //   * unverified: we DON'T know the binary name (Layer 3-only;
+  //     ``pgrep -f frida-server`` would miss a renamed binary or
+  //     ``frida-gadget``) — operator needs to find the PID first
+  //     via ``ps -A | grep -iE 'frida|gadget'`` then kill explicitly.
+  //
+  // The diagnose hint is hidden in the red state because the install
+  // playbook below already covers the "nothing running yet" case.
+  let diagnoseHintMode: "known-non-root" | "unverified" | null = null;
+  if (card.running && card.uid != null && card.uid !== "root") {
+    diagnoseHintMode = "known-non-root";
+  } else if (card.running && card.uid == null && card.detection === "frida-ps") {
+    diagnoseHintMode = "unverified";
+  }
 
   // Only surface the install hint when the device half is down. When
   // running we keep the card terse — the existing version-skew badge
-  // already handles the "running but mismatched" case.
+  // already handles the "running but mismatched" case, and the
+  // diagnose hint above handles the "running but broken" cases.
   const installHint = !card.running ? <FridaServerInstallHint card={card} /> : null;
 
   const actions = (
     <>
       {needsStart && <FridaServerStartButton onRefresh={onRefresh} />}
+      {diagnoseHintMode && (
+        <FridaServerDiagnoseHint mode={diagnoseHintMode} uid={card.uid} />
+      )}
       {installHint}
     </>
   );
 
-  return <StatusCardView card={card} extras={extras} actions={actions} />;
+  // v2.1.11: pass ``overrideDot="warn"`` when the server is reachable
+  // but root can't be confirmed. The backend's probe is intentionally
+  // permissive (``ok: true`` whenever ANY of the three detection
+  // layers hits, because the layers were designed for liveness, not
+  // attach-readiness) so the dot computation here is the right
+  // place to add the "reachable but broken for attaches" nuance.
+  return (
+    <StatusCardView
+      card={card}
+      extras={extras}
+      actions={actions}
+      overrideDot={unverifiedRoot ? "warn" : undefined}
+    />
+  );
 }
 
 /** "Start frida-server (as root)" action button + transient
@@ -1508,6 +1607,100 @@ function FridaServerStartButton({
         <div className="frida-server-start-err">{lastError}</div>
       )}
     </div>
+  );
+}
+
+/**
+ * Diagnose playbook — only rendered when the server is reachable but
+ * its root status either can't be verified (Layer-3-only detection)
+ * or is known to be wrong (uid != "root"). Two render modes covering
+ * the two amber sub-cases of ``FridaServerStatusCard``:
+ *
+ *   * **``"known-non-root"``** — Layer 1 or Layer 2 of the probe
+ *     found a process named ``frida-server*`` running as a non-root
+ *     uid (typically ``shell``). The Start button would return 409
+ *     because ``frida_routes.start_frida_server`` deliberately
+ *     refuses to silently kill+promote. The playbook surfaces the
+ *     single ``pgrep -f frida-server | xargs -r kill -9`` command
+ *     so the operator can kill it manually, then the Start button
+ *     succeeds on the next click.
+ *
+ *   * **``"unverified"``** — Layer 3 only (host-side ``frida-ps -U``
+ *     succeeded but no ``frida-server*`` process is visible in
+ *     ``ps -A``). The operator doesn't know which binary is actually
+ *     listening — could be a renamed ``frida-server`` (``/data/local/tmp/srv``
+ *     etc.), ``frida-gadget`` injected into the target app, or a
+ *     non-root server whose comm name doesn't match the Layer 1/2
+ *     prefix filter. Two-step playbook: ``adb shell "ps -A | grep
+ *     -iE 'frida|gadget'"`` to find the actual PID + binary name,
+ *     then ``adb shell "su 0 kill -9 <PID>"`` to kill it explicitly.
+ *     ``<PID>`` is left as a plain-text placeholder; auto-substitution
+ *     would lie about device state at render time (the operator must
+ *     read step 1's output first).
+ *
+ * Both playbooks omit the "start as root" command — the Start
+ * frida-server (as root) button rendered next to this hint by
+ * ``FridaServerStatusCard.actions`` is the single source of truth
+ * for that step, sourcing the canonical binary path from the route's
+ * ``_FRIDA_SERVER_BIN`` constant (no risk of drift).
+ *
+ * Reuses the ``frida-install-*`` CSS classes from ``FridaServerInstallHint``
+ * — visual parity with the red-state playbook + zero new CSS.
+ */
+function FridaServerDiagnoseHint({
+  mode,
+  uid,
+}: {
+  mode: "known-non-root" | "unverified";
+  uid: string | null;
+}) {
+  if (mode === "known-non-root") {
+    return (
+      <details className="frida-install-hint">
+        <summary>
+          Kill stale non-root <code>frida-server</code> before promoting to root
+        </summary>
+        <div className="frida-install-body">
+          <p className="frida-install-detect">
+            The Start button refuses to silently kill+restart an existing non-root
+            server{uid ? <> (currently running as <code>{uid}</code>)</> : null}.
+            Kill it first, then click <strong>Start frida-server (as root)</strong>{" "}
+            below.
+          </p>
+          <FridaInstallCmd cmd={`adb shell "pgrep -f frida-server | xargs -r kill -9"`} />
+        </div>
+      </details>
+    );
+  }
+  return (
+    <details className="frida-install-hint">
+      <summary>Diagnose which binary is actually running</summary>
+      <div className="frida-install-body">
+        <p className="frida-install-detect">
+          Reachable via host-side <code>frida-ps -U</code> but no <code>frida-server*</code>{" "}
+          process is visible in <code>ps -A</code>. Likely a renamed binary, frida-gadget
+          injected into the target app, or a non-root server. Find the actual process,
+          then kill it:
+        </p>
+        <ol className="frida-install-steps">
+          <li>
+            <span className="frida-install-step-label">Find process name + PID</span>
+            <FridaInstallCmd cmd={`adb shell "ps -A | grep -iE 'frida|gadget'"`} />
+          </li>
+          <li>
+            <span className="frida-install-step-label">
+              Kill it (substitute <code>&lt;PID&gt;</code> from step 1)
+            </span>
+            <FridaInstallCmd cmd={`adb shell "su 0 kill -9 <PID>"`} />
+          </li>
+        </ol>
+        <p className="frida-install-detect">
+          The card will flip red once the rogue process is gone — then click{" "}
+          <strong>Start frida-server (as root)</strong> below (or follow the install
+          playbook if the canonical binary isn't on the device yet).
+        </p>
+      </div>
+    </details>
   );
 }
 
