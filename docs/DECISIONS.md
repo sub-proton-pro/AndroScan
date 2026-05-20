@@ -1393,6 +1393,247 @@ v2.0 changes are isolated to three files: `executionFlowGraph.ts` + `ExecutionFl
 
 ---
 
+### DEC-031: Phase 13 v2-next — CFG-aware Behavior Trace flowchart ranking via slicer-side `method_invocations` data extension
+
+- **Status:** **Proposed** (2026-05-20; ratification surface for the v2-next.0 Ask-mode planning checkpoint per DEC-030's v2.0.1 closing-note "next ratification surface" promise. Lock-in pending operator answers to Q1-Q8 below.)
+- **Refines (does not supersede):** DEC-030 (v2 UX iteration; this DEC closes the v2-next promised ratification surface and addresses all three friction signals (a)+(b)+(c) from DEC-030's v2.0.1 closing-note dogfood-input record). DEC-029's three load-bearing locks (color-only edge emphasis, three-mode Static/Dynamic/Both toggle, threshold-color hook-count ladder ≤20/21-50/51-100/>100) stay **untouched**.
+- **Drives:** v2-next sub-step backlog (shape depends on Q1 answer — see § Tentative sub-step backlog below for the two candidate orderings).
+
+#### Context
+
+DEC-030 v2.0 shipped four operator-visible flowchart UX fixes 2026-05-19 (color-only emphasis preserved; global ALLOW/DENY sink coalescing; per-source neutral sinks de-emphasised + hover-progressive gate-count badge; `fill: context-stroke` arrowhead fix; within-column entry-first sort; within-page fullscreen toggle). v2.0.1 hotfixed the fullscreen width/height regression on the same calendar day. Operator dogfood within minutes of v2.0 deploying surfaced **three friction signals** captured verbatim in DEC-030's v2.0.1 closing note + the corresponding TASKS.md Active Task block:
+
+1. **Signal (a) — flat-layout friction.** Column-rank still feels like a single tall column without indentation; operator expected method calls to look like a real hierarchy (caller above, callees indented below). Formally fires the v2.1 promotion trigger DEC-030 locked at (a) subjective/dogfood-based — was ISSUE-022 territory until now.
+2. **Signal (b) — neutral-count clutter.** 5-6 small de-emphasised per-source `sink_neutral` nodes per flowchart still adds up visually; operator wants further merging (e.g., one collapsed "N neutral outcomes" chip per source method) or default-hidden behind a toggle.
+3. **Signal (c) — gate-count badge invisible.** Hover-progressive disclosure was a misread of operator behaviour; the operator doesn't hover-explore by default, so the v2.0 badge never registered; operator wants always-visible at rest with `-warn` modifier still visually distinct for unclassified gates. Effectively retracts the Q1 = (g) hover-progressive lock from v2.0 for the badge specifically (sink-hover tooltip behaviour preserved — the small sink is the affordance the operator hovers when they want detail).
+
+**v3 preview empirical findings (commit `c59d879`, 2026-05-20) — load-bearing diagnosis for this DEC.** The v3 preview shipped behind `?flow=v3` as exploratory code to test whether the call-graph injection deferred by DEC-030 (ISSUE-022 / originally-scoped v2.1) would resolve signal (a). The v3 preview took three categorical steps beyond v2's emitter — dropping synthetic ALLOW/DENY/neutral sinks (closing the hand-mockup's "why is ALLOW itself a box?" feedback), adding always-on `verdictSummary` chips on every gate card (per-verdict counts as the primary distribution surface), and routing real-callee terminals via `BypassPlan.target_method` resolution (when verdict is `allow`). The v3.1-fix iteration further added a `FRAMEWORK_CLASS_PREFIXES` denylist so `Intrinsics.checkNotNullParam` and friends no longer appear as rank-1 siblings.
+
+Operator dogfooded the v3.1 preview on the same WeakBank `MainActivity.onCreate$lambda$0` anchor (the trigger anchor for v2.0.1 signal (a)). **Result: the flat-layout friction persists.** Three surviving app-code methods (`LabStore.getPin`, `MainActivity.renderState`, `MainActivity.validatePin`) still sit horizontally at rank 1 below the entry. Walking through the data flow in Ask mode (recorded in this same agent-transcripts entry) localised the root cause: v3 relies on (i) synthesised `entry → DecisionPoint.method` `call` edges (one per gate-bearing method, fanning out from the entry) and (ii) plan-target edges (only emitted for `allow` verdicts), and the anchor has **`0 plans`** (all 20 decisions reclassified to neutral by the heuristic `branch_classifier`) so no plan-target edges fire to extend chain depth via Dagre's longest-path layering. All three methods are direct callees of the entry as far as Dagre can tell, so they correctly land at the same rank.
+
+**This is a slicer-side data-model limit, not a renderer limit.** The `BehaviorAnchor` payload (`androscan/analysis/trace_types.py::BehaviorAnchor`, mirrored TS-side at `androscan/web/frontend/src/api/trace.ts:177-187`) carries:
+
+```python
+@dataclass(frozen=True)
+class BehaviorAnchor:
+    entry_method: MethodRef
+    hops: int
+    truncated: bool
+    incomplete: bool
+    decisions: tuple[DecisionPoint, ...]
+    plans: tuple[BypassPlan, ...]
+    advanced_plans: tuple[BypassPlan, ...]
+    rationale: str
+    low_confidence_decision_indices: tuple[int, ...]
+```
+
+It knows **which methods contain `if`/`switch` instructions** (via `decisions[*].method` + `decisions[*].instruction_index`), **which bypass plans cross-reference which decision** (via `plans[*].source_decision_method` + `source_decision_instruction_index` + optional `target_method`), and **confidence + verdict for each branch**. It does **not** know:
+
+- **Per-method invocation sequence.** The bytecode of `login` has `invoke check_active_session`, `invoke check_input`, `invoke validate_pin`, `invoke create_session`, `invoke PostLoginActivity`, `invoke Login_UI_text` at specific instruction indices in order — but none of that lives in `BehaviorAnchor`. The anchor only carries the if/switch instructions, not the invoke instructions.
+- **Caller → callee relationships.** Even decision-free callees (e.g., `validate_pin` calling `validate_pin_final`, or `create_session` doing UUID gen + field write) wouldn't have any record of who calls them — the call graph is a separate artefact (`call_graph.sqlite`, ISSUE-022, not wired into the anchor yet).
+- **CFG structure within a method.** The basic-block graph of `login` (which decisions dominate which calls, which calls live in which branch arm) is something Soot/the slicer computed in the slicer pass but **discarded** before producing `BehaviorAnchor`.
+
+The v3 preview demonstrates that ISSUE-022's originally-scoped fix (inject `call_graph.sqlite::neighbors()` as `kind: "call"` edges before BFS) would help but would NOT produce the operator's mental model. ISSUE-022 alone gives a wide fan-out (call-graph depth = 1 for all of `login`'s direct callees: `check_active_session`, `check_input`, `validate_pin`, `create_session`, `PostLoginActivity`, `Login_UI_text` all sit at rank 1 as siblings). To get a **vertical chain** ranked by **statement order inside the entry's body** (operator's hand-mockup posture), the emitter needs:
+
+1. A per-method **invocation sequence** (with instruction indices for ordering).
+2. A per-invocation **branch-dominance label** (which `if`-arm of which decision does this invoke live in) so off-axis terminals (the deny/Ret: False branches in the operator's mockup) become siblings of the rank-below sequential call rather than collapsing into a verdict chip.
+3. The **decision-free callees kept as first-class nodes**. v3.1's filter rule (`isEntry || isDecisionSource || isPlanTarget`) drops `validate_pin` (pure call to `validate_pin_final`), `validate_pin_against_store` (pure boolean return), and `create_session` (UUID gen, no decisions) — exactly the methods the operator's hand-mockup keeps as call points.
+
+The Ask-mode trace through a worked Kotlin example (`com.example.mocklogin.LoginActivity.login(String, String)` — nested local functions `check_active_session`, `check_input`, `validate_pin` containing `validate_pin_format` + `validate_pin_against_store` + `validate_pin_final`, `create_session`, plus the outer `Login_UI_text` + `PostLoginActivity`) confirmed v3.1 would produce 6 siblings at rank 1 and lose 3 of the operator-meaningful methods entirely. The operator's response: "The ranking is simply done based on presence within a method (even when it is the entry). The idea of a rank is to put them in the same column of indentation, not lay them horizontally. And the order in which they appear in login's definition should decide how far down from login in the graph they are."
+
+#### Proposed solution (subject to Q1-Q8 ratification below)
+
+**Two-layer change** — additive at the schema layer, new emitter at the renderer layer.
+
+##### Slicer side (Python; `androscan/analysis/`)
+
+New field on `BehaviorAnchor`:
+
+```python
+@dataclass(frozen=True)
+class CallSite:
+    """One ``invoke-*`` instruction in a method's body, with the
+    dominating decision (if any) and branch arm label so the
+    renderer can reconstruct CFG-position-aware ranking.
+
+    Captured by the slicer alongside the existing decision walk;
+    same Soot CFG pass that computes basic-block dominance for
+    the predicate-origin slicer can surface ``in_branch_of`` +
+    ``branch_label`` essentially for free. The slicer already
+    discards this information post-walk; v2-next preserves it."""
+
+    caller: MethodRef
+    instruction_index: int        # position in the caller's bytecode
+    callee: MethodRef             # resolved invoke target (or external/unresolved fallback)
+    in_branch_of: int | None      # the dominating decision's instruction_index in the same caller, if any
+    branch_label: str | None      # which arm of that decision ("R0:if-true" / "fallthrough" / etc.; matches Branch.label)
+
+@dataclass(frozen=True)
+class BehaviorAnchor:
+    # ... existing fields unchanged ...
+    method_invocations: dict[str, tuple[CallSite, ...]]  # NEW; key = overload signature; default = empty dict for back-compat
+```
+
+Implementation locus: extends the slicer pass in `androscan/analysis/slicing.py` (or a new sibling module) to surface the invoke instruction list while it walks the entry's closure. Soot's CFG already computes basic-block dominance for the predicate-origin slicer; surfacing `(in_branch_of, branch_label)` requires no new analysis pass, only preserving data the slicer already had.
+
+Backwards compatibility: `method_invocations` defaults to `{}` (empty dict). v2 / v2.0.1 anchors already in `trace.sqlite` deserialise correctly (the field defaults to empty); the renderer treats an empty dict as "no CFG data available, fall back to v3.x layout".
+
+##### Renderer side (TypeScript; `androscan/web/frontend/src/components/trace/`)
+
+New emitter `executionFlowGraphV4.ts` (or evolved-in-place `executionFlowGraphV3.ts` per Q7 below) that consumes `BehaviorAnchor.method_invocations`:
+
+1. **Walk the entry method's `method_invocations[entryKey]` list in `instruction_index` order.**
+2. **Emit a sequential `prev_invoke → next_invoke` `call` edge between consecutive callees in the same branch arm** — Dagre's longest-path layering naturally stacks them vertically.
+3. **For each decision in the entry, emit sibling subtrees:** one column per `branch_label`, with each branch's call list at increasing rank. Off-axis (deny/Ret: False) branch terminals become siblings of the next sequential call in the happy-path arm at the same rank.
+4. **Recurse into each callee that itself has `method_invocations` entries** (so `check_input`'s three internal gates show as deny-side terminals into `Login_UI_text("bad_input")`, not as a single chip; `validate_pin` → `validate_pin_final` → `validate_pin_format` + `validate_pin_against_store` becomes a real chain).
+5. **Keep decision-free methods (`validate_pin`, `create_session`, etc.) as first-class nodes** because they're now ingested via `method_invocations`, not via `anchor.decisions` or `anchor.plans` — the filter rule expands accordingly.
+
+Dagre still does the heavy lifting (`rankdir: 'TB'`, `network-simplex` ranker, no custom layout primitive). The new emitter changes only **which edges Dagre sees**.
+
+##### Migration story
+
+- v2 / v2.0.1 keeps serving as production until v4 lands and is operator-ratified.
+- v3 preview (`?flow=v3`) keeps the cosmetic improvements (no synthetic sinks, verdict-summary chip, framework filter, real-callee terminals via plan resolution); its layout is unchanged because `method_invocations` isn't populated yet at the time v3 was authored.
+- New emitter ships behind `?flow=v4` (or evolved-in-place per Q7) once slicer landings are operator-ratified.
+- Promotion to default happens after dogfood confirms the CFG-aware layout matches the operator's mockup intuition.
+- Slicer change is purely additive (new optional field on `BehaviorAnchor`). Old `trace.sqlite` caches deserialise cleanly; v4 falls back to v3-shaped layout when `method_invocations` is empty.
+
+#### Open Q&As — Ask-mode operator ratification surface
+
+This DEC ships **Proposed** with eight ratification questions awaiting operator answer. Each Q lists concrete options + my recommendation + rationale. Lock-in happens via a follow-up Ask-mode planning checkpoint (mirroring DEC-029 13.0 / DEC-030 plan-mode iteration); the answers get appended verbatim to this DEC entry under a "Planning-checkpoint Q&A record" sub-heading and the status flips `Proposed → Active` at that point.
+
+**Q1. Ship vehicle — single broader v2.1 OR three separate sub-steps?**
+
+| Option | Description |
+|---|---|
+| (a) Single v2.1 (broader than DEC-030's originally-scoped v2.1) | One sub-step covers signals (a)+(b)+(c) end-to-end including the slicer change. Largest ship vehicle; longest dogfood gap; one ratification surface. |
+| (b) Three separate sub-steps in size order: **c → v2.0.2** (FE-only gate-count badge always-visible toggle, smallest ship vehicle, quick win); **b → v2.2** (FE-only neutral coalescing, medium); **a → v2.1** (slicer extension + new v4 emitter, biggest). | Smallest first ships fast; three ratification surfaces, three commits; each can dogfood independently. |
+| (c) Two-stage: **(b)+(c) together as v2.0.2** (both small FE-only) then **(a) as v2.1** (slicer + emitter, larger). | Groups the FE-only fixes for a single quick-win commit; separates the slicer side. |
+
+**Recommendation: (b).** The three signals are conceptually independent — (c) is a CSS/render-posture flip, (b) is a graph-build rule, (a) is a slicer + emitter overhaul. Folding them together inflates ratification surface area. (b) lets the operator dogfood (c)'s "is always-visible actually better?" and (b)'s "does the coalesced chip kill the clutter?" before committing to the (a) heavy lift. The slicer change is real software with its own test surface (Python `tests/test_decisions_slicing.py` extensions) and deserves its own ratification cadence apart from FE tweaks.
+
+**Q2. CallSite shape — minimal vs. complete vs. external-graph-only?**
+
+| Option | Description |
+|---|---|
+| (a) Complete — `(caller, instruction_index, callee, in_branch_of, branch_label)` per the proposal above. | Renderer gets everything it needs; trade-off is a slicer-side computation surface (must surface dominance + branch arm labels). |
+| (b) Minimal — `(caller, instruction_index, callee)` only; branch dominance computed FE-side by walking `decisions[]` and comparing instruction indices. | Smaller slicer change; FE-side dominance reconstruction is brittle (needs basic-block boundaries the FE doesn't have). |
+| (c) Wire to `call_graph.sqlite` directly — emit only the subset of the existing call graph that touches the anchor closure; CFG branch labels computed separately (or skipped, in which case the renderer falls back to v3 layout). | Reuses existing infrastructure; doesn't get branch-arm labels (siblings collapse). |
+
+**Recommendation: (a).** Gives the renderer everything needed in a single field; avoids brittle FE-side reconstruction. The slicer already has the basic-block CFG in hand during the predicate-origin walk; surfacing dominance labels is essentially free. The +5-field-per-CallSite wire-cost is negligible relative to the existing `DecisionPoint` payload weight.
+
+**Q3. Computation locus — slicer pass extension vs. separate post-pass vs. lazy-on-demand?**
+
+| Option | Description |
+|---|---|
+| (a) Extend the existing slicer pass in `androscan/analysis/slicing.py` (or a new sibling module) to walk invoke instructions alongside decision-point walking. Same Soot CFG visit. | Single pass keeps the slicer the source of truth; consistent with how `BehaviorAnchor` is currently built. |
+| (b) Separate post-processing module that walks the anchor's closure + decompiled sources to extract the invocation lists. | Decouples the slicer; allows incremental rollout; doubles the bytecode-walking cost per anchor. |
+| (c) Lazy-on-demand — slicer emits placeholder; renderer requests `method_invocations` on-demand via new endpoint when an anchor is opened. | Smallest cache footprint; biggest per-render latency; adds a new endpoint to the API surface. |
+
+**Recommendation: (a).** Single-pass discipline; the slicer is already the source of truth for `BehaviorAnchor`; reusing its Soot session avoids re-instantiating the CFG. The slicer's existing `_DescentBudget` + `MAX_SLICE_DEPTH` + framework denylists naturally apply to the invocation walk too.
+
+**Q4. Schema version — bump 2 → 3 with cache wipe OR keep at 2 additively?**
+
+| Option | Description |
+|---|---|
+| (a) Bump `SCHEMA_VERSION 2 → 3` with cache wipe — clean break, no backwards-compat code path. | Matches the Phase 11 v2 → v2.1 cadence; forces operators to rebuild traces to see the new visual. |
+| (b) Keep at 2 with `method_invocations: dict = field(default_factory=dict)` so old caches still load (empty dict means renderer falls back to v3-shaped layout). | Additive-by-design discipline per DEC-022 / Phase 11 v2.1.5 widgets; renderer gracefully degrades. No cache wipe. |
+| (c) Bump to 3 but write a one-shot migration that scans existing v2 caches and lazily computes `method_invocations` from `decisions[]` + decompiled sources. | Old caches survive without rebuild; biggest migration surface area. |
+
+**Recommendation: (b).** The Phase 11 v2.1.5 `SkillResult.widgets` extension set the additive-by-design precedent for this kind of schema growth; honouring it here keeps the cache-bump count down (operators rebuild traces only when they want the new visual, not because we forced them). v4 emitter naturally handles `method_invocations: {}` by falling back to v3 layout — the empty-dict signal is unambiguous.
+
+**Q5. Gate-count badge always-visible posture (signal c)?**
+
+| Option | Description |
+|---|---|
+| (a) Always-visible at rest — drop the hover-progressive disclosure entirely. `-warn` modifier still raises emphasis when `unclassifiedGates > 0`. | Operator-confirmed preferred posture. Cleanest implementation. |
+| (b) Always-visible only when `unclassifiedGates > 0` (the `-warn` case); hidden otherwise. | Cleaner default view; loses the badge-as-an-anchor-for-spotting-fully-classified gates. |
+| (c) Always-visible with operator toggle — keep both default-hidden + always-visible modes available, surface a Settings toggle. | Discoverable; adds Settings surface area for what should be a posture flip. |
+
+**Recommendation: (a).** Operator explicitly confirmed they don't hover-explore by default; (a) directly addresses the misread. (b) preserves a partial hover-progressive intuition that the operator already rejected.
+
+**Q6. Neutral coalescing (signal b)?**
+
+| Option | Description |
+|---|---|
+| (a) Collapsed "N neutral outcomes" chip per source method on the gate card itself; per-source `sink_neutral` nodes dropped entirely from the graph. | Cleanest visual; the `verdictSummary` chip (already v3.1's posture) is the right home. |
+| (b) Default-hidden behind operator toggle — neutral sinks stay in the graph but hidden by default, surface a toggle in the section header. | Preserves the anchor for misclassification spotting; one more piece of chrome. |
+| (c) Aggregate to single global neutral sink (parallel to v2.0's `GLOBAL_ALLOW_SINK_ID` / `GLOBAL_DENY_SINK_ID`). | Symmetric with allow/deny coalescing; the global neutral sink loses the per-source feeding-gates tooltip. |
+| (d) Leave as-is — v2.0 small-de-emphasised per-source neutral sinks are already minimal; only the visual count is operator's complaint. | Zero change; banks on (a)+(c) of THIS DEC tightening the rest of the visual to make the residual neutrals tolerable. |
+
+**Recommendation: (a).** The `verdictSummary` chip is already the always-visible per-verdict count surface (`2 allow · 1 deny · 8 ?`); the per-source `sink_neutral` node is redundant once the chip is always-visible per Q5. The feeding-gates tooltip (the v2.0 sink-hover affordance) gets re-homed to the verdict-chip tooltip — same data, same hover affordance, fewer nodes.
+
+**Q7. v3 preview disposition?**
+
+| Option | Description |
+|---|---|
+| (a) Keep `?flow=v3` URL gate as-is until v4 ships, then deprecate both v3 and the URL gate (`?flow=v4` replaces it; v3 stays accessible for one release as a rollback target). | Conservative; preserves v3 as a known-good preview state. |
+| (b) Deprecate v3 now — remove the preview code, ship v4 directly when ready. | Smallest preview-code surface; loses the v3 cosmetic improvements until v4 lands. |
+| (c) Roll forward incrementally — `executionFlowGraphV3.ts` evolves into v4 as the slicer changes land. One preview module, no separate v4. Promote to default when CFG-aware ranking lands. | Smallest commit surface area; conflates two versions in one module's history; complicates rollback. |
+
+**Recommendation: (a).** v3 already lives as a self-contained module pair (`ExecutionFlowV3.tsx` + `executionFlowGraphV3.ts`); paying the slightly-larger preview-code surface buys clean rollback ("flip the URL param to compare v3 vs. v4 side-by-side"). The v3 cosmetic improvements (no synthetic sinks, verdict-summary chip, framework filter) are also operator-visible signals during v4 dogfood — the operator can isolate "did the CFG-aware ranking help?" from "did the cosmetic improvements help?" by URL-swapping.
+
+**Q8. Test coverage scope?**
+
+| Option | Description |
+|---|---|
+| (a) Slicer-side only — pin the `method_invocations` shape via `tests/test_decisions_slicing.py` extensions; FE side gets the existing `tsc --noEmit` + `vite build` verification (no FE test runner shipped yet per Phase 13 v2.0-tests deferral). | Smallest infra change; FE regressions only caught at dogfood time. |
+| (b) Slicer + FE — ship the FE test runner (the deferred v2.0-tests sub-step) alongside, cover both the new shape parsing + the v4 emitter's CFG-edge-construction logic. Folds v2.0-tests into the v2.1 ratification surface. | Symmetric test surface; resurrects the v2.0-tests scope that was deprioritised vs v2-next. |
+| (c) Slicer + FE + integration — end-to-end test from anchor build through render via a headless browser harness. | Best coverage; biggest infra commitment; introduces a new test layer (headless browser) the project doesn't have yet. |
+
+**Recommendation: (b).** The FE test infra was already a committed follow-up (Phase 13 v2.0-tests sub-step) that got deprioritised vs v2-next because operator-visible friction won — but the v4 emitter is the biggest FE change since 13.6 and absolutely deserves test coverage. Folding v2.0-tests into the v2.1 sub-step ratification surface kills two birds (test infra + v4 emitter unit tests) with one planning-checkpoint decision (which FE test runner — `vitest` vs `node:test` vs others — locked at the v2.1.0 planning checkpoint top).
+
+#### Tentative sub-step backlog (shape depends on Q1 answer)
+
+**If Q1 = (b) three separate sub-steps:**
+
+| Sub-step | Vehicle | Signal | Estimated scope |
+|---|---|---|---|
+| **v2.0.2** | FE-only CSS + render posture flip on `.execution-flow-node-gate-badge` | (c) gate-count badge always-visible | ~10 LOC CSS + ~5 LOC render comparator; smallest commit; quick-win |
+| **v2.2** | FE-only emitter rule + render flip; per-source `sink_neutral` nodes dropped from graph; `verdictSummary` chip already always-visible from v3.1 — but lands here in production v2 path | (b) neutral coalescing into chip | ~30 LOC graph-builder + ~20 LOC render delta + verdict-chip tooltip re-home |
+| **v2.1.0** | Ask-mode planning checkpoint locking FE test runner choice + v4 emitter contract | meta — gates v2.1 | docs only |
+| **v2.1.1** | Slicer extension — new `CallSite` dataclass + `method_invocations` field on `BehaviorAnchor` + slicer-pass extension + `tests/test_decisions_slicing.py` extension covering `method_invocations` shape on at least 3 anchor types (linear / branchy / nested-locals) | (a) part 1 — backend | ~+350 LOC slicer + ~+30 tests |
+| **v2.1.2** | FE v4 emitter — `executionFlowGraphV4.ts` consuming `method_invocations` + `ExecutionFlowV4.tsx` renderer + `?flow=v4` URL gate + FE unit tests on the new emitter | (a) part 2 — frontend | ~+450 LOC FE + ~+25 tests |
+| **v2.1.3** | Dogfood window + promotion to default (operator-ratified after side-by-side comparison v3 vs. v4 on real anchors) | (a) part 3 — promotion | docs sweep |
+
+**If Q1 = (a) single broader v2.1:**
+
+One v2.1 commit covering all three signals end-to-end including the slicer change. Bigger ratification surface; one commit. Sub-step backlog collapses to v2.1.0 planning checkpoint + v2.1 implementation + v2.1-tests follow-up.
+
+#### Rationale (high-level; assumes recommended answers)
+
+- **Slicer-side data extension is the right home, not FE-side reconstruction.** The slicer is already the source of truth for `BehaviorAnchor`; bolting CFG/invocation-sequence reconstruction onto the renderer would duplicate logic that already lives upstream and would lose context (Soot already computes basic-block dominance during the predicate-origin walk). The Q3 = (a) recommendation honours single-pass discipline.
+- **Additive schema (Q4 = (b)) preserves operator workflow.** Operators with v2-era trace caches can keep using them; the renderer falls back gracefully. Avoids the cache-wipe pain Phase 11 v2 → v2.1 (`SCHEMA_VERSION 1 → 2`) imposed.
+- **Three separate sub-steps (Q1 = (b)) optimises for dogfood feedback.** Each fix surfaces its impact independently — the operator can answer "is always-visible the right badge posture?" before committing to "do collapsed neutrals work?" before committing to "does CFG-aware ranking match the mental model?". (a) bundles them and forces a single yes/no, which loses the diagnostic signal.
+- **v3 preview kept as rollback (Q7 = (a))** because v3.x cosmetic improvements remain operator-visible signals during v4 dogfood; isolating "cosmetic" from "structural" helps diagnose any v4 regressions.
+
+#### Out of scope for v2-next (regardless of Q1 split)
+
+- **Marching-ants animation on fired edges** — ISSUE-017, operator-demand-gated.
+- **Branch-outcome inference from dynamic data** — ISSUE-018, operator-demand-gated.
+- **Per-thread layout reshape into thread lanes** — ISSUE-019, operator-demand-gated.
+- **Bootstrap-fetch GET route for cached summaries** — ISSUE-020, operator-demand-gated.
+- **`<MethodSummaryWidget>` "Refresh summary" + pan-to-fit-on-selection** — ISSUE-021, operator-demand-gated.
+- **Cross-platform `BehaviorAnchor` adapters** (iOS / WebView / native-binary) — DEC-024 / DEC-026 territory; orthogonal to v2-next.
+- **Frontend rebrand or restructure of unrelated tabs** — out of scope.
+
+#### Roll-back path
+
+Per-sub-step roll-back stories (assuming Q1 = (b)):
+
+- **v2.0.2 (signal c) roll-back:** single CSS file revert; ~10 LOC change. Restores v2.0's hover-progressive disclosure.
+- **v2.2 (signal b) roll-back:** revert the graph-builder + render changes (~50 LOC). v2.0's per-source `sink_neutral` nodes return.
+- **v2.1 (signal a) roll-back:**
+  - Slicer side: schema is additive (Q4 = (b)); rolling back the slicer change means `method_invocations` is always empty on new traces. Old traces from v2.1.x continue to deserialise.
+  - FE side: revert the `?flow=v4` wiring; v3 preview stays untouched per Q7 = (a); production stays on v2 / v2.0.1.
+- **Whole-DEC roll-back:** the DEC entry stays as a Superseded record; the v2.0.2 / v2.2 / v2.1 commits get reverted independently. v3 preview stays as a non-default URL-gated preview.
+
+#### Status flip rule
+
+This DEC stays **Proposed** until the v2-next.0 Ask-mode planning checkpoint locks Q1-Q8 answers verbatim. At that point: the locked answers get appended to this DEC entry as a "Planning-checkpoint Q&A record" table (mirroring DEC-030's format); status flips `Proposed → Active`; the sub-step backlog row in TASKS.md gets fleshed out per the Q1 = (?) outcome.
+
+---
+
 ## Superseded / deprecated decisions
 
 Use this section when a previous decision is replaced.
