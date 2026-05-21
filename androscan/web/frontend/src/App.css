@@ -6753,6 +6753,35 @@ code { color: var(--accent); }
   color: var(--muted);
 }
 
+/* v3.X-next.2 / DEC-031 N7 — when the renderer has an
+ * ``onSourceLineClick`` callback wired, the source-line pill is
+ * rendered as a button so keyboard navigation + screen readers
+ * treat it as an interactive control. Styled to keep the muted-
+ * pill look but with the accent underline on hover / focus so the
+ * affordance reads. ``button`` defaults (padding, background,
+ * border) are reset so it visually matches the ``span`` sibling
+ * the static cards still render. */
+.execution-flow-node-source-line-clickable {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+  text-decoration: underline dotted transparent;
+  text-underline-offset: 2px;
+  transition: color 0.12s ease, text-decoration-color 0.12s ease;
+}
+
+.execution-flow-node-source-line-clickable:hover,
+.execution-flow-node-source-line-clickable:focus-visible {
+  color: var(--accent);
+  text-decoration: underline dotted currentColor;
+  outline: none;
+}
+
 .execution-flow-node-overload-pill,
 .execution-flow-node-inlined-pill {
   padding: 1px 5px;
@@ -8012,6 +8041,20 @@ code { color: var(--accent); }
   stroke: var(--border-strong);
   stroke-dasharray: 0;
   opacity: 0.85;
+}
+
+/* --- v3.X-next.2 CFG-position-aware invocation edge. Sourced from
+ *  ``BehaviorAnchor.method_invocations``; carries the smali
+ *  instruction index + branch context so the Dagre layout stacks
+ *  callees vertically in true execution order. Visually the same
+ *  family as ``.execution-flow-edge-call`` (muted gray, neutral
+ *  arrow, no operator-readable label) — the layout itself is what
+ *  carries the CFG-position signal, the edge stroke is just the
+ *  connector between cards in the vertical chain. */
+.execution-flow-edge-invoke {
+  stroke: var(--border-strong);
+  stroke-dasharray: 0;
+  opacity: 0.78;
 }
 
 /* --- Preview panel chrome (top-left) --- */

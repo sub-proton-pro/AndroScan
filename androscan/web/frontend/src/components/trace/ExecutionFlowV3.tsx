@@ -1,15 +1,13 @@
 /**
- * Behavior Trace **v3 preview** — flowchart renderer.
+ * Behavior Trace **V3** — flowchart renderer (production).
  *
- * **PRE-DEC PRODUCTION PREVIEW** — mounted only behind the
- * ``?flow=v3`` URL gate in ``LabTraceMode``; the v2.0
- * ``ExecutionFlow`` remains the default production renderer. The
- * file is deliberately a parallel module rather than a v2 patch so
- * the old + new visuals can be compared side-by-side during the
- * preview window. Once the operator signs off on the visual, the v3
- * path replaces the v2 path (Q5 = (b) hard-cut per the pre-preview
- * plan) and v2.0's ``ExecutionFlow.tsx`` + ``executionFlowGraph.ts``
- * get archived.
+ * v3.X-next.2 promoted V3 from preview to production: the
+ * ``?flow=v3`` URL gate + the v2-pair (``ExecutionFlow.tsx`` +
+ * ``executionFlowGraph.ts``) were deleted in the same commit that
+ * landed the CFG-position-aware ``method_invocations`` consumer.
+ * V3 is now the sole flowchart renderer and the v2 path has been
+ * archived per DEC-031 N2 = (i) (immediate-deletion of the v2
+ * pair, no transition window).
  *
  * **What's different from v2.0**:
  *
@@ -57,16 +55,44 @@
  *     ``width: 100vw; height: 100vh;`` so the v3 path inherits the
  *     same viewport-fill behaviour without a separate CSS rule.
  *
- * **Out of scope for the preview**:
+ * **v3.X-next.2 additions** (this revision):
  *
- *   * Dynamic-overlay rendering (``firedMethods`` / ``liveValues``
- *     / ``hookFailed``). The v2 component carries these; the v3
- *     preview defers them so the static visual gets confirmed
- *     first. Once v3 lands as production, the dynamic-overlay
- *     paths will port over.
- *   * Inspector wiring beyond the click handler. Click works,
- *     selection halo works; richer Inspector consumption stays on
- *     the v2 component until v3 is promoted.
+ *   * **``method_invocations`` consumer.** The renderer now ingests
+ *     ``BehaviorAnchor.method_invocations`` (CallSite sequences
+ *     keyed by caller signature) and emits ``invoke`` edges that
+ *     carry the smali ``instruction_index`` + branch-arm identity.
+ *     Dagre's top-down ranking then stacks callees vertically in
+ *     true execution order rather than the v3.1 flat-fan layout.
+ *     The pre-v3.X-next.2 synthesised ``call`` edges survive as
+ *     the Q5=(a) gap-fallback for caches built before the backend
+ *     emitted the field (legacy ``trace.sqlite`` rows or anchors
+ *     that the slicer truncated before any invocation was
+ *     captured).
+ *   * **Dynamic-overlay surface ported from v2.** Fired-method
+ *     accent + fired-edge emphasis + untaken-dynamic edge fade +
+ *     depth pill on fired nodes + live-value chip on fired edges
+ *     + runtime ``hook_failed`` "inlined (runtime)" decoration.
+ *     Mode toggle (Static / Dynamic / Both) drives all four.
+ *   * **N6 verdict-chip relabels.** Per DEC-031 N6 the terse
+ *     ``9 ?`` / ``9 unv`` chip labels grew to plain-language
+ *     ``9 neutral?`` / ``9 unverdicted?`` with per-sub-chip hover
+ *     tooltips sourced from ``copy.ts``. The aggregate chip-level
+ *     hover still spells out the per-bucket totals + the
+ *     visibility caveat (the per-bucket counts ALSO include
+ *     verdicts that the rendered next-method edge already
+ *     reflects).
+ *   * **N7 source-line pill clickable.** When the consumer wires
+ *     an ``onSourceLineClick`` callback, the ``line N`` pill on a
+ *     method card becomes a button that fires the callback with
+ *     ``(className, methodName, sourceLine)`` — ``LabTraceMode``
+ *     plugs it into ``setPendingCodeNav`` + ``setTab("inspect")``
+ *     for one-click jump to the Code Browser.
+ *   * **N8 title shape swap.** Primary line on the card is now the
+ *     method name only (``validatePin``) with the fully-qualified
+ *     ``MainActivity.validatePin`` as the secondary line. The old
+ *     v3.1 pattern (``MainActivity.validatePin`` primary +
+ *     ``MainActivity`` chip) was redundant — the chip's value was
+ *     already encoded in the primary.
  *
  * **Dagre integration notes**:
  *
@@ -106,14 +132,48 @@ import {
 import "@xyflow/react/dist/style.css";
 import dagre from "@dagrejs/dagre";
 
-import type { BehaviorAnchor } from "../../api/trace";
+import type {
+  BehaviorAnchor,
+  HookFailureRecord,
+  LiveValueRecord,
+} from "../../api/trace";
 import {
   buildExecutionFlowV3Graph,
   graphV3Stats,
+  overloadKeyFromNodeId,
   type ExecutionFlowV3Edge,
   type ExecutionFlowV3Node,
   type ExecutionFlowV3Options,
 } from "./executionFlowGraphV3";
+import type { TraceMode } from "./TraceModeToggle";
+import { VERDICT_CHIP_LABELS, VERDICT_CHIP_TOOLTIPS } from "./copy";
+
+// ---------------------------------------------------------------------------
+// Live-value chip formatter — ported verbatim from v2's
+// ``ExecutionFlow.tsx`` (DEC-031 N2=(i) immediate-deletion of the
+// v2 pair means V3 owns this helper now). Pre-formats the per-edge
+// "args → ret" chip so the renderer doesn't need to know about
+// ``LiveValueRecord``'s shape.
+
+const LIVE_LABEL_BUDGET_CHARS = 56;
+const LIVE_LABEL_ARG_BUDGET = 24;
+
+function composeLiveLabel(live: LiveValueRecord | null): string | null {
+  if (!live) return null;
+  const truncate = (s: string, n: number) =>
+    s.length <= n ? s : s.slice(0, Math.max(0, n - 1)) + "…";
+  const args = (live.args ?? [])
+    .slice(0, 4)
+    .map((a) => truncate(a, LIVE_LABEL_ARG_BUDGET));
+  const argsPart = args.length > 0 ? args.join(", ") : "";
+  const moreArgs =
+    (live.args?.length ?? 0) > 4 ? `, +${(live.args?.length ?? 0) - 4} more` : "";
+  const retPart =
+    live.ret != null ? ` → ${truncate(live.ret, LIVE_LABEL_ARG_BUDGET)}` : "";
+  const out = `${argsPart}${moreArgs}${retPart}`.trim();
+  if (!out) return null;
+  return truncate(out, LIVE_LABEL_BUDGET_CHARS);
+}
 
 // ---------------------------------------------------------------------------
 // Layout constants — v3 is top-down (rankdir TB) so the pitch
@@ -136,12 +196,51 @@ type Props = {
   anchor: BehaviorAnchor;
   selectedNodeId?: string | null;
   onNodeClick?: (node: ExecutionFlowV3Node) => void;
-  /** v3 preview toggles — wired into ``?flow=v3&...`` URL params by
-   *  the consumer. Both default ``undefined`` so the underlying
-   *  graph builder falls back to its v3.1 defaults
-   *  (``hideRetPills=true``, ``gatesOnly=true``). */
+  /** v3.X-next.2 — opt-in toggle to drop the per-branch
+   *  ``return_pill`` terminals and accumulate verdict counts into
+   *  the gate card's chip. Default ``undefined`` lets the emitter's
+   *  v3.1-baseline default (``true``) win. Operator override path
+   *  is the legacy ``?pills=show`` URL param wired through
+   *  ``LabTraceMode``. */
   hideRetPills?: boolean;
+  /** v3.X-next.2 — opt-in toggle to disable the framework-package
+   *  filter (``kotlin.*``, ``androidx.*``, ``java.*`` etc. per
+   *  ``FRAMEWORK_CLASS_PREFIXES``). Default ``undefined`` lets the
+   *  emitter's v3.1 default (``true``) win. Operator override path
+   *  is the legacy ``?methods=all`` URL param. */
   gatesOnly?: boolean;
+  /** Phase 13 sub-step 13.8 — overlay mode (Static / Dynamic /
+   *  Both). Drives fired-edge / fired-node accent rendering plus
+   *  the untaken-edge fade in ``"dynamic"`` mode. Default
+   *  ``"static"`` so call sites that don't yet pass the prop keep
+   *  their original rendering. */
+  mode?: TraceMode;
+  /** Phase 13 sub-step 13.8 — set of overload keys (descriptor-
+   *  stripped Smali) that have fired during the current dynamic
+   *  trace. Empty in ``"static"`` mode. */
+  firedMethods?: ReadonlySet<string>;
+  /** Phase 13 sub-step 13.8 — per-method live values (latest fire's
+   *  args / return / thread + fire count) keyed by overload key.
+   *  Used to populate the depth pill on fired nodes + the live-
+   *  value chip on fired edges. Empty in ``"static"`` mode. */
+  liveValues?: ReadonlyMap<string, LiveValueRecord>;
+  /** Phase 13 sub-step 13.9 — runtime ``hook_failed`` confirmations
+   *  keyed by overload key. Drives the warn-orange "inlined
+   *  (runtime-confirmed)" decoration on the affected node. Empty
+   *  in ``"static"`` mode. */
+  hookFailed?: ReadonlyMap<string, HookFailureRecord>;
+  /** v3.X-next.2 / DEC-031 N7 — source-line pill clickable. Called
+   *  with the node's MethodRef-derived source line + class /
+   *  method names so the consumer can open the Code Browser via
+   *  the existing ``pendingCodeNav`` plumbing. Receives the same
+   *  ``(className, methodName, sourceLine)`` triple that the
+   *  Inspector's "Open source" button uses; ``LabTraceMode`` wires
+   *  it through. Default no-op when omitted. */
+  onSourceLineClick?: (target: {
+    className: string;
+    methodName: string;
+    sourceLine: number;
+  }) => void;
 };
 
 // ---------------------------------------------------------------------------
@@ -202,12 +301,31 @@ function layoutWithDagre(
 
 // ---------------------------------------------------------------------------
 // Custom node component
+//
+// v3.X-next.2 — extended with dynamic-overlay decoration (fired
+// emphasis + depth pill + runtime-confirmed inlined pill) + N6 chip
+// relabels (``9 ?`` → ``9 neutral?``, ``9 unv`` → ``9 unverdicted?``)
+// + N7 source-line pill clickable + N8 title shape swap (method
+// name primary, fully-qualified secondary).
 
-type NodeData = ExecutionFlowV3Node;
+type NodeData = ExecutionFlowV3Node & {
+  mode?: TraceMode;
+  fired?: boolean;
+  live?: LiveValueRecord | null;
+  runtimeInlined?: HookFailureRecord | null;
+  onSourceLineClick?: (target: {
+    className: string;
+    methodName: string;
+    sourceLine: number;
+  }) => void;
+};
 
 function MethodNodeV3({ data, selected }: NodeProps<Node<NodeData>>) {
   const n = data;
   const isPill = n.kind === "return_pill";
+  const isFiredEmphasis =
+    !!n.fired && (n.mode === "dynamic" || n.mode === "both");
+  const isRuntimeInlined = !!n.runtimeInlined;
 
   const cardClass = [
     "execution-flow-node",
@@ -216,6 +334,9 @@ function MethodNodeV3({ data, selected }: NodeProps<Node<NodeData>>) {
     n.kind === "gate" && "execution-flow-node-v3-gate",
     selected && "execution-flow-node-selected",
     isPill && "execution-flow-node-retpill",
+    isFiredEmphasis && "execution-flow-node-fired",
+    n.possiblyInlined && "execution-flow-node-inlined",
+    isRuntimeInlined && "execution-flow-node-inlined-runtime",
   ]
     .filter(Boolean)
     .join(" ");
@@ -232,9 +353,20 @@ function MethodNodeV3({ data, selected }: NodeProps<Node<NodeData>>) {
     return "";
   })();
 
-  const classChip = n.className
-    ? n.className.split(".").pop() || n.className
-    : null;
+  // N8 — title shape swap. Primary line = method name only (e.g.
+  // ``validatePin``); secondary line = fully-qualified
+  // ``Class.method`` (e.g. ``MainActivity.validatePin``). The
+  // operator's eye lands on the method name first; the secondary
+  // line carries the class context for disambiguation across the
+  // graph. Replaces the v3.1 ``MainActivity.validatePin`` primary
+  // + ``MainActivity`` chip pattern (the class chip's value was
+  // already encoded in the primary so the chip was redundant).
+  const primary = isPill ? n.title : (n.methodName || n.title);
+  const secondary = isPill
+    ? n.retSourceTitle ?? null
+    : n.className
+      ? `${n.className.split(".").pop() || n.className}.${n.methodName}`
+      : null;
 
   const titleAttr = isPill
     ? n.retSourceTitle
@@ -271,19 +403,66 @@ function MethodNodeV3({ data, selected }: NodeProps<Node<NodeData>>) {
         </span>
       )}
 
+      {/* Depth pill on fired nodes (when mode allows the emphasis).
+          Bottom-right corner so it doesn't collide with the top-right
+          GATE / ENTRY pill. Format: ``d:N · t:M``; ``× count`` suffix
+          when the method fired more than once. */}
+      {isFiredEmphasis && n.live && (
+        <span
+          className="execution-flow-node-depth-pill"
+          title={`Latest fire: depth ${n.live.threadDepth} on thread ${n.live.threadId}${
+            n.live.fireCount > 1
+              ? ` · fired ${n.live.fireCount} times this session`
+              : ""
+          }`}
+        >
+          d:{n.live.threadDepth} · t:{n.live.threadId}
+          {n.live.fireCount > 1 && (
+            <span className="execution-flow-node-depth-pill-count">
+              {" "}
+              ×{n.live.fireCount}
+            </span>
+          )}
+        </span>
+      )}
+
       {isPill ? (
         <div className="execution-flow-node-retpill-body">{n.title}</div>
       ) : (
         <>
-          <div className="execution-flow-node-title">{n.title}</div>
-          {classChip && (
-            <div className="execution-flow-node-class">{classChip}</div>
+          <div className="execution-flow-node-title">{primary}</div>
+          {secondary && (
+            <div className="execution-flow-node-class">{secondary}</div>
           )}
           <div className="execution-flow-node-meta">
             {n.sourceLine != null && (
-              <span className="execution-flow-node-source-line">
-                line {n.sourceLine}
-              </span>
+              // N7 — source-line pill is now clickable. Falls back
+              // to the static ``span`` rendering when no callback is
+              // wired (e.g. the renderer is hosted outside
+              // ``LabTraceMode``); when a callback is present the
+              // pill becomes a ``button`` so keyboard navigation +
+              // screen readers treat it as an interactive control.
+              n.onSourceLineClick ? (
+                <button
+                  type="button"
+                  className="execution-flow-node-source-line execution-flow-node-source-line-clickable"
+                  title={`Open ${n.className}.${n.methodName} at line ${n.sourceLine} in the Code Browser`}
+                  onClick={(evt) => {
+                    evt.stopPropagation();
+                    n.onSourceLineClick!({
+                      className: n.className,
+                      methodName: n.methodName,
+                      sourceLine: n.sourceLine!,
+                    });
+                  }}
+                >
+                  line {n.sourceLine}
+                </button>
+              ) : (
+                <span className="execution-flow-node-source-line">
+                  line {n.sourceLine}
+                </span>
+              )
             )}
             {n.overloadCount > 1 && (
               <span className="execution-flow-node-overload-pill">
@@ -292,13 +471,17 @@ function MethodNodeV3({ data, selected }: NodeProps<Node<NodeData>>) {
             )}
             {n.verdictSummary && (() => {
               // v3.1 — inline verdict-summary chip on the gate card.
-              // Replaces the v2 ``Ng · M?`` gate-count badge with a
-              // per-verdict-kind breakdown so the operator sees the
-              // full distribution at a glance. Sub-spans are
-              // suppressed when their count is ``0`` (de-clutters
-              // the chip on gates with skewed distributions —
-              // ``2 allow`` reads cleaner than ``2 allow · 0 deny ·
-              // 0 ? · 0 unv`` on a low-decision gate).
+              // Per-verdict-kind breakdown so the operator sees the
+              // full distribution at a glance. Sub-spans suppressed
+              // when their count is ``0`` (de-clutters skewed
+              // distributions).
+              //
+              // v3.X-next.2 N6 — chip labels grew from terse
+              // ``9 ?`` / ``9 unv`` to plain-language
+              // ``9 neutral?`` / ``9 unverdicted?`` with per-sub-
+              // chip hover tooltips sourced from ``copy.ts``. The
+              // aggregate hover (on the outer chip) still spells
+              // out the per-bucket totals + the visibility caveat.
               const s = n.verdictSummary;
               const total = s.allow + s.deny + s.neutral + s.unverdicted;
               if (total === 0) return null;
@@ -322,32 +505,58 @@ function MethodNodeV3({ data, selected }: NodeProps<Node<NodeData>>) {
                   title={titleLines.join("\n")}
                 >
                   {s.allow > 0 && (
-                    <span className="execution-flow-node-v3-summary-allow">
-                      {s.allow} allow
+                    <span
+                      className="execution-flow-node-v3-summary-allow"
+                      title={VERDICT_CHIP_TOOLTIPS.allow}
+                    >
+                      {s.allow} {VERDICT_CHIP_LABELS.allow}
                     </span>
                   )}
                   {s.deny > 0 && (
-                    <span className="execution-flow-node-v3-summary-deny">
-                      {s.deny} deny
+                    <span
+                      className="execution-flow-node-v3-summary-deny"
+                      title={VERDICT_CHIP_TOOLTIPS.deny}
+                    >
+                      {s.deny} {VERDICT_CHIP_LABELS.deny}
                     </span>
                   )}
                   {s.neutral > 0 && (
-                    <span className="execution-flow-node-v3-summary-neutral">
-                      {s.neutral} ?
+                    <span
+                      className="execution-flow-node-v3-summary-neutral"
+                      title={VERDICT_CHIP_TOOLTIPS.neutral}
+                    >
+                      {s.neutral} {VERDICT_CHIP_LABELS.neutral}
                     </span>
                   )}
                   {s.unverdicted > 0 && (
-                    <span className="execution-flow-node-v3-summary-unv">
-                      {s.unverdicted} unv
+                    <span
+                      className="execution-flow-node-v3-summary-unv"
+                      title={VERDICT_CHIP_TOOLTIPS.unverdicted}
+                    >
+                      {s.unverdicted} {VERDICT_CHIP_LABELS.unverdicted}
                     </span>
                   )}
                 </span>
               );
             })()}
-            {n.possiblyInlined && (
-              <span className="execution-flow-node-inlined-pill">
-                possibly inlined
+            {/* Runtime-confirmed inlined pill takes precedence over
+                the static heuristic pill. ``runtimeInlined`` is
+                truthy iff a Frida ``hook_failed`` event landed for
+                this method's overload key during the active dynamic
+                trace. */}
+            {isRuntimeInlined && n.runtimeInlined ? (
+              <span
+                className="execution-flow-node-inlined-pill execution-flow-node-inlined-pill-runtime"
+                title={`Frida hook_failed: ${n.runtimeInlined.reason}`}
+              >
+                inlined (runtime)
               </span>
+            ) : (
+              n.possiblyInlined && (
+                <span className="execution-flow-node-inlined-pill">
+                  possibly inlined
+                </span>
+              )
             )}
           </div>
         </>
@@ -358,8 +567,19 @@ function MethodNodeV3({ data, selected }: NodeProps<Node<NodeData>>) {
 
 // ---------------------------------------------------------------------------
 // Custom edge component
+//
+// v3.X-next.2 — extended with dynamic-overlay decoration (fired
+// emphasis + untaken-dynamic fade + live-value chip) ported from
+// the v2 ``ExecutionFlow.tsx`` VerdictEdge. ``invoke`` (the new
+// v3.X-next.2 CFG-position-aware edge kind) renders with a neutral
+// stroke + no label (the vertical-stack layout carries the
+// execution-order signal; an explicit label would just be noise).
 
-type EdgeData = ExecutionFlowV3Edge;
+type EdgeData = ExecutionFlowV3Edge & {
+  mode?: TraceMode;
+  fired?: boolean;
+  liveLabel?: string | null;
+};
 
 function VerdictEdgeV3({
   id,
@@ -381,10 +601,19 @@ function VerdictEdgeV3({
     borderRadius: 6,
   });
 
+  const isDynamic = e.mode === "dynamic";
+  const isBoth = e.mode === "both";
+  const isFired = !!e.fired && (isDynamic || isBoth);
+  const isFadedUntaken = isDynamic && !isFired;
+
   const className = [
     "execution-flow-edge",
     `execution-flow-edge-${e.kind}`,
-  ].join(" ");
+    isFired && "execution-flow-edge-fired",
+    isFadedUntaken && "execution-flow-edge-untaken-dynamic",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <>
@@ -401,12 +630,32 @@ function VerdictEdgeV3({
             className={[
               "execution-flow-edge-label",
               `execution-flow-edge-label-${e.kind}`,
-            ].join(" ")}
+              isFired && "execution-flow-edge-label-fired",
+              isFadedUntaken && "execution-flow-edge-label-untaken-dynamic",
+            ]
+              .filter(Boolean)
+              .join(" ")}
             style={{
               transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
             }}
           >
             {e.label}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+      {/* Live-value chip on fired edges — same pattern as v2's
+          ``execution-flow-edge-live-chip``. Positioned slightly
+          below the verdict label so the two don't collide. */}
+      {isFired && e.liveLabel && (
+        <EdgeLabelRenderer>
+          <div
+            className="execution-flow-edge-live-chip"
+            style={{
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY + 18}px)`,
+            }}
+            title={e.liveLabel}
+          >
+            {e.liveLabel}
           </div>
         </EdgeLabelRenderer>
       )}
@@ -429,20 +678,19 @@ export function ExecutionFlowV3({
   onNodeClick,
   hideRetPills,
   gatesOnly,
+  mode = "static",
+  firedMethods,
+  liveValues,
+  hookFailed,
+  onSourceLineClick,
 }: Props) {
-  // v3 preview's dev-overlay state — operator can toggle the stats
-  // bar via the panel button or via the URL ``?flow=v3&stats=0``;
-  // default ``true`` because the preview is for inspecting the
-  // visual + the underlying graph metrics together.
-  const [showStats, setShowStats] = useState(true);
+  // Dev-overlay state. Default ``false`` post-v3-promotion so the
+  // production rendering is uncluttered; operators can still toggle
+  // via the top-left panel button when inspecting graph internals.
+  const [showStats, setShowStats] = useState(false);
 
   const { rfNodes, rfEdges, stats } = useMemo(() => {
     const buildOpts: ExecutionFlowV3Options = {
-      // ``undefined`` here lets the emitter fall back to its v3.1
-      // defaults (``hideRetPills=true``, ``gatesOnly=true``); the
-      // URL gate in ``LabTraceMode`` flips these to ``false`` when
-      // the operator passes ``?flow=v3&pills=show`` or
-      // ``?flow=v3&methods=all`` respectively.
       hideRetPills,
       gatesOnly,
     };
@@ -450,12 +698,33 @@ export function ExecutionFlowV3({
     const layout = layoutWithDagre(graph.nodes, graph.edges);
     const stats = graphV3Stats(graph);
 
+    // Index the dynamic-overlay payloads by overload key (descriptor-
+    // stripped) — same indexing pattern as v2's ``ExecutionFlow``.
+    // Return pill nodes never fire (no MethodRef backing); guard
+    // explicitly so a stray live-value hit on an empty overload key
+    // doesn't accent.
+    const fired = firedMethods ?? null;
+    const live = liveValues ?? null;
+    const failed = hookFailed ?? null;
+
     const rfNodes: Node<NodeData>[] = graph.nodes.map((n) => {
       const isPill = n.kind === "return_pill";
+      const oKey = isPill ? "" : overloadKeyFromNodeId(n.id);
+      const isFired = !isPill && !!fired?.has(oKey);
+      const liveRecord = !isPill && live ? (live.get(oKey) ?? null) : null;
+      const runtimeInlined =
+        !isPill && failed ? (failed.get(oKey) ?? null) : null;
       return {
         id: n.id,
         type: "method",
-        data: n,
+        data: {
+          ...n,
+          mode,
+          fired: isFired,
+          live: liveRecord,
+          runtimeInlined,
+          onSourceLineClick,
+        },
         position: layout.positions.get(n.id) ?? { x: 0, y: 0 },
         width: isPill ? PILL_WIDTH : NODE_WIDTH,
         height: isPill ? PILL_HEIGHT : NODE_HEIGHT,
@@ -465,21 +734,52 @@ export function ExecutionFlowV3({
       };
     });
 
-    const rfEdges: Edge<EdgeData>[] = graph.edges.map((e) => ({
-      id: e.id,
-      source: e.source,
-      target: e.target,
-      type: "verdict",
-      data: e,
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        width: ARROWHEAD_SIZE,
-        height: ARROWHEAD_SIZE,
-      },
-    }));
+    // Edge fired-ness: an edge is "fired" iff BOTH endpoints fired.
+    // The fired source means the gate / caller executed; the fired
+    // target means the path actually flowed through. Synthetic
+    // return-pill targets ride on the source's fired flag (a fired
+    // gate routing into a pill reads as "this branch was taken").
+    const rfEdges: Edge<EdgeData>[] = graph.edges.map((e) => {
+      const sourceOKey = overloadKeyFromNodeId(e.source);
+      const targetOKey = overloadKeyFromNodeId(e.target);
+      const sourceFired = !!fired?.has(sourceOKey);
+      const targetIsPill = e.target.startsWith("__retpill__::");
+      const targetFired = targetIsPill
+        ? sourceFired
+        : !!fired?.has(targetOKey);
+      const edgeFired = sourceFired && targetFired;
+      const sourceLive = live?.get(sourceOKey) ?? null;
+      const liveLabel = composeLiveLabel(sourceLive);
+      return {
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        type: "verdict",
+        data: {
+          ...e,
+          mode,
+          fired: edgeFired,
+          liveLabel,
+        },
+        markerEnd: {
+          type: MarkerType.ArrowClosed,
+          width: ARROWHEAD_SIZE,
+          height: ARROWHEAD_SIZE,
+        },
+      };
+    });
 
     return { rfNodes, rfEdges, stats };
-  }, [anchor, hideRetPills, gatesOnly]);
+  }, [
+    anchor,
+    hideRetPills,
+    gatesOnly,
+    mode,
+    firedMethods,
+    liveValues,
+    hookFailed,
+    onSourceLineClick,
+  ]);
 
   const styledNodes = useMemo(
     () =>
@@ -549,8 +849,11 @@ export function ExecutionFlowV3({
           pannable
           zoomable
         />
+        {/* v3.X-next.2 — dropped the "v3 preview" badge (v3 is now
+            the production renderer). Stats toggle survives for
+            graph-internals inspection during dogfood; collapsed by
+            default per the post-promotion uncluttered default. */}
         <Panel position="top-left" className="execution-flow-v3-preview-panel">
-          <span className="execution-flow-v3-preview-badge">v3 preview</span>
           <button
             type="button"
             className="execution-flow-v3-preview-toggle"
@@ -589,7 +892,7 @@ export function ExecutionFlowV3({
               {stats.entry}× entry · {stats.gate}× gate · {stats.method}× method · {stats.returnPills}× ret-pill
             </div>
             <div>
-              {stats.edges} edges ({stats.callEdges} call, {stats.verdictEdges} verdict){stats.dangling > 0 && ` · ${stats.dangling} DANGLING`}
+              {stats.edges} edges ({stats.invokeEdges} invoke, {stats.callEdges} call-fallback, {stats.verdictEdges} verdict){stats.dangling > 0 && ` · ${stats.dangling} DANGLING`}
             </div>
             <div>
               verdicts: {stats.summary.allow}a · {stats.summary.deny}d · {stats.summary.neutral}? · {stats.summary.unverdicted}unv

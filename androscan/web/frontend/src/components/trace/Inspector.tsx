@@ -125,8 +125,8 @@ import { BypassPlanCard } from "./BypassPlanCard";
 import { PredicateOriginView } from "./PredicateOriginView";
 import {
   overloadKey as graphOverloadKey,
-  type ExecutionFlowNode,
-} from "./executionFlowGraph";
+  type ExecutionFlowV3Node,
+} from "./executionFlowGraphV3";
 import type { TraceMode } from "./TraceModeToggle";
 
 
@@ -250,7 +250,7 @@ type Props = {
   /** ``ExecutionFlow``'s node data for the selected node — needed
    *  for ``overloadCount`` + ``possiblyInlined`` + ``isSynthetic``
    *  (the heuristics live on the graph layer; we don't re-derive). */
-  selectedNodeData: ExecutionFlowNode | null;
+  selectedNodeData: ExecutionFlowV3Node | null;
   /** Active app id from context — passed down so child views
    *  (PredicateOriginView, action handlers) don't re-call
    *  ``useWorkbench()``. */

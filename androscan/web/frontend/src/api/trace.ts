@@ -170,9 +170,58 @@ export type BypassPlan = {
 };
 
 /**
+ * Phase 13 v3.X-next.1 / DEC-031 — per-invoke call-site record. One
+ * ``CallSite`` is emitted by ``androscan/analysis/slicing.py::extract_call_sites``
+ * for every non-framework ``invoke-*`` smali instruction in a closure
+ * method's body, in source order. Carries the per-invoke positional +
+ * branch-arm context the v3.X-next.2 emitter needs to build CFG-position-
+ * aware flowchart ranking (sequential ``prev_invoke → next_invoke``
+ * edges in ``instruction_index`` order; per-branch fork via
+ * ``in_branch_of`` + ``branch_label``).
+ *
+ * Field semantics (mirrors the Python frozen dataclass):
+ *
+ * * ``caller`` — the method making the call (always == the
+ *   ``method_invocations`` dict key's ``MethodRef`` equivalent).
+ * * ``instruction_index`` — smali instruction position of the
+ *   ``invoke-*`` op, monotonically increasing within a method body.
+ * * ``callee`` — the resolved target method. Cross-module targets
+ *   that the slicer's Q3=(c) hybrid resolver couldn't resolve are
+ *   silently dropped at extraction time (not surfaced as CallSites
+ *   with a null callee — v3.X-next.1 contract).
+ * * ``in_branch_of`` — the ``instruction_index`` of the innermost
+ *   decision whose branch arm contains this call, or ``null`` for
+ *   pre-branch / post-arm calls.
+ * * ``branch_label`` — when ``in_branch_of != null``, the
+ *   ``Branch.label`` of the arm containing the call (verbatim from
+ *   the decision's ``branches[*].label``); ``null`` otherwise.
+ *
+ * Q4=(a) lock: arm identity rides on ``branch_label`` matching
+ * ``Branch.label`` verbatim — multi-arm switches use the per-case
+ * label (e.g. ``packed_switch_case_2``), not a tuple of
+ * (decision-index, arm-index).
+ */
+export type CallSite = {
+  caller: MethodRef;
+  instruction_index: number;
+  callee: MethodRef;
+  in_branch_of: number | null;
+  branch_label: string | null;
+};
+
+/**
  * The canonical ``BehaviorAnchor`` JSON shape (mirrors
  * ``androscan/analysis/trace_types.py::BehaviorAnchor``). Locked field
  * names per ``dataclasses.asdict``; new optional fields are additive.
+ *
+ * Phase 13 v3.X-next.1 / DEC-031 Q4=(b) — ``method_invocations`` is
+ * the additive-at-schema-v2 wire field. Keyed by the caller's full
+ * overload-signature ``Lcom/Foo;->bar(I)V`` (matches
+ * ``methodKey(callerMethodRef)``); values are tuples of ``CallSite``
+ * records ordered by ``instruction_index``. Marked optional (``?``)
+ * on the FE type because legacy ``trace.sqlite`` caches (v2 / v2.0.1
+ * / v3.0 / v3.1) deserialise without the field — the FE emitter
+ * treats missing-or-empty as the v3.1 fallback per Q5=(a).
  */
 export type BehaviorAnchor = {
   entry_method: MethodRef;
@@ -184,6 +233,7 @@ export type BehaviorAnchor = {
   advanced_plans: BypassPlan[];
   rationale: string;
   low_confidence_decision_indices: number[];
+  method_invocations?: Record<string, CallSite[]>;
 };
 
 export type ApiResult<T> =

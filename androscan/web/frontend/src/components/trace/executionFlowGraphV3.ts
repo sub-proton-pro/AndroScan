@@ -102,13 +102,75 @@ import type {
   BehaviorAnchor,
   BranchOutcome,
   BypassPlan,
+  CallSite,
   DecisionPoint,
   MethodRef,
 } from "../../api/trace";
-import {
-  methodKey,
-  overloadKey,
-} from "./executionFlowGraph";
+
+// ---------------------------------------------------------------------------
+// Shared smali-signature helpers — owned by the V3 module since
+// v3.X-next.2 deleted the V2 ``executionFlowGraph.ts`` per DEC-031
+// N2=(i). All FE consumers (Inspector, LabTraceMode, V3 emitter
+// itself) import from here.
+
+/** Smali signature shape — used as the stable node id + dedup key.
+ *  Matches :attr:`MethodRef.smali_signature` on the Python side
+ *  byte-equally (``Lcom/example/Foo;->bar(I)Z``). */
+export function methodKey(m: MethodRef): string {
+  const className = (m.class_name || "").replace(/\./g, "/");
+  return `L${className};->${m.method_name}(${(m.param_descriptors || []).join("")})${m.return_descriptor || "V"}`;
+}
+
+/** Collapse-key for overload merging — drops the descriptor portion
+ *  so methods with the same name on the same class but different
+ *  param descriptors land on the same node (the node's
+ *  ``overloadCount`` then carries the count). */
+export function overloadKey(m: MethodRef): string {
+  const className = (m.class_name || "").replace(/\./g, "/");
+  return `L${className};->${m.method_name}`;
+}
+
+/** ``methodKey`` shape but starting from a node id — strips the
+ *  trailing ``(...)return-descriptor`` to recover the overload key.
+ *  Used by ``ExecutionFlowV3`` to look up firedMethods / liveValues
+ *  by overload key without knowing the underlying ``MethodRef``. */
+export function overloadKeyFromNodeId(nodeId: string): string {
+  const parenIdx = nodeId.indexOf("(");
+  return parenIdx > 0 ? nodeId.slice(0, parenIdx) : nodeId;
+}
+
+/** Phase 13 sub-step 13.9 — count the unique full Smali signatures
+ *  Frida will hook for ``anchor``. Mirrors
+ *  :func:`androscan.web.trace_dynamic.extract_closure_methods`'s
+ *  dedup-by-``smali_signature`` pass exactly so the FE's pre-run
+ *  threshold-color decision matches what the BE will actually
+ *  attempt (the overload-key collapsing the ``ExecutionFlowV3`` does
+ *  for visual stacking is a presentation concern; Frida hooks
+ *  EVERY overload, so the hook count is keyed on the full
+ *  signature). The five-source flatten:
+ *
+ *    1. ``anchor.entry_method``
+ *    2. each ``DecisionPoint.method``
+ *    3. each ``BypassPlan.target_method`` + ``source_decision_method``
+ *       (both ``plans`` and ``advanced_plans``)
+ *
+ *  Returns the unique-signature count; the caller bands it against
+ *  DEC-029's threshold colour ladder to decorate the "Run dynamic
+ *  trace" button. */
+export function closureMethodCount(anchor: BehaviorAnchor): number {
+  const seen = new Set<string>();
+  const add = (m: MethodRef | null | undefined) => {
+    if (!m) return;
+    seen.add(methodKey(m));
+  };
+  add(anchor.entry_method);
+  for (const d of anchor.decisions) add(d.method);
+  for (const p of [...anchor.plans, ...anchor.advanced_plans]) {
+    add(p.target_method);
+    add(p.source_decision_method);
+  }
+  return seen.size;
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -190,16 +252,45 @@ export type ExecutionFlowV3Edge = {
    *     so the operator's visual training carries over.
    *   - ``unverdicted`` — slicer hit max-walk on the predicate
    *     origin; rendered dim-dashed (same as v2).
-   *   - ``call`` — synthesised entry-to-decision-source edge. No
-   *     verdict semantics; rendered as a neutral arrow without an
-   *     operator-readable label (the call hierarchy is its own
-   *     signal). */
-  kind: "allow" | "deny" | "neutral" | "unverdicted" | "call";
+   *   - ``call`` — synthesised entry-to-decision-source edge,
+   *     emitted ONLY as the Q5=(a) gap-fallback when
+   *     ``method_invocations`` is missing or empty on the entry
+   *     (e.g. legacy ``trace.sqlite`` caches without the
+   *     v3.X-next.1 field). No verdict semantics; rendered as a
+   *     neutral arrow without an operator-readable label.
+   *   - ``invoke`` — v3.X-next.2 CFG-position-aware invocation
+   *     edge sourced from ``BehaviorAnchor.method_invocations``.
+   *     Carries the smali ``instruction_index`` + branch-arm
+   *     identity (``in_branch_of`` + ``branch_label``) so Dagre's
+   *     top-down ranking stacks callees vertically in execution
+   *     order rather than the v3.1 flat-fan layout. Multiple
+   *     invocations within the same caller's body chain through
+   *     ``prev_invoke → next_invoke`` per branch arm; the main
+   *     (pre-branch / post-arm) segment chains from the caller
+   *     itself. */
+  kind: "allow" | "deny" | "neutral" | "unverdicted" | "call" | "invoke";
   /** Edge label rendered alongside the edge. v3 shape:
-   *   - ``call`` edges: empty string (the arrow is enough).
+   *   - ``call`` / ``invoke`` edges: empty string (the arrow + the
+   *     CFG-aware vertical stacking are enough; the operator reads
+   *     execution order from the layout).
    *   - verdict edges: ``Ret: True`` / ``Ret: False`` / ``Ret: ?``. */
   label: string;
   isCandidateGate: boolean;
+  /** v3.X-next.2 — for ``invoke`` edges sourced from
+   *  ``method_invocations``, the smali ``instruction_index`` of the
+   *  ``invoke-*`` op the edge represents. ``null`` for non-invoke
+   *  edges. Surfaced so the Inspector can scroll the Code Browser
+   *  to the originating line on hover / click. */
+  instructionIndex: number | null;
+  /** v3.X-next.2 — for ``invoke`` edges, the ``in_branch_of`` of
+   *  the dominating decision (or ``null`` for pre-branch / post-arm
+   *  calls). Surfaces the per-arm forking the operator needs to
+   *  reason about "this call only happens in the true-arm". */
+  inBranchOf: number | null;
+  /** v3.X-next.2 — for ``invoke`` edges with a non-null
+   *  ``inBranchOf``, the ``Branch.label`` of the arm containing the
+   *  call. ``null`` for main-segment invokes + non-invoke edges. */
+  branchLabel: string | null;
 };
 
 export type ExecutionFlowV3Graph = {
@@ -448,18 +539,15 @@ export function buildExecutionFlowV3Graph(
   // shape as v2 but tracks a narrower set of provenance flags
   // because v3 doesn't need the inlined inference for synthetic-sink
   // edge routing.
-  type MethodCollector = {
-    canonical: MethodRef;
-    overloadCount: number;
-    descriptors: Set<string>;
-    isDecisionSource: boolean;
-    isPlanTarget: boolean;
-  };
-  const methods = new Map<string, MethodCollector>();
+  const methods = new Map<string, CallerCollector>();
 
   const ingest = (
     m: MethodRef,
-    flags: { isDecisionSource?: boolean; isPlanTarget?: boolean } = {},
+    flags: {
+      isDecisionSource?: boolean;
+      isPlanTarget?: boolean;
+      isInvokeTarget?: boolean;
+    } = {},
   ) => {
     const k = overloadKey(m);
     const sig = methodKey(m);
@@ -469,6 +557,7 @@ export function buildExecutionFlowV3Graph(
       existing.overloadCount = existing.descriptors.size;
       existing.isDecisionSource ||= !!flags.isDecisionSource;
       existing.isPlanTarget ||= !!flags.isPlanTarget;
+      existing.isInvokeTarget ||= !!flags.isInvokeTarget;
     } else {
       methods.set(k, {
         canonical: m,
@@ -476,6 +565,7 @@ export function buildExecutionFlowV3Graph(
         descriptors: new Set([sig]),
         isDecisionSource: !!flags.isDecisionSource,
         isPlanTarget: !!flags.isPlanTarget,
+        isInvokeTarget: !!flags.isInvokeTarget,
       });
     }
   };
@@ -499,6 +589,45 @@ export function buildExecutionFlowV3Graph(
     }
     if (p.target_method) {
       ingest(p.target_method, { isPlanTarget: true });
+    }
+  }
+
+  // v3.X-next.2 / DEC-031 — ingest ``method_invocations`` callers
+  // + callees so the v3.X-next.2 invoke-chain emission has all the
+  // surviving callee nodes available. Callers are typically already
+  // ingested (they're decision sources / entry / plan targets), but
+  // we re-ingest defensively in case a future slicer surfaces an
+  // invocation map for a method that's none of those (cheap; the
+  // ``ingest`` helper dedupes on overloadKey). Callees may be
+  // novel — e.g. ``validate_pin`` / ``create_session`` in WeakBank
+  // dogfood are called from entry but are not themselves decision
+  // sources or plan targets, so the v3.1 emitter missed them
+  // entirely.
+  //
+  // Callees are tagged ``isInvokeTarget`` (NOT ``isPlanTarget``)
+  // so the provenance splits correctly:
+  //   * The ``gatesOnly`` framework filter's bypass stays scoped
+  //     to operator-opted-in entries (entry / plan target); an
+  //     invoke-only framework callee — defensive only since the
+  //     slicer denylists those — still gets filtered out, matching
+  //     the backstop's stated intent.
+  //   * The ``possiblyInlined`` heuristic stays
+  //     (``!isDecisionSource && isPlanTarget``); being called via
+  //     an ``invoke-*`` op no longer false-flags a method as
+  //     possibly-inlined (the very opposite signal).
+  const methodInvocations = anchor.method_invocations ?? {};
+  for (const [callerSig, callSites] of Object.entries(methodInvocations)) {
+    if (!callSites || callSites.length === 0) continue;
+    // The caller key is the smali signature, not a MethodRef. The
+    // first call site's ``caller`` field carries the MethodRef
+    // (all sites in a list share the same caller per slicer
+    // contract). Defensive guard: if the key shape doesn't match
+    // the first caller's methodKey, log + skip.
+    const firstCaller = callSites[0]?.caller;
+    if (!firstCaller || methodKey(firstCaller) !== callerSig) continue;
+    ingest(firstCaller);
+    for (const cs of callSites) {
+      ingest(cs.callee, { isInvokeTarget: true });
     }
   }
 
@@ -529,11 +658,22 @@ export function buildExecutionFlowV3Graph(
   for (const [key, c] of methods.entries()) {
     const isEntry = key === entryKey;
     const hasGate = hasCandidateGate(anchor.decisions, key);
-    if (!isEntry && !c.isDecisionSource && !c.isPlanTarget) {
+    if (
+      !isEntry &&
+      !c.isDecisionSource &&
+      !c.isPlanTarget &&
+      !c.isInvokeTarget
+    ) {
       // Defensive — shouldn't happen with the collection passes above
       // but cheap to guard against future ingestion paths.
       continue;
     }
+    // Framework-class filter bypass is intentionally scoped to
+    // ``isEntry`` + ``isPlanTarget`` (operator-opted-in sources).
+    // ``isInvokeTarget`` is NOT a bypass channel: the slicer
+    // already denylists framework callees, so an invoke-only
+    // framework callee should never appear in production —
+    // dropping it here is the defensive backstop.
     if (
       gatesOnly &&
       !isEntry &&
@@ -569,30 +709,57 @@ export function buildExecutionFlowV3Graph(
   const edges: ExecutionFlowV3Edge[] = [];
   const returnPills: ExecutionFlowV3Node[] = [];
 
-  // Synthesised entry → decision-source ``call`` edges so the
-  // graph is always rooted-connected at the entry. Dedupe on target
-  // (one edge per surviving decision-source method regardless of
-  // decision count). Methods that ``gatesOnly`` filtered out are
-  // skipped via the ``nodeIds.has(tgtId)`` guard — Dagre would
-  // otherwise produce a dangling edge.
-  const calledFromEntry = new Set<string>();
-  for (const d of anchor.decisions) {
-    const k = overloadKey(d.method);
-    if (k === entryKey) continue;
-    const target = methods.get(k);
-    if (!target) continue;
-    const tgtId = methodKey(target.canonical);
-    if (!nodeIds.has(tgtId)) continue;
-    if (calledFromEntry.has(tgtId)) continue;
-    calledFromEntry.add(tgtId);
-    edges.push({
-      id: `${entryId}->${tgtId}#call`,
-      source: entryId,
-      target: tgtId,
-      kind: "call",
-      label: "",
-      isCandidateGate: false,
-    });
+  // v3.X-next.2 / DEC-031 Q5=(a) — emit CFG-position-aware invoke
+  // edges from ``method_invocations`` first (the primary path).
+  // The function below populates ``edges`` with one ``invoke`` edge
+  // per ``CallSite`` whose endpoints both survive the
+  // ``gatesOnly`` filter, chained per-branch-arm so Dagre's
+  // top-down ranking stacks callees vertically in execution order.
+  // Returns the set of ``methodKey``s that contributed at least
+  // one outgoing invoke edge — used below to decide which methods
+  // need the v3.1 synthesised-call fallback.
+  const callersWithInvokes = emitInvokeEdges(
+    anchor.method_invocations ?? {},
+    methods,
+    nodeIds,
+    edges,
+  );
+
+  // Q5=(a) gap-fallback — v3.1 synthesised entry → decision-source
+  // ``call`` edges, emitted ONLY when the entry's
+  // ``method_invocations`` entry is missing or empty (legacy
+  // ``trace.sqlite`` caches without the v3.X-next.1 field, or live
+  // anchors where the slicer didn't surface any non-framework
+  // invokes in entry's body — e.g. entry is a pure dispatcher
+  // calling only framework methods that the slicer filtered).
+  // Preserves the empty-dict-renders-as-v3.1 invariant ratified at
+  // v3.X-next.2.0 (TASKS.md § Phase 13 v3.X-next sub-step backlog).
+  // Q5=(b)/(c) call-graph recovery deferred to v3.X-next.3
+  // candidate stub per the diminishing-returns analysis at
+  // v3.X-next.2.0 (see DEC-031 / STATE.md).
+  if (!callersWithInvokes.has(entryId)) {
+    const calledFromEntry = new Set<string>();
+    for (const d of anchor.decisions) {
+      const k = overloadKey(d.method);
+      if (k === entryKey) continue;
+      const target = methods.get(k);
+      if (!target) continue;
+      const tgtId = methodKey(target.canonical);
+      if (!nodeIds.has(tgtId)) continue;
+      if (calledFromEntry.has(tgtId)) continue;
+      calledFromEntry.add(tgtId);
+      edges.push({
+        id: `${entryId}->${tgtId}#call`,
+        source: entryId,
+        target: tgtId,
+        kind: "call",
+        label: "",
+        isCandidateGate: false,
+        instructionIndex: null,
+        inBranchOf: null,
+        branchLabel: null,
+      });
+    }
   }
 
   // Verdict edges — one per (decision × verdict).
@@ -638,6 +805,9 @@ export function buildExecutionFlowV3Graph(
           kind: "unverdicted",
           label: "Ret: ?",
           isCandidateGate: false,
+          instructionIndex: null,
+          inBranchOf: null,
+          branchLabel: null,
         });
       }
       continue;
@@ -724,12 +894,129 @@ export function buildExecutionFlowV3Graph(
         kind: verdictKind,
         label: `Ret: ${retLabel}`,
         isCandidateGate: isCandidate,
+        instructionIndex: null,
+        inBranchOf: null,
+        branchLabel: null,
       });
     }
   }
 
   nodes.push(...returnPills);
   return { nodes, edges };
+}
+
+// ---------------------------------------------------------------------------
+// v3.X-next.2 — invoke-edge emission helper
+//
+// Walks ``method_invocations`` (the v3.X-next.1 slicer extension)
+// and emits one ``invoke`` edge per ``CallSite`` whose caller +
+// callee both have surviving nodes. Chains consecutive calls within
+// the same ``(in_branch_of, branch_label)`` arm so the resulting
+// graph stacks callees vertically in execution order under their
+// caller — closing the v3.1 "horizontal-fan flatness" friction
+// DEC-031 was diagnosed to fix.
+//
+// Algorithm (per caller, sorted by instruction_index):
+//   * Track a per-arm "last node" frame keyed on the
+//     (in_branch_of, branch_label) tuple. Main-segment calls
+//     (in_branch_of == null) live in their own frame anchored at
+//     the caller.
+//   * On encountering a CallSite:
+//       1. Compute the frame key.
+//       2. Look up the frame's current ``lastNodeId``; if absent
+//          (first call in this arm), anchor at the caller itself.
+//       3. Skip if the callee's node id isn't in ``nodeIds`` (it
+//          was filtered out by the ``gatesOnly`` framework filter
+//          or never registered as a method — defensive).
+//       4. Push an ``invoke`` edge ``lastNodeId → calleeId`` with
+//          the per-edge ``instruction_index`` + branch-arm
+//          metadata.
+//       5. Update the frame's ``lastNodeId`` to the callee so the
+//          next call in the same arm chains onto it.
+//
+// Returns the set of caller node ids that emitted at least one
+// invoke edge — the caller uses this to decide which entries need
+// the Q5=(a) gap-fallback synthesised-call edges (v3.1 behaviour
+// kicks in when entry has no surviving invokes).
+
+type CallerCollector = {
+  canonical: MethodRef;
+  overloadCount: number;
+  descriptors: Set<string>;
+  isDecisionSource: boolean;
+  isPlanTarget: boolean;
+  /** v3.X-next.2 — method appears at least once as a CallSite
+   *  callee in ``BehaviorAnchor.method_invocations``. Splits the
+   *  invoke-only provenance off ``isPlanTarget`` so:
+   *    * The ``gatesOnly`` framework-filter bypass stays scoped to
+   *      operator-opted-in plan targets (an invoke-only framework
+   *      callee — defensive only since the slicer denylists those
+   *      — is filtered out, matching the backstop's stated intent).
+   *    * The ``possiblyInlined`` heuristic
+   *      (``!isDecisionSource && isPlanTarget``) no longer false-
+   *      flags every invoke callee as "possibly inlined" — being
+   *      called via an ``invoke-*`` op is the very opposite of
+   *      being inlined.
+   *  Still acts as a node-survival signal (an invoke-only callee
+   *  IS reachable from the closure and SHOULD render). */
+  isInvokeTarget: boolean;
+};
+
+function emitInvokeEdges(
+  methodInvocations: Record<string, CallSite[]>,
+  // ``methods`` is reserved for future use (e.g. surfacing
+  // ``possiblyInlined`` flags on invoke targets that lack a
+  // smali body); not consumed in v3.X-next.2's first cut since
+  // node-ingestion already happened in the caller's Phase 1.
+  _methods: Map<string, CallerCollector>,
+  nodeIds: Set<string>,
+  edges: ExecutionFlowV3Edge[],
+): Set<string> {
+  const callersWithInvokes = new Set<string>();
+  for (const [callerSig, callSites] of Object.entries(methodInvocations)) {
+    if (!callSites || callSites.length === 0) continue;
+    if (!nodeIds.has(callerSig)) continue;
+    // Defensive sort — slicer guarantees instruction_index order
+    // but a future caller could pass a tuple in any order. Cheap.
+    const sorted = [...callSites].sort(
+      (a, b) => a.instruction_index - b.instruction_index,
+    );
+    const arms = new Map<string, string>();
+    for (const cs of sorted) {
+      const calleeId = methodKey(cs.callee);
+      if (!nodeIds.has(calleeId)) continue;
+      const armKey =
+        cs.in_branch_of == null
+          ? "__main__"
+          : `${cs.in_branch_of}:${cs.branch_label ?? ""}`;
+      const lastNodeId = arms.get(armKey) ?? callerSig;
+      // Don't emit self-loops (caller == callee on a recursive
+      // call would otherwise produce a node-onto-itself edge that
+      // Dagre handles weirdly).
+      if (lastNodeId === calleeId) {
+        // Still advance the chain — subsequent calls in this arm
+        // should chain off the callee, not the caller. (e.g.
+        // ``A() { foo(); foo(); bar(); }`` — bar should chain
+        // after the second foo, not back to A.)
+        arms.set(armKey, calleeId);
+        continue;
+      }
+      edges.push({
+        id: `${lastNodeId}->${calleeId}#invoke#${callerSig}#${cs.instruction_index}`,
+        source: lastNodeId,
+        target: calleeId,
+        kind: "invoke",
+        label: "",
+        isCandidateGate: false,
+        instructionIndex: cs.instruction_index,
+        inBranchOf: cs.in_branch_of,
+        branchLabel: cs.branch_label,
+      });
+      arms.set(armKey, calleeId);
+      callersWithInvokes.add(callerSig);
+    }
+  }
+  return callersWithInvokes;
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +1039,16 @@ export function graphV3Stats(g: ExecutionFlowV3Graph): {
   edges: number;
   dangling: number;
   callEdges: number;
+  /** v3.X-next.2 — count of ``invoke`` edges sourced from
+   *  ``method_invocations``. When ``invokeEdges > 0`` the
+   *  CFG-position-aware ranking is active for this anchor; when
+   *  ``invokeEdges === 0 && callEdges > 0`` the Q5=(a) gap-fallback
+   *  to v3.1 synthesised entry→gate edges is active (legacy
+   *  ``trace.sqlite`` caches, or anchors where the slicer didn't
+   *  surface any non-framework invokes). The dev overlay can use
+   *  this discrimination to surface "CFG-aware" vs "v3.1 fallback"
+   *  state for operator inspection without re-walking the anchor. */
+  invokeEdges: number;
   verdictEdges: number;
   /** v3.1 — aggregate verdict counts across every surviving gate
    *  node's ``verdictSummary``. Mirrors the per-card chip totals so
@@ -787,10 +1084,12 @@ export function graphV3Stats(g: ExecutionFlowV3Graph): {
   }
   let dangling = 0;
   let callEdges = 0;
+  let invokeEdges = 0;
   let verdictEdges = 0;
   for (const e of g.edges) {
     if (!ids.has(e.target) || !ids.has(e.source)) dangling += 1;
     if (e.kind === "call") callEdges += 1;
+    else if (e.kind === "invoke") invokeEdges += 1;
     else verdictEdges += 1;
   }
   return {
@@ -802,6 +1101,7 @@ export function graphV3Stats(g: ExecutionFlowV3Graph): {
     edges: g.edges.length,
     dangling,
     callEdges,
+    invokeEdges,
     verdictEdges,
     summary: { allow, deny, neutral, unverdicted },
   };

@@ -222,7 +222,6 @@ import { ChatDock } from "../components/ChatDock";
 import { BehaviorAnchorCard } from "../components/trace/BehaviorAnchorCard";
 import { BypassPlanCard } from "../components/trace/BypassPlanCard";
 import { BehaviorTrace } from "../components/trace/BehaviorTrace";
-import { ExecutionFlow } from "../components/trace/ExecutionFlow";
 import { ExecutionFlowV3 } from "../components/trace/ExecutionFlowV3";
 import { Inspector } from "../components/trace/Inspector";
 import {
@@ -232,8 +231,8 @@ import {
 } from "../components/trace/TraceModeToggle";
 import {
   closureMethodCount,
-  type ExecutionFlowNode,
-} from "../components/trace/executionFlowGraph";
+  type ExecutionFlowV3Node,
+} from "../components/trace/executionFlowGraphV3";
 import { ClassMethodTree } from "../components/ClassMethodTree";
 import {
   fetchTree,
@@ -258,7 +257,10 @@ import {
 } from "../api/trace";
 import type { ChatAttachment } from "../types";
 import { useWorkbench } from "../context/WorkbenchContext";
-import { javaRelPathToSmaliMethodPrefix } from "../util/smaliClassToFile";
+import {
+  classNameToJavaRelPath,
+  javaRelPathToSmaliMethodPrefix,
+} from "../util/smaliClassToFile";
 import { renderTraceAttachment } from "../util/traceChatAttachment";
 
 type Props = {
@@ -1281,6 +1283,30 @@ type ResultProps = {
 };
 
 function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultProps) {
+  // v3.X-next.2 / DEC-031 N7 — source-line pill click handler.
+  // Mirrors the Inspector's "Open source" path: writes
+  // ``pendingCodeNav`` with the node's class / method / rel-path
+  // (derived via :func:`classNameToJavaRelPath`) + switches the
+  // top-level tab to Inspect so the Code Browser actually mounts
+  // to consume the nav. The handler is declared once at the
+  // ``TraceResultRegion`` scope so a stable identity passes
+  // through ``ExecutionFlowV3``'s ``useMemo`` deps without
+  // triggering needless graph rebuilds on parent re-render.
+  const { setPendingCodeNav, setTab } = useWorkbench();
+  const onSourceLineClick = useCallback(
+    (target: { className: string; methodName: string; sourceLine: number }) => {
+      if (!appId) return;
+      setPendingCodeNav({
+        appId,
+        relPath: classNameToJavaRelPath(target.className),
+        className: target.className,
+        method: target.methodName,
+      });
+      setTab("inspect");
+    },
+    [appId, setPendingCodeNav, setTab],
+  );
+
   // Behavior Trace collapse state (legacy alias: "decision timeline").
   // Lives at the parent level (rather than inside ``BehaviorTrace``)
   // so the toggle can sit next to the section
@@ -1298,49 +1324,40 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   // this section (right-side fixed-width pane); 13.8 adds the
   // Static / Dynamic / Both mode toggle + live-value chips.
   const [executionFlowCollapsed, setExecutionFlowCollapsed] = useState(false);
-  // Phase 13 **v3 preview** — URL-gated preview path so the operator
-  // can compare the v2 + v3 visuals side-by-side without touching
-  // production. Parsed once on mount (no re-parse on URL change —
-  // the operator opens a fresh tab / reloads to toggle); all v3-
-  // specific behaviour gates through ``v3Preview.enabled``.
+  // v3.X-next.2 — V3 is now the **production** renderer (no more
+  // ``?flow=v3`` URL gate). The two URL escape hatches DEC-030 Q5
+  // / Q6 locked still survive as the operator-power-user overrides
+  // against the emitter's v3.1 defaults (``hideRetPills=true`` /
+  // ``gatesOnly=true``):
   //
-  // **v3.1 URL contract** (replaces v3.0's ``pills=hide`` /
-  // ``methods=gates-only`` which were the *off* paths against
-  // permissive defaults):
+  //   * ``?pills=show``     — restore the per-branch ``Ret: X``
+  //                           return-pill terminals (the v3.0
+  //                           shape; cleaner side-by-side
+  //                           comparison with the verdict-summary
+  //                           chip during operator triage).
+  //   * ``?methods=all``    — drop the framework-package filter
+  //                           (``kotlin.*`` / ``androidx.*`` /
+  //                           ``java.*``); useful when the
+  //                           operator is hunting for a synthetic
+  //                           accessor / kotlin getter that the
+  //                           default filter hid.
   //
-  //   * ``?flow=v3``               — v3.1 defaults: gate-methods
-  //                                  only + verdict-summary chip
-  //                                  on the gate card (no per-
-  //                                  branch ret pills).
-  //   * ``?flow=v3&pills=show``    — escape hatch: bring back the
-  //                                  per-branch ``Ret: X`` terminal
-  //                                  pills (the v3.0 default
-  //                                  behaviour).
-  //   * ``?flow=v3&methods=all``   — escape hatch: include framework
-  //                                  noise (``Intrinsics.*``,
-  //                                  kotlin getters, etc.) that the
-  //                                  default gates-only filter
-  //                                  drops.
-  //
-  // ``hideRetPills`` / ``gatesOnly`` are passed only when the
-  // operator explicitly flipped the escape-hatch param; ``undefined``
-  // otherwise so the emitter's v3.1 defaults (``true`` / ``true``)
-  // win. No DEC entry yet — preview path, will land as part of the
-  // v3 promotion ratification.
-  const v3Preview = useMemo(() => {
+  // ``hideRetPills`` / ``gatesOnly`` pass through as ``undefined``
+  // unless the operator explicitly flips the param, in which case
+  // V3's emitter consumes the override. v3.X-next.2.0 ratified
+  // these as the long-term operator-visible knobs (no v3.X-next.3
+  // re-shape planned).
+  const v3Overrides = useMemo(() => {
     if (typeof window === "undefined") {
       return {
-        enabled: false,
         hideRetPills: undefined as boolean | undefined,
         gatesOnly: undefined as boolean | undefined,
       };
     }
     const params = new URLSearchParams(window.location.search);
-    const enabled = params.get("flow") === "v3";
     const pillsParam = params.get("pills");
     const methodsParam = params.get("methods");
     return {
-      enabled,
       hideRetPills:
         pillsParam === "show"
           ? false
@@ -1363,7 +1380,7 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
   // Inspector gets ``overloadCount`` + ``possiblyInlined`` + the
   // synthetic-sink guard fields directly from the graph layer.
   const [selectedFlowNode, setSelectedFlowNode] =
-    useState<ExecutionFlowNode | null>(null);
+    useState<ExecutionFlowV3Node | null>(null);
 
   // Phase 13 sub-step 13.8 — dynamic-trace lifecycle owned by the
   // shared :func:`useDynamicTrace` hook. The hook's state drives
@@ -1532,27 +1549,18 @@ function TraceResultRegion({ state, appId, lowConfidenceSet, onBuild }: ResultPr
         </header>
         {!executionFlowCollapsed && (
           <div id="execution-flow-body" className="execution-flow-row">
-            {v3Preview.enabled ? (
-              <ExecutionFlowV3
-                anchor={anchor}
-                selectedNodeId={selectedFlowNode?.id ?? null}
-                onNodeClick={(node) =>
-                  setSelectedFlowNode(node as unknown as ExecutionFlowNode)
-                }
-                hideRetPills={v3Preview.hideRetPills}
-                gatesOnly={v3Preview.gatesOnly}
-              />
-            ) : (
-              <ExecutionFlow
-                anchor={anchor}
-                selectedNodeId={selectedFlowNode?.id ?? null}
-                onNodeClick={(node) => setSelectedFlowNode(node)}
-                mode={mode}
-                firedMethods={dynamic.state.firedMethods}
-                liveValues={dynamic.state.liveValues}
-                hookFailed={dynamic.state.hookFailed}
-              />
-            )}
+            <ExecutionFlowV3
+              anchor={anchor}
+              selectedNodeId={selectedFlowNode?.id ?? null}
+              onNodeClick={(node) => setSelectedFlowNode(node)}
+              hideRetPills={v3Overrides.hideRetPills}
+              gatesOnly={v3Overrides.gatesOnly}
+              mode={mode}
+              firedMethods={dynamic.state.firedMethods}
+              liveValues={dynamic.state.liveValues}
+              hookFailed={dynamic.state.hookFailed}
+              onSourceLineClick={onSourceLineClick}
+            />
             <Inspector
               anchor={anchor}
               selectedNodeId={selectedFlowNode?.id ?? null}
