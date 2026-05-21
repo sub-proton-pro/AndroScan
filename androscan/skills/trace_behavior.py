@@ -53,6 +53,7 @@ from androscan.analysis.trace_types import (
     BranchOutcome,
     BranchVerdict,
     BypassPlan,
+    CallSite,
     DecisionPoint,
     MethodRef,
 )
@@ -241,18 +242,35 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
 
     aggregated_decisions: list[DecisionPoint] = []
     aggregated_plans: list[BypassPlan] = []
+    # Phase 13 v3.X-next.1 / DEC-031 — per-method CallSite tuples keyed by
+    # the caller's smali signature (overload-shape per Q2=(a)). Captured
+    # via ``slicing.extract_call_sites`` for every closure method with a
+    # body — branchless helpers included, so the v3.X-next.2 emitter has
+    # the full app-code call graph available for CFG-position-aware
+    # ranking. Empty tuples are dropped at insertion time to keep the
+    # dict tight (consumers treat a missing key as "no app-code
+    # invocations in that method body").
+    method_invocations: dict[str, tuple[CallSite, ...]] = {}
     incomplete = False
     for sig in closure.methods:
         md = by_signature.get(sig)
         if md is None:
             # Closure node has no Smali body in the apktool tree
             # (compiled-away helper). Legitimate and just contributes
-            # zero decisions.
+            # zero decisions + zero CallSites.
             continue
+        call_sites = slicing.extract_call_sites(
+            md,
+            classes_by_smali=classes_by_smali,
+        )
+        if call_sites:
+            method_invocations[md.method_signature] = call_sites
         if not md.decision_points:
             # Branchless method (now reachable via ``include_branchless=True``
             # but contributes no decisions to the aggregation —
-            # behaviour matches v1 for the per-closure loop).
+            # behaviour matches v1 for the per-closure loop). CallSites
+            # for branchless helpers still flow into method_invocations
+            # above so the v3.X-next.2 emitter sees the full graph.
             continue
         sliced = slicing.slice_predicate_origins(
             md,
@@ -325,6 +343,7 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
         advanced_plans=advanced_plans,
         rationale=rationale,
         low_confidence_decision_indices=low_conf_indices,
+        method_invocations=method_invocations,
     )
 
     try:

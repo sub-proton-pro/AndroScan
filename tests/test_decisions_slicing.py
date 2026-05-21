@@ -17,11 +17,16 @@ import pytest
 
 from androscan.analysis import decisions, slicing, smali_parser
 from androscan.analysis.trace_types import (
+    BehaviorAnchor,
+    Branch,
+    CallSite,
     CompositeOrigin,
     ConstOrigin,
+    DecisionKind,
     DecisionPoint,
     FieldReadOrigin,
     MethodCallOrigin,
+    MethodRef,
     ParamOrigin,
 )
 
@@ -1016,3 +1021,661 @@ def test_v1_vs_v2_corpus_measurement_v2_resolves_strictly_more_terminals() -> No
         f"v1={v1_none}, v2={v2_none}. Descent must never make slicing"
         f" *worse* — only equal or better."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 v3.X-next.1 / DEC-031 — CallSite + method_invocations
+#
+# Tests for ``slicing.extract_call_sites``, ``slicing._compute_branch_dominance``,
+# the ``FRAMEWORK_CLASS_PREFIXES`` denylist, the ``CallSite`` dataclass
+# shape, and the additive ``BehaviorAnchor.method_invocations`` field.
+#
+# All-synthetic — we hand-build :class:`MethodDecisions` so each test
+# pins one specific slicer behaviour without relying on the fixture
+# smali corpus (which would couple v3.X-next.1's regression posture to
+# any future fixture refactor).
+
+
+_CALLER_SIG = "Lcom/app/Caller;->run()V"
+_CALLER_CLASS_SMALI = "Lcom/app/Caller;"
+
+
+def _caller_ref() -> MethodRef:
+    """The canonical caller MethodRef used by the synthetic fixtures
+    below. Matches :data:`_CALLER_SIG` round-tripped through
+    :meth:`MethodRef.from_smali_signature`."""
+    return MethodRef.from_smali_signature(_CALLER_SIG)
+
+
+def _md(
+    *,
+    instructions: tuple[str, ...],
+    decision_points: tuple[DecisionPoint, ...] = (),
+    label_index: tuple[tuple[str, int], ...] = (),
+    method_signature: str = _CALLER_SIG,
+) -> decisions.MethodDecisions:
+    """Build a synthetic :class:`MethodDecisions` for the v3.X-next.1
+    test class. The signature defaults to :data:`_CALLER_SIG` so each
+    test reads as "this is what the caller's body looks like"; tests
+    that need a different caller (nested-locals scenario) override
+    explicitly."""
+    return decisions.MethodDecisions(
+        method_signature=method_signature,
+        src_file="com/app/Caller.smali",
+        decision_points=decision_points,
+        label_index=label_index,
+        instructions=instructions,
+    )
+
+
+def _ifeqz_at(
+    *,
+    instruction_index: int,
+    target_label: str,
+    method_signature: str = _CALLER_SIG,
+) -> DecisionPoint:
+    """Build a synthetic ``if-eqz`` DecisionPoint pointing at *target_label*.
+
+    Mirrors how :mod:`androscan.analysis.decisions` shapes the
+    two-branch fan-out (``"true"`` branch jumps to the target;
+    ``"false"`` branch falls through to the next instruction)."""
+    return DecisionPoint(
+        method=MethodRef.from_smali_signature(method_signature),
+        instruction_index=instruction_index,
+        source_line=None,
+        kind=DecisionKind.IF_EQZ,
+        predicate_registers=("v0",),
+        branches=(
+            Branch(label="true", target_label=target_label),
+            Branch(label="false", target_label=None),
+        ),
+    )
+
+
+def _app_classes(*class_descs: str) -> dict[str, smali_parser.ClassDecl]:
+    """Build a ``classes_by_smali`` map populated with sentinel entries
+    for the given class descriptors. The slicer's primary resolution
+    path only checks for *membership*, never inspects the
+    :class:`ClassDecl` body, so we can use ``None`` sentinels — typed
+    ``Any`` here to satisfy the static checker."""
+    return {desc: None for desc in class_descs}  # type: ignore[misc]
+
+
+class TestPhase13V3XNext1_MethodInvocations:
+    """Phase 13 v3.X-next.1 (DEC-031) — slicer extension.
+
+    Locked Q&As under test:
+
+    * Q1=(a) — :class:`CallSite` lives in
+      :mod:`androscan.analysis.trace_types` (import path test).
+    * Q2=(a) — ``method_invocations`` keyed by overload-signature shape.
+    * Q3=(c) — hybrid invoke-target resolution (same-module direct;
+      cross-module via optional resolver).
+    * Q4=(a) — single ``in_branch_of`` dominator + ``branch_label``
+      ride-along; innermost wins.
+    * Q5=(c) — slicer applies ``FRAMEWORK_CLASS_PREFIXES`` denylist.
+    """
+
+    # -----------------------------------------------------------------
+    # Linear scenarios (no decisions) — 4 tests
+
+    def test_linear_three_invokes_no_branches(self) -> None:
+        """3 sequential invokes, no decisions → 3 CallSites, all
+        un-dominated (``in_branch_of=None, branch_label=None``)."""
+        md = _md(instructions=(
+            "invoke-static {p0}, Lcom/app/A;->aa()V",
+            "invoke-static {p0}, Lcom/app/B;->bb()V",
+            "invoke-static {p0}, Lcom/app/C;->cc()V",
+            "return-void",
+        ))
+        classes = _app_classes("Lcom/app/Caller;", "Lcom/app/A;", "Lcom/app/B;", "Lcom/app/C;")
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert len(sites) == 3
+        for cs in sites:
+            assert cs.in_branch_of is None
+            assert cs.branch_label is None
+        assert [cs.callee.class_name for cs in sites] == ["com.app.A", "com.app.B", "com.app.C"]
+
+    def test_linear_invokes_preserve_source_order(self) -> None:
+        """``extract_call_sites`` returns CallSites ordered by
+        ``instruction_index`` — same as source order under sequential
+        iteration, but the explicit sort is the contract."""
+        md = _md(instructions=(
+            "invoke-static {}, Lcom/app/A;->aa()V",
+            "invoke-static {}, Lcom/app/B;->bb()V",
+            "invoke-static {}, Lcom/app/C;->cc()V",
+        ))
+        classes = _app_classes("Lcom/app/Caller;", "Lcom/app/A;", "Lcom/app/B;", "Lcom/app/C;")
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert [cs.instruction_index for cs in sites] == [0, 1, 2]
+
+    def test_linear_zero_invokes_returns_empty_tuple(self) -> None:
+        """Method with no invoke instructions → empty tuple. The
+        caller-side wire-up in ``trace_behavior`` drops empty tuples
+        from the ``method_invocations`` dict to keep it tight."""
+        md = _md(instructions=(
+            "const/4 v0, 0x0",
+            "return-void",
+        ))
+        classes = _app_classes("Lcom/app/Caller;")
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert sites == ()
+
+    def test_caller_methodref_matches_method_signature(self) -> None:
+        """Every CallSite's ``caller`` round-trips to
+        ``method_signature`` — the caller anchor that the v3.X-next.2
+        emitter joins against."""
+        md = _md(instructions=(
+            "invoke-static {}, Lcom/app/A;->aa()V",
+        ))
+        classes = _app_classes("Lcom/app/Caller;", "Lcom/app/A;")
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert len(sites) == 1
+        assert sites[0].caller.smali_signature == _CALLER_SIG
+
+    # -----------------------------------------------------------------
+    # Branchy scenarios (one if-eqz) — 4 tests
+
+    def test_branchy_pre_branch_callsite_undominated(self) -> None:
+        """A CallSite at an instruction-index *before* the if-eqz
+        decision must have ``in_branch_of=None, branch_label=None``."""
+        md = _md(
+            instructions=(
+                "invoke-static {p0}, Lcom/app/Pre;->pre()V",   # idx 0 — pre-branch
+                "if-eqz v0, :cond_0",                            # idx 1
+                "invoke-static {p0}, Lcom/app/False;->fa()V",   # idx 2 — false arm
+                "goto :end_0",                                    # idx 3
+                "invoke-static {p0}, Lcom/app/True;->ta()V",    # idx 4 — true arm
+                "return-void",                                    # idx 5
+            ),
+            decision_points=(_ifeqz_at(instruction_index=1, target_label=":cond_0"),),
+            label_index=((":cond_0", 4), (":end_0", 5)),
+        )
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/Pre;", "Lcom/app/False;", "Lcom/app/True;")
+        sites = {cs.instruction_index: cs for cs in slicing.extract_call_sites(md, classes_by_smali=classes)}
+        assert sites[0].in_branch_of is None
+        assert sites[0].branch_label is None
+
+    def test_branchy_true_arm_dominated(self) -> None:
+        """CallSite in the true arm has ``in_branch_of = decision_idx``
+        and ``branch_label = "true"`` (matches :class:`Branch.label`
+        verbatim)."""
+        md = _md(
+            instructions=(
+                "invoke-static {p0}, Lcom/app/Pre;->pre()V",
+                "if-eqz v0, :cond_0",
+                "invoke-static {p0}, Lcom/app/False;->fa()V",
+                "goto :end_0",
+                "invoke-static {p0}, Lcom/app/True;->ta()V",
+                "return-void",
+            ),
+            decision_points=(_ifeqz_at(instruction_index=1, target_label=":cond_0"),),
+            label_index=((":cond_0", 4), (":end_0", 5)),
+        )
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/Pre;", "Lcom/app/False;", "Lcom/app/True;")
+        sites = {cs.instruction_index: cs for cs in slicing.extract_call_sites(md, classes_by_smali=classes)}
+        assert sites[4].in_branch_of == 1
+        assert sites[4].branch_label == "true"
+
+    def test_branchy_false_arm_dominated(self) -> None:
+        """CallSite in the false (fall-through) arm has
+        ``branch_label = "false"`` and points at the same decision."""
+        md = _md(
+            instructions=(
+                "invoke-static {p0}, Lcom/app/Pre;->pre()V",
+                "if-eqz v0, :cond_0",
+                "invoke-static {p0}, Lcom/app/False;->fa()V",
+                "goto :end_0",
+                "invoke-static {p0}, Lcom/app/True;->ta()V",
+                "return-void",
+            ),
+            decision_points=(_ifeqz_at(instruction_index=1, target_label=":cond_0"),),
+            label_index=((":cond_0", 4), (":end_0", 5)),
+        )
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/Pre;", "Lcom/app/False;", "Lcom/app/True;")
+        sites = {cs.instruction_index: cs for cs in slicing.extract_call_sites(md, classes_by_smali=classes)}
+        assert sites[2].in_branch_of == 1
+        assert sites[2].branch_label == "false"
+
+    def test_branchy_two_register_predicate_no_special_case(self) -> None:
+        """``if-eq`` (two-register variant) dominance behaves identically
+        to ``if-eqz`` — the slicer treats every Branch label uniformly."""
+        decision = DecisionPoint(
+            method=_caller_ref(),
+            instruction_index=0,
+            source_line=None,
+            kind=DecisionKind.IF_EQ,
+            predicate_registers=("v0", "v1"),
+            branches=(
+                Branch(label="true", target_label=":cond_0"),
+                Branch(label="false", target_label=None),
+            ),
+        )
+        md = _md(
+            instructions=(
+                "if-eq v0, v1, :cond_0",
+                "invoke-static {}, Lcom/app/F;->fa()V",
+                "goto :end_0",
+                "invoke-static {}, Lcom/app/T;->ta()V",
+                "return-void",
+            ),
+            decision_points=(decision,),
+            label_index=((":cond_0", 3), (":end_0", 4)),
+        )
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/F;", "Lcom/app/T;")
+        sites = {cs.instruction_index: cs for cs in slicing.extract_call_sites(md, classes_by_smali=classes)}
+        assert sites[1].branch_label == "false"
+        assert sites[3].branch_label == "true"
+
+    # -----------------------------------------------------------------
+    # Nested-locals scenarios — 3 tests
+
+    def test_nested_outer_method_invocations_keyed_by_signature(self) -> None:
+        """Outer method's CallSites flow into the
+        ``method_invocations`` dict under the outer's
+        ``method_signature``; the inner method's CallSites flow under
+        the inner's signature. Keys are the overload-signature shape
+        (Q2=(a)) — matches :attr:`MethodRef.smali_signature`."""
+        outer_sig = "Lcom/app/Login;->login(Ljava/lang/String;)Z"
+        inner_sig = "Lcom/app/Login;->check_active_session()Z"
+        outer_md = _md(
+            method_signature=outer_sig,
+            instructions=(
+                "invoke-virtual {p0}, Lcom/app/Login;->check_active_session()Z",
+                "invoke-virtual {p0, p1}, Lcom/app/Login;->check_input(Ljava/lang/String;)Z",
+                "invoke-virtual {p0, p1}, Lcom/app/Login;->validate_pin(Ljava/lang/String;)Z",
+                "return v0",
+            ),
+        )
+        classes = _app_classes("Lcom/app/Login;")
+        sites = slicing.extract_call_sites(outer_md, classes_by_smali=classes)
+        assert len(sites) == 3
+        method_names = [cs.callee.method_name for cs in sites]
+        assert method_names == ["check_active_session", "check_input", "validate_pin"]
+        assert all(cs.caller.smali_signature == outer_sig for cs in sites)
+        assert outer_sig != inner_sig  # paranoia — Q2 key shape distinct
+
+    def test_nested_innermost_wins_dominance(self) -> None:
+        """CallSite inside an inner if-eqz's true arm picks the
+        *inner* decision as ``in_branch_of`` (not the outer's),
+        per Q4=(a) — innermost dominator wins."""
+        outer = _ifeqz_at(instruction_index=0, target_label=":outer_true")
+        inner = _ifeqz_at(instruction_index=3, target_label=":inner_true")
+        md = _md(
+            instructions=(
+                "if-eqz v0, :outer_true",                          # 0 — outer decision
+                "invoke-static {}, Lcom/app/OuterFalse;->of()V",  # 1 — outer false arm
+                "goto :end_outer",                                  # 2
+                "if-eqz v1, :inner_true",                           # 3 — inner decision (in outer true arm)
+                "invoke-static {}, Lcom/app/InnerFalse;->if_()V", # 4 — inner false arm
+                "goto :end_inner",                                   # 5
+                "invoke-static {}, Lcom/app/InnerTrue;->it()V",   # 6 — inner true arm
+                "return-void",                                       # 7
+            ),
+            decision_points=(outer, inner),
+            label_index=(
+                (":outer_true", 3),
+                (":inner_true", 6),
+                (":end_outer", 7),
+                (":end_inner", 7),
+            ),
+        )
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/OuterFalse;", "Lcom/app/InnerFalse;", "Lcom/app/InnerTrue;")
+        sites = {cs.instruction_index: cs for cs in slicing.extract_call_sites(md, classes_by_smali=classes)}
+        assert sites[6].in_branch_of == 3
+        assert sites[6].branch_label == "true"
+        assert sites[4].in_branch_of == 3
+        assert sites[4].branch_label == "false"
+
+    def test_nested_outer_arm_only_uses_outer_dominator(self) -> None:
+        """A CallSite in the outer-arm region that is NOT covered by
+        any inner arm gets the outer decision as its dominator."""
+        outer = _ifeqz_at(instruction_index=0, target_label=":outer_true")
+        md = _md(
+            instructions=(
+                "if-eqz v0, :outer_true",                          # 0 — outer decision
+                "invoke-static {}, Lcom/app/OuterFalse;->of()V",  # 1 — outer false arm
+                "return-void",                                       # 2
+            ),
+            decision_points=(outer,),
+            label_index=((":outer_true", 2),),
+        )
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/OuterFalse;")
+        sites = {cs.instruction_index: cs for cs in slicing.extract_call_sites(md, classes_by_smali=classes)}
+        assert sites[1].in_branch_of == 0
+        assert sites[1].branch_label == "false"
+
+    # -----------------------------------------------------------------
+    # Shape / contract tests — 4 tests
+
+    def test_callsite_is_frozen(self) -> None:
+        """:class:`CallSite` is ``frozen=True`` — attempting to mutate a
+        field raises :class:`dataclasses.FrozenInstanceError`."""
+        ref = _caller_ref()
+        cs = CallSite(caller=ref, instruction_index=0, callee=ref, in_branch_of=None, branch_label=None)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            cs.instruction_index = 99  # type: ignore[misc]
+
+    def test_callsite_is_hashable(self) -> None:
+        """Frozen dataclass → hashable. Tests can stuff CallSites in
+        sets / dict keys for de-duplication."""
+        ref = _caller_ref()
+        cs1 = CallSite(caller=ref, instruction_index=0, callee=ref, in_branch_of=None, branch_label=None)
+        cs2 = CallSite(caller=ref, instruction_index=0, callee=ref, in_branch_of=None, branch_label=None)
+        assert hash(cs1) == hash(cs2)
+        assert {cs1, cs2} == {cs1}
+
+    def test_callsite_roundtrips_asdict_json(self) -> None:
+        """``dataclasses.asdict`` + ``json.dumps`` + ``json.loads``
+        round-trip preserves every field. Belt-and-braces guard for
+        the trace cache layer's encode/decode contract."""
+        ref = MethodRef.from_smali_signature("Lcom/app/Caller;->run()V")
+        cs = CallSite(
+            caller=ref,
+            instruction_index=7,
+            callee=MethodRef.from_smali_signature("Lcom/app/X;->y()V"),
+            in_branch_of=4,
+            branch_label="case 2",
+        )
+        encoded = json.dumps(dataclasses.asdict(cs), sort_keys=True)
+        raw = json.loads(encoded)
+        assert raw["instruction_index"] == 7
+        assert raw["in_branch_of"] == 4
+        assert raw["branch_label"] == "case 2"
+        assert raw["caller"]["class_name"] == "com.app.Caller"
+        assert raw["callee"]["method_name"] == "y"
+
+    def test_behavior_anchor_method_invocations_defaults_empty(self) -> None:
+        """Constructing :class:`BehaviorAnchor` without
+        ``method_invocations`` defaults to ``{}`` — backwards-compat
+        with v2 / v2.0.1 / v3.0 / v3.1 cached anchors that were
+        serialised before the field existed."""
+        anchor = BehaviorAnchor(entry_method=_caller_ref(), hops=1)
+        assert anchor.method_invocations == {}
+
+    def test_behavior_anchor_method_invocations_can_be_populated(self) -> None:
+        """Explicit ``method_invocations`` flows through the
+        constructor — sanity check that the additive field is wired
+        up correctly on :class:`BehaviorAnchor`."""
+        ref = _caller_ref()
+        cs = CallSite(caller=ref, instruction_index=0, callee=ref, in_branch_of=None, branch_label=None)
+        anchor = BehaviorAnchor(
+            entry_method=ref, hops=1,
+            method_invocations={_CALLER_SIG: (cs,)},
+        )
+        assert anchor.method_invocations[_CALLER_SIG] == (cs,)
+
+    # -----------------------------------------------------------------
+    # Framework filter (Q5=(c)) — 4 tests
+
+    @pytest.mark.parametrize("prefix", list(slicing.FRAMEWORK_CLASS_PREFIXES))
+    def test_framework_filter_drops_all_ten_prefixes(self, prefix: str) -> None:
+        """Each of the 10 ``FRAMEWORK_CLASS_PREFIXES`` entries must
+        cause the slicer to drop matching invoke targets — keeps the
+        denominator consistent with the v3.1 emitter's denylist."""
+        target_class = prefix + "Synthetic;"
+        md = _md(instructions=(
+            f"invoke-static {{p0}}, {target_class}->doit()V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI)
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert sites == ()
+
+    def test_framework_filter_drops_kotlin_intrinsics(self) -> None:
+        """The canonical noise case — ``Kotlin.Intrinsics.checkNotNull``
+        — must drop. This is the rank-1 sibling the v3.1 emitter's
+        denylist was originally built to suppress."""
+        md = _md(instructions=(
+            "invoke-static {p0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI)
+        assert slicing.extract_call_sites(md, classes_by_smali=classes) == ()
+
+    def test_framework_filter_drops_android_view(self) -> None:
+        """``Landroid/`` prefix catches platform classes the operator
+        never wants in the flowchart (View / Bundle / Activity
+        framework methods)."""
+        md = _md(instructions=(
+            "invoke-virtual {p0}, Landroid/view/View;->getId()I",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI)
+        assert slicing.extract_call_sites(md, classes_by_smali=classes) == ()
+
+    def test_app_code_callee_not_filtered_by_framework_list(self) -> None:
+        """``Lcom/app/`` (or any non-framework prefix) target passes
+        through the filter unchanged."""
+        md = _md(instructions=(
+            "invoke-static {p0}, Lcom/app/Service;->call()V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/Service;")
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert len(sites) == 1
+        assert sites[0].callee.class_name == "com.app.Service"
+
+    # -----------------------------------------------------------------
+    # Resolution policy (Q3=(c)) — 5 tests
+
+    def test_primary_path_resolves_in_module_callee(self) -> None:
+        """Target class IS in ``classes_by_smali`` → primary path
+        constructs the callee MethodRef directly off the smali line
+        (no resolver invoked)."""
+        md = _md(instructions=(
+            "invoke-static {p0}, Lcom/app/In;->aa()V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/In;")
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert len(sites) == 1
+        assert sites[0].callee.smali_signature == "Lcom/app/In;->aa()V"
+
+    def test_resolver_none_drops_cross_module_callee(self) -> None:
+        """Target class NOT in ``classes_by_smali`` AND no resolver
+        provided → CallSite dropped silently (Q3=(c) fallback path
+        unavailable)."""
+        md = _md(instructions=(
+            "invoke-static {p0}, Lcom/external/X;->y()V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI)
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert sites == ()
+
+    def test_resolver_returning_methodref_emits_callsite(self) -> None:
+        """Resolver returns a :class:`MethodRef` → the CallSite is
+        emitted with the resolver's MethodRef as the callee (Q3=(c)
+        cross-module fallback success path)."""
+        external_ref = MethodRef.from_smali_signature("Lcom/external/X;->y()V")
+
+        def resolver(sig: str) -> MethodRef:
+            assert sig == "Lcom/external/X;->y()V"
+            return external_ref
+
+        md = _md(instructions=(
+            "invoke-static {p0}, Lcom/external/X;->y()V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI)
+        sites = slicing.extract_call_sites(
+            md, classes_by_smali=classes, call_graph_resolver=resolver,
+        )
+        assert len(sites) == 1
+        assert sites[0].callee is external_ref
+
+    def test_resolver_returning_none_drops_callsite(self) -> None:
+        """Resolver returns ``None`` (call-graph doesn't know the
+        target) → CallSite dropped silently."""
+        def resolver(sig: str) -> None:
+            return None
+
+        md = _md(instructions=(
+            "invoke-static {p0}, Lcom/external/X;->y()V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI)
+        sites = slicing.extract_call_sites(
+            md, classes_by_smali=classes, call_graph_resolver=resolver,
+        )
+        assert sites == ()
+
+    def test_resolver_not_called_for_in_module_target(self) -> None:
+        """When the primary path resolves the target (class is in
+        ``classes_by_smali``), the resolver MUST NOT be invoked — its
+        only role is the cross-module fallback."""
+        resolver_calls: list[str] = []
+
+        def resolver(sig: str) -> MethodRef:
+            resolver_calls.append(sig)
+            return MethodRef.from_smali_signature(sig)
+
+        md = _md(instructions=(
+            "invoke-static {p0}, Lcom/app/In;->aa()V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/In;")
+        sites = slicing.extract_call_sites(
+            md, classes_by_smali=classes, call_graph_resolver=resolver,
+        )
+        assert len(sites) == 1
+        assert resolver_calls == []
+
+    # -----------------------------------------------------------------
+    # Dominance edge cases — 5 tests
+
+    def test_packed_switch_per_case_branch_label(self) -> None:
+        """``packed-switch`` with 4 cases — each per-case CallSite gets
+        its arm's ``Branch.label`` (``"case 0"`` / ``"case 1"`` / ... /
+        ``"default"``) verbatim."""
+        switch = DecisionPoint(
+            method=_caller_ref(),
+            instruction_index=0,
+            source_line=None,
+            kind=DecisionKind.PACKED_SWITCH,
+            predicate_registers=("v0",),
+            branches=(
+                Branch(label="case 0", target_label=":case_0"),
+                Branch(label="case 1", target_label=":case_1"),
+                Branch(label="case 2", target_label=":case_2"),
+                Branch(label="default", target_label=None),
+            ),
+        )
+        md = _md(
+            instructions=(
+                "packed-switch v0, :switch_data",   # 0
+                "invoke-static {}, Lcom/app/D;->d()V",   # 1 — default arm (fall-through)
+                "goto :end",                         # 2
+                "invoke-static {}, Lcom/app/A;->a()V",   # 3 — case 0
+                "goto :end",                         # 4
+                "invoke-static {}, Lcom/app/B;->b()V",   # 5 — case 1
+                "goto :end",                         # 6
+                "invoke-static {}, Lcom/app/C;->c()V",   # 7 — case 2
+                "return-void",                        # 8
+            ),
+            decision_points=(switch,),
+            label_index=(
+                (":case_0", 3),
+                (":case_1", 5),
+                (":case_2", 7),
+                (":end", 8),
+            ),
+        )
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/A;", "Lcom/app/B;", "Lcom/app/C;", "Lcom/app/D;")
+        sites = {cs.instruction_index: cs for cs in slicing.extract_call_sites(md, classes_by_smali=classes)}
+        assert sites[1].branch_label == "default"
+        assert sites[3].branch_label == "case 0"
+        assert sites[5].branch_label == "case 1"
+        assert sites[7].branch_label == "case 2"
+
+    def test_sparse_switch_default_label(self) -> None:
+        """``sparse-switch`` with a ``default`` arm — fall-through
+        CallSites pick up the ``"default"`` branch_label (matches
+        :class:`Branch.label` from ``decisions.py``)."""
+        switch = DecisionPoint(
+            method=_caller_ref(),
+            instruction_index=0,
+            source_line=None,
+            kind=DecisionKind.SPARSE_SWITCH,
+            predicate_registers=("v0",),
+            branches=(
+                Branch(label="case 100", target_label=":case_100"),
+                Branch(label="default", target_label=None),
+            ),
+        )
+        md = _md(
+            instructions=(
+                "sparse-switch v0, :switch_data",   # 0
+                "invoke-static {}, Lcom/app/D;->d()V",   # 1 — default
+                "goto :end",                         # 2
+                "invoke-static {}, Lcom/app/H;->h()V",   # 3 — case 100
+                "return-void",                        # 4
+            ),
+            decision_points=(switch,),
+            label_index=((":case_100", 3), (":end", 4)),
+        )
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/D;", "Lcom/app/H;")
+        sites = {cs.instruction_index: cs for cs in slicing.extract_call_sites(md, classes_by_smali=classes)}
+        assert sites[1].branch_label == "default"
+        assert sites[3].branch_label == "case 100"
+
+    def test_dominance_no_decisions_returns_empty(self) -> None:
+        """``_compute_branch_dominance`` on a decision-free method
+        body returns an empty dict — every instruction is
+        un-dominated."""
+        md = _md(instructions=(
+            "invoke-static {}, Lcom/app/A;->a()V",
+            "return-void",
+        ))
+        dom = slicing._compute_branch_dominance(md)
+        assert dom == {}
+
+    def test_dominance_unresolvable_target_label_skipped(self) -> None:
+        """Defensive: a Branch with ``target_label`` not in
+        ``label_index`` is silently skipped (shouldn't happen on
+        well-formed parser output but the dominance helper stays
+        defensive)."""
+        broken_dp = DecisionPoint(
+            method=_caller_ref(),
+            instruction_index=0,
+            source_line=None,
+            kind=DecisionKind.IF_EQZ,
+            predicate_registers=("v0",),
+            branches=(
+                Branch(label="true", target_label=":does_not_exist"),
+                Branch(label="false", target_label=None),
+            ),
+        )
+        md = _md(
+            instructions=("if-eqz v0, :does_not_exist", "return-void"),
+            decision_points=(broken_dp,),
+            label_index=(),
+        )
+        dom = slicing._compute_branch_dominance(md)
+        assert all(label != "true" for (_, label) in dom.values())
+
+    def test_extract_call_sites_explicit_sort_by_instruction_index(self) -> None:
+        """The returned tuple is sorted by ``instruction_index`` — the
+        sort is the documented contract even when the natural
+        iteration order already matches."""
+        md = _md(instructions=(
+            "invoke-static {}, Lcom/app/A;->a()V",
+            "invoke-static {}, Lcom/app/B;->b()V",
+            "invoke-static {}, Lcom/app/C;->c()V",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/A;", "Lcom/app/B;", "Lcom/app/C;")
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        indices = [cs.instruction_index for cs in sites]
+        assert indices == sorted(indices)
+
+    # -----------------------------------------------------------------
+    # Import-path / Q1 lock — 1 test
+
+    def test_callsite_importable_from_trace_types(self) -> None:
+        """Q1=(a) — :class:`CallSite` must live in
+        :mod:`androscan.analysis.trace_types` (alongside every other
+        anchor-payload primitive)."""
+        from androscan.analysis import trace_types
+        assert trace_types.CallSite is CallSite

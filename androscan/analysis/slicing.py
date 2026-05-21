@@ -133,11 +133,12 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from androscan.analysis.decisions import MethodDecisions
 from androscan.analysis.smali_parser import ClassDecl
 from androscan.analysis.trace_types import (
+    CallSite,
     CompositeOrigin,
     ConstOrigin,
     DecisionPoint,
@@ -1450,3 +1451,253 @@ def _java_class_to_smali(java_name: str) -> str:
     so the slicer doesn't have to import a private helper from
     trace_types. ``com.example.Foo`` → ``Lcom/example/Foo;``."""
     return f"L{java_name.replace('.', '/')};"
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 v3.X-next.1 (DEC-031) — CallSite extraction
+#
+# Captures every app-code ``invoke-*`` instruction in a method body
+# alongside the dominating decision (if any) + branch-arm label, so the
+# v3.X-next.2 emitter can build CFG-position-aware flowchart ranking.
+# Wire-compatible additive extraction; the slicer's existing
+# :func:`slice_predicate_origins` pass is unchanged.
+#
+# Three additions:
+#
+# * :data:`FRAMEWORK_CLASS_PREFIXES` — denylist mirrored verbatim against
+#   the v3.1 emitter's ``FRAMEWORK_CLASS_PREFIXES`` (in Java-dotted form
+#   on the FE side); the slicer's copy lives here in smali form
+#   (``Lkotlin/`` / ``Landroid/`` / etc.). Both lists are kept in lockstep
+#   so slicer-emitted CallSites + emitter-rendered nodes agree on what's
+#   "framework noise".
+# * :func:`_compute_branch_dominance` — pure helper that maps each
+#   instruction-index in a method to its dominating
+#   ``(decision_instruction_index, branch_label)``, or absent if the
+#   instruction is in the pre-branch / post-arm rejoin region. Uses the
+#   next-arm-start as the end-of-arm boundary heuristic; innermost
+#   nested decisions win by virtue of source-order processing.
+# * :func:`extract_call_sites` — pure function that walks a method's
+#   instruction stream once, parses ``invoke-*`` lines via the existing
+#   :data:`_RE_INVOKE` regex, applies the framework filter (Q5=(c)), and
+#   resolves callees via the hybrid policy (Q3=(c) — same-module direct;
+#   cross-module via optional resolver callable).
+
+
+#: Class-descriptor prefixes the slicer treats as framework noise and
+#: skips when emitting :class:`CallSite` records. Mirrors the v3.1
+#: emitter's ``FRAMEWORK_CLASS_PREFIXES`` list (Java-dotted on the FE
+#: side); the slicer's copy is in smali form so it can be compared
+#: directly against the ``owner`` capture group of :data:`_RE_INVOKE`.
+#: Kept lock-stepped with the FE list — additions on either side need a
+#: matching update on the other so the denominator stays consistent.
+FRAMEWORK_CLASS_PREFIXES: tuple[str, ...] = (
+    "Lkotlin/",
+    "Lkotlinx/",
+    "Landroidx/",
+    "Landroid/",
+    "Ljava/",
+    "Ljavax/",
+    "Lcom/google/android/",
+    "Lcom/google/gson/",
+    "Ldalvik/",
+    "Lsun/",
+)
+
+
+def _compute_branch_dominance(
+    method_decisions: MethodDecisions,
+) -> dict[int, tuple[int, str]]:
+    """Map each instruction-index in *method_decisions* to its dominating
+    ``(decision_instruction_index, branch_label)`` tuple.
+
+    Indices not present in the returned dict are *not* inside any branch
+    arm of any decision in the method (pre-branch region, or post-arm
+    rejoin region under the next-arm-start boundary heuristic).
+
+    Algorithm:
+
+    * For each :class:`Branch` on each :class:`DecisionPoint`, determine
+      the arm's ``start_idx``:
+
+      * ``target_label = None`` (fall-through) — ``start_idx = dp.instruction_index + 1``.
+      * Else — resolve ``target_label`` against ``method_decisions.label_index``
+        and use the resulting instruction-index. Unresolvable labels skip
+        the arm defensively (shouldn't happen for well-formed smali).
+
+    * ``end_idx`` is the smallest arm-start-index greater than
+      ``start_idx`` across *all* arms in the method, capped at the method
+      end (``len(instructions)``). This is the "next-boundary" heuristic
+      — cheap to compute, doesn't require building a full CFG, and
+      correct for the common case where nested if-arms don't overlap
+      laterally with later siblings.
+
+    * Decisions are processed in source order (which matches
+      ``decision_points`` ordering, which the parser emits in textual
+      order). Later writes overwrite earlier ones, so nested
+      ("inner") decisions win for indices their arms cover (per Q4=(a)
+      / DEC-031 — innermost dominator wins).
+
+    Returned dict is keyed by 0-based instruction-index; values are
+    ``(decision.instruction_index, branch.label)`` — same shape the
+    :class:`CallSite` consumer expects.
+    """
+    label_idx_map = dict(method_decisions.label_index)
+    n_instructions = len(method_decisions.instructions)
+
+    arm_starts: list[int] = []
+    for dp in method_decisions.decision_points:
+        for br in dp.branches:
+            if br.target_label is None:
+                arm_starts.append(dp.instruction_index + 1)
+            else:
+                target_idx = label_idx_map.get(br.target_label)
+                if target_idx is not None:
+                    arm_starts.append(target_idx)
+    arm_starts_sorted = sorted(set(arm_starts))
+
+    def _next_boundary_after(start_idx: int) -> int:
+        for s in arm_starts_sorted:
+            if s > start_idx:
+                return s
+        return n_instructions
+
+    dominance: dict[int, tuple[int, str]] = {}
+    for dp in method_decisions.decision_points:
+        for br in dp.branches:
+            if br.target_label is None:
+                start_idx = dp.instruction_index + 1
+            else:
+                target_idx = label_idx_map.get(br.target_label)
+                if target_idx is None:
+                    continue
+                start_idx = target_idx
+            end_idx = _next_boundary_after(start_idx)
+            for idx in range(start_idx, end_idx):
+                dominance[idx] = (dp.instruction_index, br.label)
+    return dominance
+
+
+def extract_call_sites(
+    method_decisions: MethodDecisions,
+    *,
+    classes_by_smali: dict[str, ClassDecl],
+    call_graph_resolver: Optional[Callable[[str], Optional[MethodRef]]] = None,
+) -> tuple[CallSite, ...]:
+    """Extract :class:`CallSite` records for every app-code ``invoke-*``
+    in *method_decisions*'s instruction stream.
+
+    Pure function — no I/O, no SQLite. Captures everything the
+    v3.X-next.2 emitter needs to build CFG-position-aware flowchart
+    ranking, with the v3.X-next.1.0 locks applied at extraction time so
+    consumers never see framework noise or cross-module-unresolvable
+    callees.
+
+    Lockset (DEC-031 / v3.X-next.1.0 planning checkpoint):
+
+    * **Q3=(c) — hybrid invoke-target resolution.** The callee is parsed
+      directly off the smali ``invoke-*`` line (the ``owner`` /
+      ``method`` / ``params`` / ``ret`` capture groups). If the target
+      class is in *classes_by_smali* (same-module / in-scope), that's
+      the resolution; if not, fall back to ``call_graph_resolver`` when
+      provided (the existing call-graph context the ``trace_behavior``
+      skill already has loaded — no new SQLite opens). When the resolver
+      returns ``None`` (or is itself ``None``) the CallSite is silently
+      dropped — the caller can't usefully render a method it can't even
+      reference.
+
+    * **Q5=(c) — framework filter.** :data:`FRAMEWORK_CLASS_PREFIXES` is
+      applied at extraction time before any resolution work, so framework
+      targets never enter the CallSite stream regardless of whether
+      they'd resolve. The slicer + emitter agree on the denylist (the
+      latter's copy lives on the FE side); keeping the filter in the
+      slicer guarantees the denominator is consistent even if a future
+      caller bypasses the emitter.
+
+    * **Q4=(a) — single dominator.** Dominance is computed by
+      :func:`_compute_branch_dominance`; each CallSite carries the
+      innermost dominating decision's ``instruction_index`` +
+      ``branch.label`` (or ``None`` / ``None`` for pre-branch or
+      post-arm CallSites).
+
+    Arguments:
+
+    * ``method_decisions`` — the per-method bundle from
+      :func:`androscan.analysis.decisions.parse_decisions` (with
+      ``include_branchless=True`` so even decision-free helper bodies
+      yield their invocations).
+    * ``classes_by_smali`` — keyed by class smali descriptor
+      (``Lcom/Foo;`` etc.); already in scope in the ``trace_behavior``
+      skill for the existing slicer descent plumbing.
+    * ``call_graph_resolver`` — optional callable that takes a target
+      method's smali signature and returns a :class:`MethodRef` (or
+      ``None`` if the callee can't be resolved). Used only for
+      cross-module targets — same-module targets resolve directly off
+      the smali line.
+
+    Returns a tuple of :class:`CallSite` ordered by ``instruction_index``
+    (which already matches source order of the iteration; the explicit
+    sort is a defensive guard against future caller-side dict-ordering
+    bugs).
+    """
+    try:
+        caller_ref = MethodRef.from_smali_signature(method_decisions.method_signature)
+    except ValueError:
+        logger.warning(
+            "extract_call_sites: malformed method_signature %r — skipping",
+            method_decisions.method_signature,
+        )
+        return ()
+
+    dominance = _compute_branch_dominance(method_decisions)
+    call_sites: list[CallSite] = []
+
+    for idx, instr in enumerate(method_decisions.instructions):
+        m = _RE_INVOKE.match(instr)
+        if m is None:
+            continue
+        owner = m.group("owner")
+
+        if any(owner.startswith(p) for p in FRAMEWORK_CLASS_PREFIXES):
+            continue
+
+        target_sig = (
+            f"{owner}->{m.group('method')}"
+            f"({m.group('params')}){m.group('ret')}"
+        )
+
+        callee: Optional[MethodRef]
+        if owner in classes_by_smali:
+            try:
+                callee = MethodRef.from_smali_signature(target_sig)
+            except ValueError:
+                logger.warning(
+                    "extract_call_sites: malformed invoke target %r in %s — skipping",
+                    target_sig, method_decisions.method_signature,
+                )
+                continue
+        elif call_graph_resolver is not None:
+            callee = call_graph_resolver(target_sig)
+            if callee is None:
+                continue
+        else:
+            continue
+
+        dom = dominance.get(idx)
+        if dom is None:
+            in_branch_of: Optional[int] = None
+            branch_label: Optional[str] = None
+        else:
+            in_branch_of, branch_label = dom
+
+        call_sites.append(
+            CallSite(
+                caller=caller_ref,
+                instruction_index=idx,
+                callee=callee,
+                in_branch_of=in_branch_of,
+                branch_label=branch_label,
+            )
+        )
+
+    call_sites.sort(key=lambda cs: cs.instruction_index)
+    return tuple(call_sites)

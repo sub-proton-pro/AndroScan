@@ -33,7 +33,7 @@ both serialize uniformly.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Union
 
@@ -566,6 +566,19 @@ class BehaviorAnchor:
       Lets 10.7's UI surface "this verdict was LLM-refined" affordances
       without re-walking the heuristic catalog. Empty when no LLM call
       ran.
+    * ``method_invocations`` (Phase 13 v3.X-next.1 / DEC-031) — per-caller
+      sequence of :class:`CallSite` records, keyed by the caller's
+      ``MethodRef.smali_signature`` (e.g. ``"Lcom/Foo;->bar(I)V"``).
+      Captures every app-code ``invoke-*`` instruction in each method
+      reachable in the anchor's closure, with the dominating decision
+      (if any) + branch-arm label so the v3.X-next.2 emitter can build
+      a CFG-position-aware flowchart ranking that mirrors actual
+      execution order. Additive at schema v2: anchors cached before
+      v3.X-next.1 deserialise with ``method_invocations={}`` and the
+      v3.1 emitter ignores the field. Empty tuples are dropped at
+      construction time to keep the dict tight; callers reading from
+      a populated anchor should treat a missing key as "no app-code
+      invocations in that method body".
     """
     entry_method: MethodRef
     hops: int
@@ -576,6 +589,7 @@ class BehaviorAnchor:
     advanced_plans: tuple["BypassPlan", ...] = ()
     rationale: str = ""
     low_confidence_decision_indices: tuple[int, ...] = ()
+    method_invocations: dict[str, tuple["CallSite", ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -622,3 +636,79 @@ class BypassPlan:
     target_method: Optional[MethodRef] = None
     source_decision_method: Optional[MethodRef] = None
     source_decision_instruction_index: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# CallSite — Phase 13 v3.X-next.1 (DEC-031)
+#
+# One ``invoke-*`` instruction in a caller's body, captured by the
+# slicer alongside the existing decision walk. The v3.X-next.2 emitter
+# uses these records to build a CFG-position-aware flowchart ranking:
+# CallSites in the same dominating-decision arm sit in the same column;
+# sequential CallSites flow top-to-bottom; the pre-branch CallSites flow
+# above the branch, the in-arm CallSites flow inside their respective
+# branch columns. Without this field the v3.1 emitter could only show a
+# flat "all methods reachable" set, with no execution order.
+#
+# Wire-compatible additive change: anchors persisted before v3.X-next.1
+# deserialise with the parent ``BehaviorAnchor.method_invocations``
+# defaulting to ``{}``; the v3.1 emitter ignores the field, so
+# production rendering is unchanged at v3.X-next.1's close.
+#
+# Population semantics (per the v3.X-next.1.0 locks, DEC-031):
+#
+# * **Q3=(c) hybrid resolution** — the slicer parses the callee straight
+#   off the smali ``invoke-*`` line first; falls back to the existing
+#   call-graph context only for cross-module targets. No new SQLite
+#   handles are opened — the resolver reuses what ``trace_behavior``
+#   already loads.
+# * **Q5=(c) framework filter** — the slicer applies the same
+#   ``FRAMEWORK_CLASS_PREFIXES`` denylist the v3.1 emitter does, so the
+#   denominator is consistent (``Lkotlin/`` / ``Ljava/`` / ``Landroid/``
+#   et al. drop out before reaching this dataclass).
+# * **Q4=(a) single dominator** — ``in_branch_of`` is a single
+#   ``int | None`` pointing at the dominating ``DecisionPoint.instruction_index``
+#   in the same caller, with arm identity riding on ``branch_label``
+#   (matches ``Branch.label`` verbatim — ``"true"`` / ``"false"`` /
+#   ``"case 0"`` / ``"default"``). Innermost dominator wins for nested
+#   decisions.
+
+
+@dataclass(frozen=True)
+class CallSite:
+    """One ``invoke-*`` instruction in a caller's body with dominating
+    decision + branch-arm context (Phase 13 v3.X-next.1 / DEC-031).
+
+    Captured by :func:`androscan.analysis.slicing.extract_call_sites`
+    during the closure walk in the ``trace_behavior`` skill. Aggregated
+    onto :attr:`BehaviorAnchor.method_invocations`, keyed by the
+    caller's ``smali_signature``. Consumed by the v3.X-next.2 emitter
+    to build CFG-position-aware flowchart ranking.
+
+    Fields:
+
+    * ``caller`` — the method body this ``invoke-*`` lives in. Always
+      an app-code method (the framework filter applies at population
+      time; callers from ``Lkotlin/`` / ``Landroid/`` / etc. don't get
+      CallSites recorded against *their* bodies because we don't walk
+      framework bodies in the first place).
+    * ``instruction_index`` — the 0-based position of this ``invoke-*``
+      in the caller's instruction stream (same indexing scheme as
+      :attr:`DecisionPoint.instruction_index`).
+    * ``callee`` — the resolved invoke target (Q3=(c) hybrid policy).
+      Always an app-code :class:`MethodRef`; framework targets are
+      filtered before the CallSite is constructed (Q5=(c)).
+    * ``in_branch_of`` — the dominating
+      :attr:`DecisionPoint.instruction_index` in *the same caller*, or
+      ``None`` if this CallSite is in the fall-through / pre-branch
+      region. Innermost dominator wins for nested decisions.
+    * ``branch_label`` — matches the corresponding :attr:`Branch.label`
+      on the dominating decision verbatim (``"true"`` / ``"false"`` /
+      ``"case N"`` / ``"default"``); ``None`` iff ``in_branch_of`` is
+      ``None``.
+    """
+    caller: MethodRef
+    instruction_index: int
+    callee: MethodRef
+    in_branch_of: Optional[int]
+    branch_label: Optional[str]

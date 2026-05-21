@@ -77,6 +77,7 @@ from androscan.analysis.trace_types import (
     BranchOutcome,
     BranchVerdict,
     BypassPlan,
+    CallSite,
     CompositeOrigin,
     ConstOrigin,
     DecisionKind,
@@ -472,6 +473,49 @@ def _decode_plan(raw: dict[str, Any]) -> BypassPlan:
     )
 
 
+def _decode_call_site(raw: dict[str, Any]) -> CallSite:
+    """Decode one :class:`CallSite` from its JSON shape.
+
+    Phase 13 v3.X-next.1 / DEC-031 — additive at schema v2. Anchors
+    persisted before v3.X-next.1 have no ``method_invocations`` key in
+    their JSON; :func:`_decode_anchor` short-circuits in that case and
+    this helper isn't called. New (v3.X-next.1+) anchors round-trip
+    faithfully: every CallSite tuple in ``method_invocations`` is
+    reconstructed with its caller / callee :class:`MethodRef`s + the
+    dominator bookkeeping intact.
+    """
+    in_branch = raw.get("in_branch_of")
+    branch_label = raw.get("branch_label")
+    return CallSite(
+        caller=_decode_method_ref(raw["caller"]),
+        instruction_index=int(raw["instruction_index"]),
+        callee=_decode_method_ref(raw["callee"]),
+        in_branch_of=None if in_branch is None else int(in_branch),
+        branch_label=None if branch_label is None else str(branch_label),
+    )
+
+
+def _decode_method_invocations(
+    raw: Optional[dict[str, Any]],
+) -> dict[str, tuple[CallSite, ...]]:
+    """Decode the ``method_invocations`` payload back into a
+    ``dict[str, tuple[CallSite, ...]]``.
+
+    Tolerant by design — old cached anchors (pre-v3.X-next.1) have no
+    ``method_invocations`` key, so ``raw`` is ``None`` and we return an
+    empty dict. Matches the additive-field contract on
+    :class:`BehaviorAnchor`.
+    """
+    if not raw:
+        return {}
+    out: dict[str, tuple[CallSite, ...]] = {}
+    for key, sites in raw.items():
+        if not sites:
+            continue
+        out[str(key)] = tuple(_decode_call_site(cs) for cs in sites)
+    return out
+
+
 def _decode_anchor(raw: dict[str, Any]) -> BehaviorAnchor:
     return BehaviorAnchor(
         entry_method=_decode_method_ref(raw["entry_method"]),
@@ -485,4 +529,5 @@ def _decode_anchor(raw: dict[str, Any]) -> BehaviorAnchor:
         low_confidence_decision_indices=tuple(
             int(i) for i in (raw.get("low_confidence_decision_indices") or ())
         ),
+        method_invocations=_decode_method_invocations(raw.get("method_invocations")),
     )
