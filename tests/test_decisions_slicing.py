@@ -1679,3 +1679,495 @@ class TestPhase13V3XNext1_MethodInvocations:
         anchor-payload primitive)."""
         from androscan.analysis import trace_types
         assert trace_types.CallSite is CallSite
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 v3.X-next.3 / DEC-031 — invoke-gap recovery via shared resolver
+#
+# Tests for the v3.X-next.3 Q5=(a) extension to ``slicing.extract_call_sites``
+# (same-module ``target_sig in cls.method_sigs`` presence check + defer to
+# resolver on miss) + the new public ``call_graph.lookup_method_ref`` wrapper
+# over the existing private ``_lookup_node``.
+#
+# Five locked implementation-detail Q&As at v3.X-next.3.0 top (per
+# DEC-031 v3.X-next.3.0 follow-up note + the TASKS.md v3.X-next.3 row):
+#   Q1=(e) combined (a) inherited-from-app-superclass + (b) cross-module via
+#          shared resolver path.
+#   Q2=(a) new public ``call_graph.lookup_method_ref(decompile_cache_dir,
+#          smali_id) -> Optional[MethodRef]``.
+#   Q3=(a) per-trace dict-memoization in a closure captured by
+#          ``trace_behavior._walk_closure``.
+#   Q4=(a) INFO-log resolver stats; no ``BehaviorAnchor`` payload changes.
+#   Q5=(a) same-module branch checks ``target_sig in cls.method_sigs``;
+#          on miss, defer to resolver (treats inherited-from-app-
+#          superclass identically to cross-module).
+#
+# The pre-v3.X-next.3 cross-module fallback tests (Q3=(c) from v3.X-next.1)
+# already live in TestPhase13V3XNext1_MethodInvocations above and stay
+# unchanged — recovered CallSites for the cross-module branch flow through
+# the same resolver hook + same drop-on-None semantics now used by the
+# new inherited-from-app-superclass branch.
+
+
+def _app_class_with_methods(
+    class_desc: str, *method_sigs: str,
+) -> smali_parser.ClassDecl:
+    """Build a real :class:`ClassDecl` carrying the given
+    method-signatures (each in full smali shape
+    ``Lcom/Foo;->bar(I)V``) — used by the v3.X-next.3 tests below to
+    exercise the new ``target_sig in cls.method_sigs`` presence check.
+
+    Parses each ``method_sig`` into a :class:`MethodDecl` whose own
+    ``signature`` property round-trips back to the same string (so the
+    slicer's frozenset lookup hits). Other ``MethodDecl`` / ``ClassDecl``
+    fields are set to inert defaults — the slicer only inspects
+    ``cls.methods[*].signature``, no other field on this path.
+    """
+    methods: list[smali_parser.MethodDecl] = []
+    for sig in method_sigs:
+        sep = sig.find(";->")
+        if sep < 0:
+            raise ValueError(f"malformed test method sig: {sig!r}")
+        owner = sig[: sep + 1]
+        rest = sig[sep + 3:]
+        paren = rest.find("(")
+        close = rest.find(")", paren + 1)
+        if paren < 0 or close < 0:
+            raise ValueError(f"malformed test method sig: {sig!r}")
+        methods.append(
+            smali_parser.MethodDecl(
+                class_desc=owner,
+                name=rest[:paren],
+                params=rest[paren + 1:close],
+                ret=rest[close + 1:],
+                flags=(),
+                file=f"{owner[1:-1]}.smali",
+                line_start=0,
+                line_end=0,
+            )
+        )
+    return smali_parser.ClassDecl(
+        class_desc=class_desc,
+        super_desc=None,
+        interfaces=(),
+        file=f"{class_desc[1:-1]}.smali",
+        methods=tuple(methods),
+    )
+
+
+class TestPhase13V3XNext3_InvokeGapRecovery:
+    """Phase 13 v3.X-next.3 (DEC-031) — invoke-gap recovery via shared
+    ``call_graph_resolver`` path on ``slicing.extract_call_sites``.
+
+    Covers the Q5=(a) extension that unifies (a) inherited-from-app-
+    superclass + (b) cross-module unresolvable under one resolver hook,
+    plus the v3.X-next.1 same-module / framework-filter / Q3=(c)
+    cross-module-fallback paths that v3.X-next.3 leaves byte-equal-behaviour.
+    Tests here focus on the new ``target_sig in cls.method_sigs`` presence
+    check; the pre-existing test_resolver_* family in
+    TestPhase13V3XNext1_MethodInvocations above already covers the
+    cross-module branch.
+    """
+
+    # -----------------------------------------------------------------
+    # Inherited-from-app-superclass scenarios (Q5=(a) extension) — 5 tests
+
+    def test_inherited_method_defers_to_resolver(self) -> None:
+        """Same-module owner BUT ``target_sig`` not in
+        ``cls.method_sigs`` (method is inherited from an app-code
+        superclass) → resolver is invoked; on hit, the resolver's
+        ``MethodRef`` becomes the CallSite's callee. Demonstrates the
+        Q5=(a) unification — inherited targets flow through the same
+        resolver hook the cross-module branch uses."""
+        # MyActivity has only ``onCreate``; ``helper`` is inherited from
+        # an app-code superclass (e.g. BaseActivity) and not declared
+        # on MyActivity itself. The smali invoke line still references
+        # ``LMyActivity;->helper()V`` (some compilers emit the
+        # subclass reference rather than the declaring class).
+        declaring_ref = MethodRef.from_smali_signature("Lcom/app/BaseActivity;->helper()V")
+
+        resolver_calls: list[str] = []
+
+        def resolver(sig: str) -> MethodRef:
+            resolver_calls.append(sig)
+            assert sig == "Lcom/app/MyActivity;->helper()V"
+            return declaring_ref
+
+        md = _md(instructions=(
+            "invoke-virtual {p0}, Lcom/app/MyActivity;->helper()V",
+            "return-void",
+        ))
+        classes = {
+            _CALLER_CLASS_SMALI: None,
+            "Lcom/app/MyActivity;": _app_class_with_methods(
+                "Lcom/app/MyActivity;",
+                "Lcom/app/MyActivity;->onCreate()V",
+            ),
+        }
+        sites = slicing.extract_call_sites(
+            md, classes_by_smali=classes, call_graph_resolver=resolver,
+        )
+        assert len(sites) == 1
+        assert sites[0].callee is declaring_ref
+        # CFG metadata stays byte-equal-shape to a today's-resolved CallSite —
+        # local enumerate + dominance computation aren't gated on the
+        # resolver path per the v3.X-next.3.0 visual-safety guarantee.
+        assert sites[0].instruction_index == 0
+        assert sites[0].in_branch_of is None
+        assert sites[0].branch_label is None
+        assert resolver_calls == ["Lcom/app/MyActivity;->helper()V"]
+
+    def test_inherited_method_resolver_returns_none_drops_callsite(self) -> None:
+        """Same-module owner + missing method + resolver returns None
+        (target not in call_graph either — graceful degradation) →
+        CallSite dropped silently. Matches the Q3=(c) cross-module
+        drop-on-None contract."""
+        def resolver(sig: str) -> None:
+            return None
+
+        md = _md(instructions=(
+            "invoke-virtual {p0}, Lcom/app/MyActivity;->helper()V",
+            "return-void",
+        ))
+        classes = {
+            _CALLER_CLASS_SMALI: None,
+            "Lcom/app/MyActivity;": _app_class_with_methods(
+                "Lcom/app/MyActivity;",
+                "Lcom/app/MyActivity;->onCreate()V",
+            ),
+        }
+        sites = slicing.extract_call_sites(
+            md, classes_by_smali=classes, call_graph_resolver=resolver,
+        )
+        assert sites == ()
+
+    def test_inherited_method_no_resolver_drops_callsite(self) -> None:
+        """Same-module owner + missing method + NO resolver wired →
+        CallSite dropped silently. Pre-v3.X-next.3, this case would
+        have emitted a phantom CallSite pointing at a non-existent
+        body — v3.X-next.3 closes that gap by dropping when no
+        recovery hook is available (graceful degradation that matches
+        the Q3=(c) cross-module branch's no-resolver behaviour)."""
+        md = _md(instructions=(
+            "invoke-virtual {p0}, Lcom/app/MyActivity;->helper()V",
+            "return-void",
+        ))
+        classes = {
+            _CALLER_CLASS_SMALI: None,
+            "Lcom/app/MyActivity;": _app_class_with_methods(
+                "Lcom/app/MyActivity;",
+                "Lcom/app/MyActivity;->onCreate()V",
+            ),
+        }
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert sites == ()
+
+    def test_resolver_not_called_when_method_present_on_class(self) -> None:
+        """Same-module owner + method IS in ``cls.method_sigs`` →
+        resolver NOT invoked (Q5=(a) lock: the resolver only fires
+        when the slicer has POSITIVE evidence the method isn't
+        declared on the owner). Preserves byte-equal behaviour with
+        the pre-v3.X-next.3 happy path — this is the dominant case in
+        production (most invokes ARE same-module-direct, not
+        inherited)."""
+        resolver_calls: list[str] = []
+
+        def resolver(sig: str) -> MethodRef:
+            resolver_calls.append(sig)
+            return MethodRef.from_smali_signature(sig)
+
+        md = _md(instructions=(
+            "invoke-virtual {p0}, Lcom/app/MyActivity;->onCreate()V",
+            "return-void",
+        ))
+        classes = {
+            _CALLER_CLASS_SMALI: None,
+            "Lcom/app/MyActivity;": _app_class_with_methods(
+                "Lcom/app/MyActivity;",
+                "Lcom/app/MyActivity;->onCreate()V",
+            ),
+        }
+        sites = slicing.extract_call_sites(
+            md, classes_by_smali=classes, call_graph_resolver=resolver,
+        )
+        assert len(sites) == 1
+        assert sites[0].callee.class_name == "com.app.MyActivity"
+        assert sites[0].callee.method_name == "onCreate"
+        assert resolver_calls == []
+
+    def test_sentinel_classdecl_preserves_pre_v3xnext3_behaviour(self) -> None:
+        """When ``classes_by_smali`` has ``None`` sentinel values (test-
+        fixture mode), the v3.X-next.3 presence check falls back to
+        "trust the owner check, assume method is present" — preserves
+        byte-equal behaviour with the pre-v3.X-next.3 slicer for the
+        ~30 existing tests in TestPhase13V3XNext1_MethodInvocations
+        above that use ``_app_classes(...)`` sentinel-mode fixtures."""
+        resolver_calls: list[str] = []
+
+        def resolver(sig: str) -> MethodRef:
+            resolver_calls.append(sig)
+            return MethodRef.from_smali_signature(sig)
+
+        md = _md(instructions=(
+            "invoke-virtual {p0}, Lcom/app/MyActivity;->anyMethod()V",
+            "return-void",
+        ))
+        # Sentinel mode — ``Lcom/app/MyActivity;`` maps to ``None``,
+        # so we can't tell whether ``anyMethod`` is actually on the
+        # class. Pre-v3.X-next.3 behaviour: emit CallSite anyway.
+        classes = _app_classes(_CALLER_CLASS_SMALI, "Lcom/app/MyActivity;")
+        sites = slicing.extract_call_sites(
+            md, classes_by_smali=classes, call_graph_resolver=resolver,
+        )
+        assert len(sites) == 1
+        assert sites[0].callee.method_name == "anyMethod"
+        assert resolver_calls == [], (
+            "resolver must not fire in sentinel mode — the pre-v3.X-next.3 "
+            "behaviour is preserved verbatim"
+        )
+
+    # -----------------------------------------------------------------
+    # Framework-filter still wins over resolver (Q5=(a) outer-gate
+    # invariant) — 1 test
+
+    def test_framework_target_resolver_not_called(self) -> None:
+        """``FRAMEWORK_CLASS_PREFIXES`` filter at line 1660 stays the
+        outer gate — framework targets are dropped BEFORE any
+        resolution work runs, so the resolver never sees them. This
+        invariant matters because the FE-side ``isFrameworkClass``
+        check + the BE-side ``FRAMEWORK_CLASS_PREFIXES`` denylist
+        must agree on what's framework noise; if the resolver could
+        recover a framework target, the BE would emit edges the FE
+        would refuse to render, breaking the v3.X-next.2 emitter's
+        denominator contract."""
+        resolver_calls: list[str] = []
+
+        def resolver(sig: str) -> MethodRef:
+            resolver_calls.append(sig)
+            return MethodRef.from_smali_signature(sig)
+
+        md = _md(instructions=(
+            "invoke-virtual {p0}, Landroid/app/Activity;->getResources()Landroid/content/res/Resources;",
+            "invoke-static {p0}, Ljava/lang/String;->valueOf(I)Ljava/lang/String;",
+            "return-void",
+        ))
+        classes = _app_classes(_CALLER_CLASS_SMALI)
+        sites = slicing.extract_call_sites(
+            md, classes_by_smali=classes, call_graph_resolver=resolver,
+        )
+        assert sites == ()
+        assert resolver_calls == []
+
+    # -----------------------------------------------------------------
+    # Real-class + present-method round-trip (callee carries app-code
+    # MethodRef, not the inherited one) — 1 test
+
+    def test_present_method_callee_uses_target_sig_directly(self) -> None:
+        """When ``target_sig`` IS in ``cls.method_sigs``, the CallSite's
+        callee is parsed straight off the smali invoke line — NOT routed
+        through the resolver. Preserves the v3.X-next.1 Q3=(c) hybrid
+        contract for the same-module direct path."""
+        md = _md(instructions=(
+            "invoke-virtual {p0, p1}, Lcom/app/Login;->validate_pin(Ljava/lang/String;)Z",
+            "return v0",
+        ))
+        classes = {
+            _CALLER_CLASS_SMALI: None,
+            "Lcom/app/Login;": _app_class_with_methods(
+                "Lcom/app/Login;",
+                "Lcom/app/Login;->validate_pin(Ljava/lang/String;)Z",
+                "Lcom/app/Login;->check_input(Ljava/lang/String;)Z",
+            ),
+        }
+        sites = slicing.extract_call_sites(md, classes_by_smali=classes)
+        assert len(sites) == 1
+        assert sites[0].callee.class_name == "com.app.Login"
+        assert sites[0].callee.method_name == "validate_pin"
+        assert sites[0].callee.param_descriptors == ("Ljava/lang/String;",)
+        assert sites[0].callee.return_descriptor == "Z"
+
+
+class TestPhase13V3XNext3_LookupMethodRef:
+    """Phase 13 v3.X-next.3 (DEC-031) — public
+    :func:`call_graph.lookup_method_ref` wrapper over private
+    ``_lookup_node``.
+
+    Verifies the Q2=(a) public-API contract: thin wrapper with per-call
+    connection; returns ``None`` on miss, missing DB, malformed
+    smali_id, or any :class:`sqlite3.Error`. The wrapper is stateless;
+    memoization lives in :mod:`androscan.skills.trace_behavior`'s
+    ``_walk_closure`` per Q3=(a).
+    """
+
+    def _build_minimal_call_graph(
+        self,
+        tmp_path: Path,
+        *node_sigs: str,
+    ) -> Path:
+        """Build a minimal ``call_graph.sqlite`` under *tmp_path*
+        carrying one ``nodes`` row per ``node_sig`` (full smali
+        signature shape ``Lcom/Foo;->bar(I)V``). One synthetic
+        ``classes`` row + meta init via the module's own
+        ``_ensure_schema``. Mirrors what ``_build_node_rows`` would
+        produce, just hand-built for the unit test surface."""
+        import sqlite3
+        from androscan.analysis import call_graph
+
+        cache_dir = tmp_path / ".decompiled" / "deadbeef"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        db_path = call_graph.call_graph_db_path(cache_dir)
+
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            call_graph._ensure_schema(conn)
+            # One synthetic class row (id=1) — every node FKs to a
+            # class_id; we just need any valid one.
+            conn.execute(
+                "INSERT OR REPLACE INTO classes"
+                " (id, smali_class, class_name, package, simple_name)"
+                " VALUES (1, 'Lcom/dummy/C;', 'com.dummy.C', 'com.dummy', 'C')"
+            )
+            for i, sig in enumerate(node_sigs, start=1):
+                # Parse owner / name / params / ret off the sig — same
+                # shape ``MethodRef.from_smali_signature`` accepts.
+                sep = sig.find(";->")
+                rest = sig[sep + 3:]
+                paren = rest.find("(")
+                close = rest.find(")", paren + 1)
+                name = rest[:paren]
+                params = rest[paren + 1:close]
+                ret = rest[close + 1:]
+                descriptor = f"({params}){ret}"
+                conn.execute(
+                    "INSERT OR REPLACE INTO nodes"
+                    " (id, smali_id, class_id, method_name, descriptor,"
+                    "  return_type, param_types_json)"
+                    " VALUES (?, ?, 1, ?, ?, ?, ?)",
+                    (i, sig, name, descriptor, ret, "[]"),
+                )
+        finally:
+            conn.close()
+        return cache_dir
+
+    def test_lookup_method_ref_hit(self, tmp_path: Path) -> None:
+        """Known smali_id in the ``nodes`` table → returns a
+        :class:`MethodRef` that round-trips back to the same
+        ``smali_signature``."""
+        from androscan.analysis import call_graph
+
+        sig = "Lcom/app/Login;->validate_pin(Ljava/lang/String;)Z"
+        cache_dir = self._build_minimal_call_graph(tmp_path, sig)
+
+        ref = call_graph.lookup_method_ref(cache_dir, sig)
+        assert ref is not None
+        assert ref.smali_signature == sig
+        assert ref.class_name == "com.app.Login"
+        assert ref.method_name == "validate_pin"
+        assert ref.param_descriptors == ("Ljava/lang/String;",)
+        assert ref.return_descriptor == "Z"
+
+    def test_lookup_method_ref_miss(self, tmp_path: Path) -> None:
+        """Smali_id NOT in the ``nodes`` table → ``None`` (caller
+        treats this as "drop the CallSite")."""
+        from androscan.analysis import call_graph
+
+        cache_dir = self._build_minimal_call_graph(
+            tmp_path, "Lcom/app/Login;->validate_pin(Ljava/lang/String;)Z",
+        )
+
+        ref = call_graph.lookup_method_ref(
+            cache_dir, "Lcom/app/Unknown;->missing()V",
+        )
+        assert ref is None
+
+    def test_lookup_method_ref_missing_db(self, tmp_path: Path) -> None:
+        """No ``call_graph.sqlite`` file under the cache dir → ``None``
+        (no exception). The slicer's resolver hook will treat this as
+        "drop the CallSite" + the trace_behavior INFO log will record
+        a miss."""
+        from androscan.analysis import call_graph
+
+        cache_dir = tmp_path / ".decompiled" / "no-such-sha"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        ref = call_graph.lookup_method_ref(
+            cache_dir, "Lcom/app/Anything;->anything()V",
+        )
+        assert ref is None
+
+    def test_lookup_method_ref_empty_input(self, tmp_path: Path) -> None:
+        """Empty / whitespace smali_id → ``None`` (no DB hit, no
+        exception). Defensive guard so a malformed caller doesn't
+        propagate an exception up through the slicer resolver hook."""
+        from androscan.analysis import call_graph
+
+        cache_dir = self._build_minimal_call_graph(
+            tmp_path, "Lcom/app/Login;->validate_pin(Ljava/lang/String;)Z",
+        )
+
+        assert call_graph.lookup_method_ref(cache_dir, "") is None
+        assert call_graph.lookup_method_ref(cache_dir, "   ") is None
+
+    def test_lookup_method_ref_malformed_smali_id_in_nodes(
+        self, tmp_path: Path,
+    ) -> None:
+        """If ``nodes.smali_id`` were ever malformed (shouldn't happen
+        in practice — call_graph builder normalises everything — but
+        the parser raises ``ValueError`` and we want None propagation,
+        not a stack trace) → ``None``. Defensive contract for the
+        slicer's resolver hook."""
+        from androscan.analysis import call_graph
+
+        cache_dir = tmp_path / ".decompiled" / "deadbeef"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        db_path = call_graph.call_graph_db_path(cache_dir)
+
+        import sqlite3
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            call_graph._ensure_schema(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO classes"
+                " (id, smali_class, class_name, package, simple_name)"
+                " VALUES (1, 'Lcom/dummy/C;', 'com.dummy.C', 'com.dummy', 'C')"
+            )
+            # Deliberately malformed smali_id (missing the ;-> separator).
+            conn.execute(
+                "INSERT OR REPLACE INTO nodes"
+                " (id, smali_id, class_id, method_name, descriptor,"
+                "  return_type, param_types_json)"
+                " VALUES (1, 'not_a_valid_smali_signature', 1, 'x', '()V', 'V', '[]')",
+            )
+        finally:
+            conn.close()
+
+        ref = call_graph.lookup_method_ref(cache_dir, "not_a_valid_smali_signature")
+        assert ref is None
+
+    def test_lookup_method_ref_multiple_hits_via_memoization_friendly_shape(
+        self, tmp_path: Path,
+    ) -> None:
+        """``lookup_method_ref`` is stateless (per Q2=(a) lock —
+        memoization lives one layer up in ``trace_behavior``); repeated
+        calls open + close their own connection each time. This test
+        pins the contract — three back-to-back calls on the same key
+        each return an equivalent ``MethodRef`` (frozen dataclass
+        equality)."""
+        from androscan.analysis import call_graph
+
+        sig = "Lcom/app/Helper;->doStuff(II)V"
+        cache_dir = self._build_minimal_call_graph(tmp_path, sig)
+
+        ref1 = call_graph.lookup_method_ref(cache_dir, sig)
+        ref2 = call_graph.lookup_method_ref(cache_dir, sig)
+        ref3 = call_graph.lookup_method_ref(cache_dir, sig)
+        assert ref1 is not None
+        assert ref2 is not None
+        assert ref3 is not None
+        # Frozen dataclass equality (== ) — NOT object identity (`is`),
+        # since each call opens a fresh DB connection + builds a fresh
+        # MethodRef. The trace_behavior-side cache (Q3=(a)) is what
+        # avoids the repeated SQL hits in production.
+        assert ref1 == ref2 == ref3

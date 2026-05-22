@@ -1605,6 +1605,25 @@ def extract_call_sites(
       dropped — the caller can't usefully render a method it can't even
       reference.
 
+      **v3.X-next.3 Q5=(a) extension** — the same-module branch above
+      now additionally checks whether ``target_sig`` is actually
+      declared on the owner class (``target_sig in cls.method_sigs``).
+      If the method body isn't on the owner (i.e. it's inherited from
+      an app-code superclass — framework-inherited methods are already
+      filtered upstream by ``FRAMEWORK_CLASS_PREFIXES`` because the
+      smali assembler resolves invoke-virtual to the declaring class
+      at compile time), the slicer defers to ``call_graph_resolver``
+      using the same hook + same drop-on-None semantics as the
+      cross-module fallback. This unifies (a) inherited-from-app-
+      superclass + (b) cross-module unresolvable under one resolver
+      path. Tolerates ``None``-valued ``classes_by_smali`` entries
+      (existing test fixtures use ``{desc: None}`` sentinels) by
+      preserving today's "assume method is present" behaviour when the
+      ``ClassDecl`` body is unavailable for inspection. In production
+      ``classes_by_smali`` is always built from
+      :func:`smali_parser.parse_classes` results so the inherited-
+      method detection is always active.
+
     * **Q5=(c) — framework filter.** :data:`FRAMEWORK_CLASS_PREFIXES` is
       applied at extraction time before any resolution work, so framework
       targets never enter the CallSite stream regardless of whether
@@ -1651,6 +1670,21 @@ def extract_call_sites(
     dominance = _compute_branch_dominance(method_decisions)
     call_sites: list[CallSite] = []
 
+    # v3.X-next.3 Q5=(a) — pre-compute per-class method-signature presence
+    # sets so the per-invoke "is this method actually declared on the owner
+    # class?" check stays O(1). Maps owner descriptor → frozenset of method
+    # signatures actually declared on that class, OR ``None`` when the
+    # ``ClassDecl`` body isn't available for inspection (existing test
+    # fixtures use ``{desc: None}`` sentinels; in production every entry
+    # carries a real ``ClassDecl`` from ``smali_parser.parse_classes``).
+    # ``None`` is treated as "trust the owner check, assume method is
+    # present" to preserve byte-equal behaviour with the pre-v3.X-next.3
+    # slicer for sentinel-mode callers.
+    method_sigs_by_class: dict[str, Optional[frozenset[str]]] = {
+        desc: (frozenset(m.signature for m in cls.methods) if cls is not None else None)
+        for desc, cls in classes_by_smali.items()
+    }
+
     for idx, instr in enumerate(method_decisions.instructions):
         m = _RE_INVOKE.match(instr)
         if m is None:
@@ -1667,13 +1701,32 @@ def extract_call_sites(
 
         callee: Optional[MethodRef]
         if owner in classes_by_smali:
-            try:
-                callee = MethodRef.from_smali_signature(target_sig)
-            except ValueError:
-                logger.warning(
-                    "extract_call_sites: malformed invoke target %r in %s — skipping",
-                    target_sig, method_decisions.method_signature,
-                )
+            # v3.X-next.3 Q5=(a) — same-module owner; check whether the
+            # specific ``target_sig`` is actually declared on the class
+            # body. ``method_present is True`` when the ClassDecl was
+            # available + the method exists on it OR when the ClassDecl
+            # was unavailable (sentinel mode — preserves today's
+            # behaviour). ``method_present is False`` only when we have
+            # positive evidence the method ISN'T declared on the owner,
+            # which signals inheritance-from-app-superclass and triggers
+            # the resolver fallback (same hook the cross-module branch
+            # uses; Q5=(a) lock: "slicer treats both cases identically").
+            presence = method_sigs_by_class.get(owner)
+            method_present = presence is None or target_sig in presence
+            if method_present:
+                try:
+                    callee = MethodRef.from_smali_signature(target_sig)
+                except ValueError:
+                    logger.warning(
+                        "extract_call_sites: malformed invoke target %r in %s — skipping",
+                        target_sig, method_decisions.method_signature,
+                    )
+                    continue
+            elif call_graph_resolver is not None:
+                callee = call_graph_resolver(target_sig)
+                if callee is None:
+                    continue
+            else:
                 continue
         elif call_graph_resolver is not None:
             callee = call_graph_resolver(target_sig)

@@ -61,6 +61,7 @@ from androscan.analysis.smali_types import (
     params_to_java,
     split_class_name,
 )
+from androscan.analysis.trace_types import MethodRef
 
 logger = logging.getLogger(__name__)
 
@@ -1310,6 +1311,75 @@ def _lookup_node(conn: sqlite3.Connection, node_ref: str) -> Optional[sqlite3.Ro
     return conn.execute(
         "SELECT * FROM nodes WHERE smali_id = ?", (ref,)
     ).fetchone()
+
+
+def lookup_method_ref(
+    decompile_cache_dir: Path,
+    smali_id: str,
+) -> Optional[MethodRef]:
+    """Resolve a Smali method id (``Lcom/Foo;->bar(I)V``) to a :class:`MethodRef`
+    via the per-app ``call_graph.sqlite`` ``nodes`` table.
+
+    Phase 13 v3.X-next.3 — Q2=(a) public wrapper over the existing private
+    :func:`_lookup_node`. Wires the dormant Q3=(c) ``call_graph_resolver``
+    hook in :func:`androscan.analysis.slicing.extract_call_sites`. Used to
+    recover invoke-target ``MethodRef`` values for two distinct gap classes
+    the slicer silently drops today (per the DEC-031 v3.X-next.3.0 planning
+    record):
+
+    * **(b) Cross-module unresolvable** — invoke target's class isn't in
+      ``classes_by_smali`` (out-of-decompile-scope or library class). The
+      slicer sees the ``invoke-*`` instruction but can't construct a
+      ``MethodRef`` without the resolver; the call_graph's ``nodes`` table
+      indexes external targets as ``is_external=1`` rows so they resolve
+      here.
+    * **(a) Inherited from app-code superclass** — invoke target's class IS
+      in ``classes_by_smali`` but the specific ``target_sig`` isn't a method
+      body declared on that class (it's inherited from an app-code parent).
+      Today's slicer emits a phantom CallSite pointing at a non-existent
+      body; v3.X-next.3 defers to this resolver instead, which finds the
+      method's declaring-class node in the call_graph and returns its
+      :class:`MethodRef`.
+
+    Per-call connection per the Q2=(a) lock — memoization lives one layer
+    up in :mod:`androscan.skills.trace_behavior`'s ``_walk_closure``
+    resolver-closure (lifetime = one anchor build per Q3=(a)) so the
+    wrapper stays stateless and mirrors the :func:`neighbors` /
+    :func:`paths` public-API shape. The call is rare in practice — only
+    fires on cross-module / inherited targets, not the common same-module
+    direct path — so the per-call connection cost is bounded.
+
+    Returns ``None`` on miss (node not in index), empty / malformed input,
+    missing DB file, or any :class:`sqlite3.Error`. The caller (slicer
+    via the resolver hook) treats ``None`` as "drop the CallSite" — matches
+    the existing cross-module-fallback drop behaviour at the slicer's
+    line 1680-1681 + preserves the v3.X-next.1 Q3=(c) contract.
+
+    Note that ``smali_id`` matches ``MethodRef.smali_signature`` byte-for-byte
+    (and ``smali_parser.MethodDecl.signature``); the round-trip is
+    well-defined for any node present in the index.
+    """
+    if not smali_id or not smali_id.strip():
+        return None
+    db = call_graph_db_path(decompile_cache_dir)
+    if not db.is_file():
+        return None
+    try:
+        with _connect(db) as conn:
+            row = _lookup_node(conn, smali_id)
+            if row is None:
+                return None
+            try:
+                return MethodRef.from_smali_signature(row["smali_id"])
+            except ValueError:
+                logger.warning(
+                    "lookup_method_ref: malformed smali_id in nodes row: %r",
+                    row["smali_id"],
+                )
+                return None
+    except sqlite3.Error as e:
+        logger.warning("lookup_method_ref sqlite error for %r: %s", smali_id, e)
+        return None
 
 
 def paths(

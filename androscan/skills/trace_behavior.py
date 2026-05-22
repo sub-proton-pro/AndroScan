@@ -251,6 +251,69 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
     # dict tight (consumers treat a missing key as "no app-code
     # invocations in that method body").
     method_invocations: dict[str, tuple[CallSite, ...]] = {}
+
+    # Phase 13 v3.X-next.3 / DEC-031 — invoke-gap recovery via shared
+    # ``call_graph`` resolver path. Wires the dormant Q3=(c) resolver hook
+    # in ``extract_call_sites`` so the two real invoke-gap scenarios
+    # (cross-module unresolvable + inherited-from-app-superclass) recover
+    # ``MethodRef`` values from the call-graph instead of silently
+    # dropping the CallSite.
+    #
+    # Q3=(a) memoization shape — per-trace dict-cache in a closure
+    # captured by this function (lifetime = one anchor build). The same
+    # ``target_sig`` recurs across multiple caller bodies in any
+    # non-trivial closure (legitimately-reused app-code helpers easily
+    # hit 5-10×), so per-anchor cache lifetime is the right shape
+    # without bloating ``call_graph.lookup_method_ref``'s public API.
+    #
+    # Q4=(a) stat observability — INFO-log
+    # ``{hits_inherited, hits_cross_module, misses, total}`` after the
+    # closure loop. The stat-split is purely a ``trace_behavior``-side
+    # concern (Q5=(a) lock: slicer treats both gap classes identically
+    # inside ``extract_call_sites``); we classify the recovery type by
+    # parsing the owner descriptor out of ``target_sig`` and checking
+    # ``owner in classes_by_smali`` — same-module owner means the
+    # method was inherited from an app-code superclass, cross-module
+    # owner means the class itself isn't in the apktool tree. No
+    # ``BehaviorAnchor`` payload changes (Q4=(a) lock: no FE surface
+    # area); operator can ``grep`` the log after a real-app re-trace to
+    # confirm whether the (a)/(b) paths actually fired.
+    resolver_cache: dict[str, Optional[MethodRef]] = {}
+    resolver_stats = {
+        "hits_inherited": 0,
+        "hits_cross_module": 0,
+        "misses": 0,
+        "total": 0,
+    }
+
+    def _resolve(target_sig: str) -> Optional[MethodRef]:
+        """v3.X-next.3 resolver — shared between (a) inherited-from-app-
+        superclass + (b) cross-module unresolvable gap classes per Q5=(a)
+        lock. Returns the resolved MethodRef or None for "drop the
+        CallSite"."""
+        resolver_stats["total"] += 1
+        if target_sig in resolver_cache:
+            return resolver_cache[target_sig]
+        ref = call_graph.lookup_method_ref(cache_dir, target_sig)
+        resolver_cache[target_sig] = ref
+        if ref is None:
+            resolver_stats["misses"] += 1
+        else:
+            # Q4=(a) stat-split: classify recovery type by owner-in-module
+            # presence — same-module owner means inherited-from-app-
+            # superclass (gap A), cross-module owner means class itself
+            # isn't in the apktool tree (gap B). Parse owner off
+            # ``target_sig`` directly (mirrors ``_RE_INVOKE``'s owner
+            # capture group at the slicer's line 1658) — cheap string
+            # split, no shared regex needed for stat classification.
+            sep = target_sig.find(";->")
+            owner_desc = target_sig[: sep + 1] if sep >= 0 else target_sig
+            if owner_desc in classes_by_smali:
+                resolver_stats["hits_inherited"] += 1
+            else:
+                resolver_stats["hits_cross_module"] += 1
+        return ref
+
     incomplete = False
     for sig in closure.methods:
         md = by_signature.get(sig)
@@ -262,6 +325,7 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
         call_sites = slicing.extract_call_sites(
             md,
             classes_by_smali=classes_by_smali,
+            call_graph_resolver=_resolve,
         )
         if call_sites:
             method_invocations[md.method_signature] = call_sites
@@ -290,6 +354,19 @@ def execute(params: dict, context: SkillContext) -> SkillResult:
                 label_index=dict(classified.label_index),
             ):
                 aggregated_plans.append(plan)
+
+    # Phase 13 v3.X-next.3 / DEC-031 / Q4=(a) — emit resolver stats so
+    # operators can ``grep`` the log after a real-app re-trace to confirm
+    # whether the invoke-gap recovery paths actually fired on their app.
+    # If both ``hits_inherited`` + ``hits_cross_module`` are zero on a
+    # given app, the wire-up is harmless dead code on that app — evidence
+    # carries forward to the next dogfood subject. INFO-log only — no
+    # ``BehaviorAnchor`` payload changes per Q4=(a) lock.
+    if resolver_stats["total"] > 0:
+        logger.info(
+            "trace_behavior: v3.X-next.3 resolver stats for %s (hops=%s): %s",
+            entry_smali_id, hops, resolver_stats,
+        )
 
     # Stage 5: identify LLM workload + invoke (fail-soft).
     low_conf_indices = tuple(
