@@ -7295,6 +7295,34 @@ code { color: var(--accent); }
   background: rgba(64, 156, 255, 0.2);
 }
 
+/* Phase 13 v3.X-next.6 — operator-recovery affordances on top of
+ * Run / Stop. Restart is the primary recovery (stop + re-run);
+ * Clear is the secondary tertiary-action wipe of local overlay
+ * state. Restart warns warn-orange on hover because it tears down
+ * the active session; Clear stays neutral-muted because it only
+ * forgets local state. Neither carries the threshold-band tinting
+ * — they're recovery affordances, not "should I run this" signals.
+ */
+.lab-dynamic-trace-button-restart {
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.lab-dynamic-trace-button-restart:hover:not(:disabled) {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.lab-dynamic-trace-button-clear {
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+.lab-dynamic-trace-button-clear:hover:not(:disabled) {
+  border-color: var(--text);
+  color: var(--text);
+}
+
 .lab-dynamic-trace-status {
   font-size: 11px;
   color: var(--muted);

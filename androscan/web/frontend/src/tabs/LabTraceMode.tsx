@@ -1710,7 +1710,7 @@ type DynamicTraceRunControlProps = {
 };
 
 function DynamicTraceRunControl({ dynamic, anchor }: DynamicTraceRunControlProps) {
-  const { state, start, stop } = dynamic;
+  const { state, start, stop, reset } = dynamic;
   // Build the entry-method Smali signature from the anchor's
   // entry_method MethodRef. The BE's ``StartDynamicTraceBody.entry``
   // accepts the same signature shape ``trace_cache.read_anchor``
@@ -1747,6 +1747,55 @@ function DynamicTraceRunControl({ dynamic, anchor }: DynamicTraceRunControlProps
 
   const isRunning = state.connection === "running";
   const isBusy = state.connection === "starting" || state.connection === "stopping";
+
+  // v3.X-next.6 — operator-recovery affordances on top of Run / Stop.
+  // The Stop happy path deliberately preserves runtime overlays
+  // (``firedMethods`` / ``liveValues`` / ``summaries`` / ``hookFailed``)
+  // so the operator can post-mortem-inspect a stopped trace. That
+  // posture leaves no in-UI path to recover from "I mis-clicked in
+  // the Android app mid-trace" — pre-v3.X-next.6 the only options
+  // were anchor-switch (heavy-handed, fires the ``anchorKey`` reset
+  // useEffect in :func:`LabTraceMode`) or full page reload.
+  //
+  // **Restart** (primary recovery; visible whenever there's runtime
+  // state OR an active session): one-click ``stop → start(prev)``.
+  // The hook's ``start()`` already wipes state to
+  // ``INITIAL_DYNAMIC_TRACE_STATE`` before re-arming, so no explicit
+  // ``reset()`` is needed in between — calling ``start()`` after
+  // ``stop()`` lands a clean slate by itself.
+  //
+  // **Clear overlay** (secondary; visible only when there's runtime
+  // state AND the session is not running): pure local-state wipe via
+  // the hook's ``reset()``. Doesn't touch the BE — the BE's
+  // session-timeout GC catches any abandoned session (matches the
+  // ``useDynamicTrace`` unmount cleanup posture). Hidden during
+  // ``running`` because clearing while events stream in would just
+  // re-populate immediately (misleading affordance).
+  //
+  // Both buttons disable while ``isBusy`` (``starting`` /
+  // ``stopping``) so the operator can't queue a Restart on top of an
+  // in-flight transition. Empty-overlay edge case (no fires, no
+  // summaries, no hookFailed) hides both buttons so the Run / Stop
+  // control stays uncluttered when there's nothing worth restarting
+  // or clearing.
+  const hasRuntimeState =
+    state.firedMethods.size > 0 ||
+    state.liveValues.size > 0 ||
+    state.summaries.size > 0 ||
+    state.hookFailed.size > 0;
+  const showRestart = (isRunning || hasRuntimeState) && !isBusy;
+  const showClear = hasRuntimeState && !isRunning && !isBusy;
+
+  const onRestart = useCallback(async () => {
+    if (state.connection === "running") {
+      await stop();
+    }
+    void start({ entry, hops: anchor.hops });
+  }, [state.connection, stop, start, entry, anchor.hops]);
+
+  const onClear = useCallback(() => {
+    reset();
+  }, [reset]);
   const showStop = isRunning || isBusy;
   const buttonLabel = (() => {
     if (state.connection === "starting") return "Starting…";
@@ -1803,6 +1852,28 @@ function DynamicTraceRunControl({ dynamic, anchor }: DynamicTraceRunControlProps
       >
         {buttonLabel}
       </button>
+      {showRestart && (
+        <button
+          type="button"
+          className="lab-dynamic-trace-button lab-dynamic-trace-button-restart"
+          onClick={() => void onRestart()}
+          disabled={isBusy}
+          title="Stop the current trace (if running), forget what fired, and re-run from scratch — useful if you mis-interacted with the Android app mid-trace"
+        >
+          Restart
+        </button>
+      )}
+      {showClear && (
+        <button
+          type="button"
+          className="lab-dynamic-trace-button lab-dynamic-trace-button-clear"
+          onClick={onClear}
+          disabled={isBusy}
+          title="Forget what fired without re-running — clears fired-method accents, live-value chips, and per-method summaries from the overlay without touching the backend session"
+        >
+          Clear overlay
+        </button>
+      )}
       {statusCopy && (
         <span
           className={[
