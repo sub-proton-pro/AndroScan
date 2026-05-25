@@ -94,6 +94,30 @@
  *     ``MainActivity`` chip) was redundant — the chip's value was
  *     already encoded in the primary.
  *
+ * **v3.X-next.4 additions** (this revision):
+ *
+ *   * **N3 + N4 + N5 hover-expand-card.** Hovering (or
+ *     ``:focus-within``) a non-pill card scales it to 1.5× via a
+ *     CSS-only ``transform: scale(1.5)`` + ``z-index: 50`` lift
+ *     (matches the gate-count badge's 80ms ease-out so the
+ *     affordance feels familiar). The expanded card reveals a
+ *     ``.execution-flow-node-hover-detail`` block carrying the N5
+ *     quick-look content set: decision-predicate count (sourced
+ *     from the existing ``verdictSummary`` field), bypass-plan
+ *     count (sourced from the new ``bypassPlanCount`` field added
+ *     in the same commit), runtime depth + thread when the node
+ *     is fired, and runtime-inlined reason when Frida's
+ *     ``hook_failed`` event landed. The full content set N5
+ *     describes (per-method LLM summary preview, predicate-origin
+ *     breakdown, per-plan target/predicate/kind rendering)
+ *     intentionally stays in the Inspector — this surface is a
+ *     *quick-look preview*, not a duplicate, so operators can scan
+ *     a flowchart of cards without opening the right pane for
+ *     every node. Promoted from the v3.X-next.4 candidate stub
+ *     after operator dogfood selection (no operator-visible
+ *     density complaint, but the next-slot pick prioritised the
+ *     UX-expansion path over the next mechanical fix).
+ *
  * **Dagre integration notes**:
  *
  *   * We use ``@dagrejs/dagre`` v3 — API surface is stable enough
@@ -559,7 +583,122 @@ function MethodNodeV3({ data, selected }: NodeProps<Node<NodeData>>) {
               )
             )}
           </div>
+          {/* v3.X-next.4 — N5 hover-expand-card content set.
+              Surfaces a preview of the same signals the Inspector
+              owns in full (top decision-predicate count, bypass-
+              plan count, live runtime status) so the operator can
+              quickly scan a flowchart of cards without opening the
+              right pane for every node. Each row reads as
+              "<label>: <value>" with a per-row title-attribute
+              that mirrors the longer-form copy the Inspector
+              shows. CSS-only visibility — the block stays in DOM
+              for keyboard tab-through (``:focus-within``) and
+              hover-flicker stability, gated by ``opacity`` +
+              ``visibility`` flips on the parent ``.execution-
+              flow-node:hover``. N5's full-content items (per-
+              method LLM summary preview, predicate-origin
+              breakdown, per-plan target/predicate/kind
+              rendering) intentionally stay in the Inspector —
+              this surface is the quick-look preview, not a
+              duplicate. */}
+          {renderHoverDetailV3(n, isFiredEmphasis, isRuntimeInlined)}
         </>
+      )}
+    </div>
+  );
+}
+
+/** v3.X-next.4 — derive the hover-expand-card's quick-look content
+ *  from signals already on the node's ``data`` prop. No new BE /
+ *  emitter plumbing beyond the ``bypassPlanCount`` field added in
+ *  the same commit (operator-visible only inside the expanded
+ *  surface; the base card stays at the v3.X-next.2 baseline
+ *  density). Returns ``null`` when no quick-look row would render
+ *  (e.g. a plain ``method`` node with no gate, no plans, no fire,
+ *  no inline status) so the dashed-border separator stays hidden
+ *  in that degenerate case. */
+function renderHoverDetailV3(
+  n: NodeData,
+  isFiredEmphasis: boolean,
+  isRuntimeInlined: boolean,
+): JSX.Element | null {
+  const totalDecisions = n.verdictSummary
+    ? n.verdictSummary.allow +
+      n.verdictSummary.deny +
+      n.verdictSummary.neutral +
+      n.verdictSummary.unverdicted
+    : 0;
+  const hasDecisions = n.hasGateDecision && totalDecisions > 0;
+  const hasPlans = n.bypassPlanCount > 0;
+  const hasFiredLive = isFiredEmphasis && !!n.live;
+  const hasRuntimeInlined = isRuntimeInlined && !!n.runtimeInlined;
+  if (!hasDecisions && !hasPlans && !hasFiredLive && !hasRuntimeInlined) {
+    return null;
+  }
+  return (
+    <div className="execution-flow-node-hover-detail">
+      {hasDecisions && (
+        <div
+          className="execution-flow-node-hover-detail-row"
+          title={`${totalDecisions} decision predicate${
+            totalDecisions > 1 ? "s" : ""
+          } on this method. Open the Inspector for the per-predicate origin trace.`}
+        >
+          <span className="execution-flow-node-hover-detail-label">
+            decisions
+          </span>
+          <span className="execution-flow-node-hover-detail-value">
+            {totalDecisions}
+          </span>
+        </div>
+      )}
+      {hasPlans && (
+        <div
+          className="execution-flow-node-hover-detail-row"
+          title={`${n.bypassPlanCount} BypassPlan${
+            n.bypassPlanCount > 1 ? "s" : ""
+          } authored on this gate. Open the Inspector for target method, predicate, kind + confidence.`}
+        >
+          <span className="execution-flow-node-hover-detail-label">
+            bypass plans
+          </span>
+          <span className="execution-flow-node-hover-detail-value">
+            {n.bypassPlanCount}
+          </span>
+        </div>
+      )}
+      {hasFiredLive && n.live && (
+        <div
+          className="execution-flow-node-hover-detail-row"
+          title={`Latest fire on thread ${n.live.threadId} at depth ${
+            n.live.threadDepth
+          }${
+            n.live.fireCount > 1
+              ? ` · fired ${n.live.fireCount} times this session`
+              : ""
+          }`}
+        >
+          <span className="execution-flow-node-hover-detail-label">
+            runtime
+          </span>
+          <span className="execution-flow-node-hover-detail-value execution-flow-node-hover-detail-value-runtime">
+            depth {n.live.threadDepth} · thread {n.live.threadId}
+            {n.live.fireCount > 1 ? ` · ×${n.live.fireCount}` : ""}
+          </span>
+        </div>
+      )}
+      {hasRuntimeInlined && n.runtimeInlined && (
+        <div
+          className="execution-flow-node-hover-detail-row"
+          title={`Frida hook_failed: ${n.runtimeInlined.reason}`}
+        >
+          <span className="execution-flow-node-hover-detail-label">
+            inlined
+          </span>
+          <span className="execution-flow-node-hover-detail-value execution-flow-node-hover-detail-value-inlined">
+            {n.runtimeInlined.reason}
+          </span>
+        </div>
       )}
     </div>
   );

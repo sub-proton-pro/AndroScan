@@ -240,6 +240,19 @@ export type ExecutionFlowV3Node = {
     neutral: number;
     unverdicted: number;
   } | null;
+  /** v3.X-next.4 — number of ``BypassPlan`` records authored on this
+   *  method (count of plans whose ``source_decision_method`` matches
+   *  this method's overload key, summed across ``anchor.plans`` +
+   *  ``anchor.advanced_plans``). ``0`` for non-decision-source methods
+   *  + ``return_pill`` terminals. Drives the hover-expand-card's
+   *  N5 "bypass plan preview" surface — operator gets an at-a-glance
+   *  "this gate has N plans" without needing to open the Inspector.
+   *  The Inspector still owns the full plan rendering (target
+   *  method, predicate, kind, confidence); this field is preview-
+   *  only. Operator-visible only inside the ``:hover`` /
+   *  ``:focus-within`` expanded surface; the base card stays at the
+   *  v3.X-next.2 baseline density. */
+  bypassPlanCount: number;
 };
 
 export type ExecutionFlowV3Edge = {
@@ -454,6 +467,22 @@ function gateCountsFor(
  *
  *  Returns ``null`` when no decisions exist for this key (the
  *  caller uses this to decide whether to render the chip at all). */
+/** v3.X-next.4 — count BypassPlan records authored on this method.
+ *  Inputs are the pre-merged ``allPlans`` array (anchor.plans +
+ *  anchor.advanced_plans) computed once in the emitter's ingest
+ *  phase. Matching is by ``source_decision_method`` overload key
+ *  (the gate that authored the plan). Returns ``0`` when the method
+ *  has no plans or isn't a decision source. */
+function bypassPlanCountFor(plans: BypassPlan[], key: string): number {
+  let n = 0;
+  for (const p of plans) {
+    if (p.source_decision_method && overloadKey(p.source_decision_method) === key) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
 function verdictSummaryFor(
   decisions: DecisionPoint[],
   key: string,
@@ -700,6 +729,7 @@ export function buildExecutionFlowV3Graph(
       retValue: null,
       retSourceTitle: null,
       verdictSummary: summary,
+      bypassPlanCount: bypassPlanCountFor(allPlans, key),
     });
   }
 
@@ -797,6 +827,7 @@ export function buildExecutionFlowV3Graph(
           retValue: "?",
           retSourceTitle: sourceTitle,
           verdictSummary: null,
+          bypassPlanCount: 0,
         });
         edges.push({
           id: `${sourceId}->${pillId}#${d.instruction_index}`,
@@ -858,6 +889,7 @@ export function buildExecutionFlowV3Graph(
             retValue: retLabel,
             retSourceTitle: sourceTitle,
             verdictSummary: null,
+            bypassPlanCount: 0,
           });
           targetId = pillId;
         } else {
@@ -881,6 +913,7 @@ export function buildExecutionFlowV3Graph(
           retValue: retLabel,
           retSourceTitle: sourceTitle,
           verdictSummary: null,
+          bypassPlanCount: 0,
         });
         targetId = pillId;
       } else {

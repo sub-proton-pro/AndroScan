@@ -6673,11 +6673,133 @@ code { color: var(--accent); }
   color: var(--text);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
   cursor: pointer;
-  transition: border-color 100ms ease-out, box-shadow 100ms ease-out;
+  transition:
+    border-color 100ms ease-out,
+    box-shadow 100ms ease-out,
+    transform 80ms ease-out;
+  transform-origin: center center;
 }
 
 .execution-flow-node:hover {
   border-color: var(--accent);
+}
+
+/* v3.X-next.4 — N3 + N4 + N5 hover-expand-card affordance.
+ *
+ * DEC-031 / TASKS.md Phase 13 v3.X-next.4 lock:
+ *   * N3 = ``transform: scale()`` + ``z-index`` lift (CSS-only, no
+ *     React Flow relayout). The transform applies to the node card
+ *     itself; React Flow's viewport transform composes correctly
+ *     because the wrapper element it controls is the OUTER node
+ *     positioner, not this inner card div.
+ *   * N4 = 1.5× uniform sizing (the card's intrinsic 220×72 grows
+ *     visually to 330×108 without changing layout-time width/height
+ *     so Dagre's edge routing stays stable).
+ *   * N5 = expanded-view content set: drops the smali descriptor
+ *     (already dropped by v3.X-next.2 N8 title-shape swap), keeps
+ *     the existing meta row, and reveals the
+ *     ``.execution-flow-node-hover-detail`` block carrying the top
+ *     decision-predicate count + bypass-plan count + runtime status
+ *     preview. Full Inspector content (per-method LLM summary,
+ *     predicate-origin breakdown, full bypass-plan card list)
+ *     stays in the right-pane Inspector — the hover-expand is a
+ *     *quick-look* affordance, not a duplicate of the Inspector.
+ *
+ * Scoped to non-pill cards via ``:not(.execution-flow-node-retpill)``
+ * because the small ``Ret: ...`` chips don't carry any expandable
+ * content + scaling them up would crowd neighbour cards without
+ * adding signal. ``:focus-within`` matches ``:hover`` so keyboard
+ * tab-through reveals the expansion (mirrors the gate-count badge's
+ * accessibility pattern from v2.0).
+ *
+ * Timing matches the established 80ms ease-out used by the gate-
+ * count badge (line ~7811) so the affordance feels familiar — long
+ * enough to read as a deliberate animation, short enough to stay
+ * snappy on a mouse-drag scan across the flow.
+ *
+ * ``z-index: 50`` lifts the expanded card above neighbour nodes
+ * (React Flow's default node stacking is in the 0-10 range) but
+ * stays below modals / toasts / the within-page fullscreen toggle
+ * row. The ``transform-origin: center center`` (set on the base
+ * rule above) keeps the expansion symmetric so the card grows out
+ * of its current position rather than cascading off one edge —
+ * preserves the operator's sense of "this is the card I'm hovering"
+ * even at the larger size. */
+.execution-flow-node:not(.execution-flow-node-retpill):hover,
+.execution-flow-node:not(.execution-flow-node-retpill):focus-within {
+  transform: scale(1.5);
+  z-index: 50;
+}
+
+/* v3.X-next.4 hot-fix — hover-detail block is ``position: absolute``
+ * + ``top: calc(100% + 6px)`` so it floats as a tray BELOW the card
+ * rather than living inside the card's flex column. Earlier shape
+ * (``visibility: hidden`` while staying in-flex-flow) allocated
+ * ~30-50px of invisible vertical space inside the fixed 72px card,
+ * squeezing the title + class + meta rows under ``justify-content:
+ * center`` and producing the overlapping-title rendering operator
+ * flagged. Floating-tray shape avoids the squeeze entirely + reads
+ * as supplementary info (its own panel-2 background + border +
+ * subtle drop shadow) rather than as a continuation of the card.
+ *
+ * Under the parent's ``transform: scale(1.5)`` the absolute child
+ * inherits the transform, so the tray's ``top: calc(100% + 6px)``
+ * anchors to the scaled card's bottom edge with the +6px offset
+ * scaling along to ~9px visual gap. ``z-index: 1`` is relative to
+ * the parent's stacking context (the parent's own ``z-index: 50``
+ * on hover lifts the whole assembly above neighbour nodes). */
+.execution-flow-node-hover-detail {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 9px;
+  line-height: 1.25;
+  color: var(--muted);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 80ms ease-out;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.execution-flow-node:not(.execution-flow-node-retpill):hover .execution-flow-node-hover-detail,
+.execution-flow-node:not(.execution-flow-node-retpill):focus-within .execution-flow-node-hover-detail {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.execution-flow-node-hover-detail-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.execution-flow-node-hover-detail-label {
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.execution-flow-node-hover-detail-value {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.execution-flow-node-hover-detail-value-runtime {
+  color: var(--accent);
+}
+
+.execution-flow-node-hover-detail-value-inlined {
+  color: var(--warn);
 }
 
 .execution-flow-node-selected {
