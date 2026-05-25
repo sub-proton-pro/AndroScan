@@ -157,7 +157,26 @@ export type GlobalStatus = {
     models_available: string[];
     model_present: boolean;
   };
-  rag_provider: StatusCard;
+  /** ISSUE-024 — RAG embed-provider card. Pre-fix this rendered as a
+   *  bare ``StatusCard`` (label + dot only) because no extras were
+   *  passed at the call site and the probe payload's specific fields
+   *  weren't typed here. The functional probe (warm singleton in
+   *  ``health_probes.py``) now returns ``model`` + ``dim`` + ``latency_ms``
+   *  on success and ``error`` + ``installed`` + ``cached`` + ``cache_root``
+   *  on failure for ``fastembed``; the Ollama branch returns ``reachable``
+   *  + ``model_present``. Typing them here lets ``SettingsTab.tsx``
+   *  surface the same dense detail the LLM card does. */
+  rag_provider: StatusCard & {
+    provider: "fastembed" | "ollama" | "hash" | string;
+    model: string;
+    dim?: number | null;
+    latency_ms?: number;
+    installed?: boolean;
+    cached?: boolean;
+    cache_root?: string | null;
+    reachable?: boolean;
+    model_present?: boolean;
+  };
   filesystem: { apps_root: StatusCard };
   config_sources: Record<string, "yaml" | "env" | "default">;
 };

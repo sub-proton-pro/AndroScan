@@ -23,7 +23,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, HTTPException
 
@@ -44,6 +44,7 @@ from androscan.web.health_probes import (
     probe_apk_sha_drift,
     probe_apktool_version,
     probe_disk,
+    last_known_embed_provider_ok,
     probe_embed_provider,
     probe_foreground_activity,
     probe_device_cpu_abi,
@@ -356,8 +357,26 @@ def _decompile_card(app_dir: Path) -> dict[str, Any]:
     }
 
 
-def _rag_card(app_dir: Path, decompile: dict[str, Any]) -> dict[str, Any]:
-    """Wrap RAG status into a card; safe even if decompile isn't ready."""
+def _rag_card(
+    app_dir: Path,
+    decompile: dict[str, Any],
+    *,
+    embed_provider_ok: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Wrap RAG status into a card; safe even if decompile isn't ready.
+
+    ISSUE-024 — when ``embed_provider_ok`` is ``False`` the card is
+    downgraded from green to red even when the on-disk index reads
+    ``ready``. A "ready" index is functionally broken if the embed
+    provider can't serve queries against it; previously the card stayed
+    green and operators discovered the breakage only when query results
+    came back empty (Inspect tab) or with ``embed provider unavailable``
+    error notes. The cross-reference is sourced from the warm-singleton
+    cache in :func:`health_probes.last_known_embed_provider_ok`, which
+    is populated by the global status poll — ``None`` (probe hasn't
+    run yet this process lifetime) leaves the card's ok state unchanged
+    so the per-app card doesn't false-negative on first load.
+    """
     sha = decompile.get("sha")
     if not sha or decompile.get("status") != "ready":
         return {
@@ -372,16 +391,20 @@ def _rag_card(app_dir: Path, decompile: dict[str, Any]) -> dict[str, Any]:
     from androscan.rag.index import get_status as rag_status
     rs = rag_status(cache_dir)
     d = rs.to_dict()
+    on_disk_ready = d.get("status") == "ready"
+    embed_down = on_disk_ready and embed_provider_ok is False
+    ok = on_disk_ready and not embed_down
+    hint = {
+        "missing":  "auto-build kicks in after decompile completes; or POST /api/rag/{app_id}/rebuild",
+        "pending":  "embedding worker is running…",
+        "failed":   "see error; check embed provider availability",
+        "ready":    "queries unavailable — embed provider is down (see Global → RAG embed provider card)" if embed_down else None,
+    }.get(d.get("status"), None)
     return {
-        "ok": d.get("status") == "ready",
+        "ok": ok,
         "label": "RAG index",
         **d,
-        "hint": {
-            "missing":  "auto-build kicks in after decompile completes; or POST /api/rag/{app_id}/rebuild",
-            "pending":  "embedding worker is running…",
-            "failed":   "see error; check embed provider availability",
-            "ready":    None,
-        }.get(d.get("status"), None),
+        "hint": hint,
     }
 
 
@@ -471,7 +494,17 @@ async def _gather_per_app(app_dir: Path, app_id: str) -> dict[str, Any]:
     pkg: str = meta_card.get("package") or ""
 
     decompile_card = _decompile_card(app_dir)
-    rag_card = _rag_card(app_dir, decompile_card)
+    # ISSUE-024 — cross-reference global embed-provider liveness so the
+    # per-app RAG index card downgrades from green when queries are
+    # functionally broken. ``last_known_embed_provider_ok`` reads the
+    # warm-singleton cache populated by the global status poll; returns
+    # ``None`` when the global probe hasn't fired yet this process
+    # lifetime, in which case the card's ok state is unchanged.
+    rag_card = _rag_card(
+        app_dir,
+        decompile_card,
+        embed_provider_ok=last_known_embed_provider_ok(),
+    )
     call_graph_card = _call_graph_card(app_dir, decompile_card)
 
     device = await probe_adb_device()

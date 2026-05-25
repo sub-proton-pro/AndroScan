@@ -1032,7 +1032,36 @@ function StatusPanel() {
                   : "ollama-status"
               }
             />
-            <StatusCardView card={globalStatus.rag_provider} />
+            {/* ISSUE-024 — surface model / provider / dim / latency
+             *  extras so the card body actually renders something.
+             *  Pre-fix this was bare ``<StatusCardView card={...} />``
+             *  with no extras, leaving the body blank even when the
+             *  probe payload was fully populated. Now mirrors the LLM
+             *  card's shape (model | via X | latency | dim) so the
+             *  operator can scan provider + readiness at a glance. */}
+            <StatusCardView
+              card={globalStatus.rag_provider}
+              extras={[
+                globalStatus.rag_provider.model,
+                `via ${globalStatus.rag_provider.provider}`,
+                globalStatus.rag_provider.latency_ms !== undefined
+                  ? `${globalStatus.rag_provider.latency_ms}ms`
+                  : "",
+                globalStatus.rag_provider.dim
+                  ? `dim ${globalStatus.rag_provider.dim}`
+                  : "",
+                globalStatus.rag_provider.provider === "fastembed" &&
+                globalStatus.rag_provider.cached !== undefined
+                  ? `cache ${globalStatus.rag_provider.cached ? "hit" : "miss"}`
+                  : "",
+                globalStatus.rag_provider.provider === "ollama" &&
+                globalStatus.rag_provider.model_present !== undefined
+                  ? globalStatus.rag_provider.model_present
+                    ? "model present on ollama"
+                    : "model NOT present on ollama"
+                  : "",
+              ]}
+            />
             <StatusCardView card={globalStatus.tools.adb} />
             <StatusCardView card={globalStatus.tools.jadx} />
             <StatusCardView card={globalStatus.tools.apktool} />

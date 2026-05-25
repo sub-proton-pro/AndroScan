@@ -1198,6 +1198,215 @@ def test_probe_embed_provider_hash_always_ok() -> None:
 
 
 # ---------------------------------------------------------------------------
+# ISSUE-024 — warm-singleton functional fastembed probe
+#
+# Pre-fix ``probe_embed_provider`` for fastembed returned ``ok=True`` whenever
+# the Python package was importable, regardless of whether the configured
+# model could actually load. These tests pin the new contract:
+#  * functional probe via ``FastEmbedProvider`` instantiation
+#  * module-level singleton caches success AND failure (no re-attempt on poll)
+#  * ``last_known_embed_provider_ok`` reflects the most recent probe result
+
+
+class _FakeFastEmbedProvider:
+    """Minimal stand-in for ``FastEmbedProvider`` used in the test path.
+
+    The real class lives in ``androscan/rag/embed.py`` and pulls in the
+    optional ``fastembed`` dep + an ONNX model download on first use; we
+    can't exercise that in unit tests. The probe imports the class lazily
+    so monkeypatching ``androscan.rag.embed.FastEmbedProvider`` works.
+    """
+
+    def __init__(self, model: Optional[str] = None) -> None:
+        self.model = model or "BAAI/bge-small-en-v1.5"
+        self.name = "fastembed"
+        self.dim = 384
+
+
+class _RaisingFastEmbedProvider:
+    """Stand-in whose ``__init__`` raises — simulates the operator's bug
+    where ``fastembed failed to load model … NO_SUCHFILE`` surfaces."""
+
+    def __init__(self, model: Optional[str] = None) -> None:
+        raise RuntimeError(
+            f"fastembed failed to load model {model!r}: NO_SUCHFILE"
+        )
+
+
+def _patch_fastembed(
+    monkeypatch: pytest.MonkeyPatch,
+    cls: type,
+    *,
+    installed: bool = True,
+) -> None:
+    """Wire the test doubles into the probe's lazy-import surface.
+
+    Three knobs need patching together:
+      1. ``importlib.util.find_spec("fastembed")`` so the availability
+         probe doesn't short-circuit on the real package being absent
+         in the test env.
+      2. ``androscan.rag.embed.FastEmbedProvider`` — the symbol the
+         warm probe imports lazily.
+      3. The warm-singleton cache — flushed between tests so prior
+         tests don't pre-populate this test's expected first-call path.
+    """
+    import importlib.util
+
+    if installed:
+        monkeypatch.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name: object() if name == "fastembed" else None,
+        )
+    else:
+        monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+
+    import androscan.rag.embed as embed_mod
+
+    monkeypatch.setattr(embed_mod, "FastEmbedProvider", cls)
+    hp._reset_warm_embed_probe_cache_for_tests()
+
+
+def test_probe_embed_provider_fastembed_functional_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful FastEmbedProvider instantiation → ok=True with model + dim."""
+    _patch_fastembed(monkeypatch, _FakeFastEmbedProvider)
+
+    out = asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+
+    assert out["ok"] is True
+    assert out["provider"] == "fastembed"
+    assert out["model"] == "BAAI/bge-small-en-v1.5"
+    assert out["dim"] == 384
+    assert "latency_ms" in out
+    assert out["error"] is None
+
+
+def test_probe_embed_provider_fastembed_load_failure_reports_red(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator's bug: package installed + model missing → ok=False.
+
+    Pre-fix this returned ``ok=True`` because the probe only checked
+    ``importlib.util.find_spec("fastembed")``. The functional probe
+    now catches the constructor's exception and surfaces it.
+    """
+    _patch_fastembed(monkeypatch, _RaisingFastEmbedProvider)
+
+    out = asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+
+    assert out["ok"] is False
+    assert out["provider"] == "fastembed"
+    assert out["dim"] is None
+    assert "NO_SUCHFILE" in (out.get("error") or "")
+
+
+def test_probe_embed_provider_fastembed_not_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``fastembed`` package absent from the env → ok=False with install hint.
+
+    The warm probe should short-circuit on the availability check
+    rather than attempt the lazy import + fail with a less actionable
+    ``ModuleNotFoundError``.
+    """
+    _patch_fastembed(monkeypatch, _FakeFastEmbedProvider, installed=False)
+
+    out = asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+
+    assert out["ok"] is False
+    assert out["installed"] is False
+    assert "fastembed not installed" in (out.get("error") or "")
+
+
+def test_warm_embed_probe_cache_avoids_reprobe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Second call returns cached result; the constructor is only called once.
+
+    Pins the warm-singleton contract — the Settings tab polls every 15s,
+    so re-instantiating ``FastEmbedProvider`` (model load + dim probe)
+    every poll would dominate poll latency. The singleton holds the
+    result so subsequent polls are sub-µs.
+    """
+    instantiations = {"n": 0}
+
+    class _CountingProvider(_FakeFastEmbedProvider):
+        def __init__(self, model: Optional[str] = None) -> None:
+            instantiations["n"] += 1
+            super().__init__(model)
+
+    _patch_fastembed(monkeypatch, _CountingProvider)
+
+    out1 = asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+    out2 = asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+    out3 = asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+
+    assert out1["ok"] is True
+    assert out2 == out1
+    assert out3 == out1
+    assert instantiations["n"] == 1, (
+        "Warm singleton should have served calls 2 and 3 from cache, "
+        f"but constructor fired {instantiations['n']} times."
+    )
+
+
+def test_warm_embed_probe_cache_also_caches_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure-mode results are also cached — no re-attempt on every poll.
+
+    Without this the operator's status panel would re-pay the doomed
+    model-load cost every 15s when the configured model is missing,
+    bloating poll latency from sub-µs to multi-second.
+    """
+    instantiations = {"n": 0}
+
+    class _CountingRaiser(_RaisingFastEmbedProvider):
+        def __init__(self, model: Optional[str] = None) -> None:
+            instantiations["n"] += 1
+            super().__init__(model)
+
+    _patch_fastembed(monkeypatch, _CountingRaiser)
+
+    out1 = asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+    out2 = asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+
+    assert out1["ok"] is False
+    assert out2 == out1
+    assert instantiations["n"] == 1
+
+
+def test_last_known_embed_provider_ok_pre_probe_is_none() -> None:
+    """Returns ``None`` when no probe has fired this process lifetime.
+
+    The per-app ``RAG index`` card uses this signal to decide whether to
+    downgrade itself; ``None`` means "no signal yet, leave card as-is"
+    so the first per-app status load doesn't false-negative before the
+    global status poll has populated the singleton.
+    """
+    hp._reset_warm_embed_probe_cache_for_tests()
+    assert hp.last_known_embed_provider_ok() is None
+
+
+def test_last_known_embed_provider_ok_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fastembed(monkeypatch, _FakeFastEmbedProvider)
+    asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+    assert hp.last_known_embed_provider_ok() is True
+
+
+def test_last_known_embed_provider_ok_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fastembed(monkeypatch, _RaisingFastEmbedProvider)
+    asyncio.run(hp.probe_embed_provider("fastembed", "", ""))
+    assert hp.last_known_embed_provider_ok() is False
+
+
+# ---------------------------------------------------------------------------
 # Disk / path / dir-size
 
 

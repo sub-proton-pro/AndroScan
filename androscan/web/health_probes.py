@@ -41,6 +41,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -1117,27 +1118,142 @@ def probe_fastembed_model_cache(model: str = "BAAI/bge-small-en-v1.5") -> dict[s
     return {"ok": found, "cached": found, "cache_root": str(cache_root), "error": None}
 
 
+# ISSUE-024 fix — warm-singleton functional probe for fastembed.
+#
+# Pre-fix the fastembed branch of ``probe_embed_provider`` returned
+# ``ok = bool(avail.get("ok"))`` — i.e. ok if the Python package was
+# importable, ignoring whether the configured model was actually loadable.
+# An operator with the package installed but the ONNX file missing from
+# their cache (different ``$FASTEMBED_CACHE`` than the heuristic guessed,
+# huggingface_hub cache layout under ``/var/folders``, manual cache wipe,
+# etc.) saw the Status card render GREEN while queries failed with
+# ``fastembed failed to load model … NO_SUCHFILE``.
+#
+# The fix uses ``FastEmbedProvider.__init__`` (``androscan/rag/embed.py``
+# lines 108-139) as the probe — the constructor already does the ONNX
+# model load + dim probe via ``self._impl.embed(["dim_probe"])``, so
+# *successful instantiation IS end-to-end functional validation*. We
+# cache the result at module level keyed on ``(provider, model)`` so
+# the status-card poll (every 15s) doesn't re-pay the cold-start cost.
+# Process-lifetime cache — operators swapping models restart the server
+# (matches LCP.6's grammar-disabled-set cache pattern).
+_warm_embed_probe_cache: dict[tuple[str, str], dict[str, Any]] = {}
+_warm_embed_probe_lock = threading.Lock()
+
+
+def _probe_fastembed_warm(model: str) -> dict[str, Any]:
+    """Functional fastembed probe via ``FastEmbedProvider`` instantiation.
+
+    The constructor does the ONNX model load + dim probe in one shot;
+    a successful return means embeddings will actually work for the
+    configured model. ``EmbedProviderError`` (or any other exception)
+    means the operator's provider can't serve queries.
+
+    Result cached at module level keyed on ``(provider, model)``. First
+    call pays the cold-start cost (0-5s on M-series CPUs when the model
+    is already on disk; longer on first download). Subsequent calls
+    return the cached dict (sub-µs). Failures are cached too — we don't
+    want every 15s poll to re-attempt a doomed model load.
+    """
+    key = ("fastembed", model or "")
+    with _warm_embed_probe_lock:
+        cached = _warm_embed_probe_cache.get(key)
+        if cached is not None:
+            return cached
+
+    avail = probe_fastembed_available()
+    cache_root = probe_fastembed_model_cache(model or "BAAI/bge-small-en-v1.5")
+    started = time.perf_counter()
+    try:
+        if not avail.get("installed"):
+            raise RuntimeError(avail.get("error") or "fastembed not installed")
+        # Lazy import keeps fastembed an optional dep at module import time.
+        from androscan.rag.embed import FastEmbedProvider  # noqa: PLC0415
+
+        prov = FastEmbedProvider(model=model or None)
+        result: dict[str, Any] = {
+            "ok": True,
+            "provider": "fastembed",
+            "model": prov.model,
+            "dim": prov.dim,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "installed": True,
+            "cached": bool(cache_root.get("cached")),
+            "cache_root": cache_root.get("cache_root"),
+            "error": None,
+        }
+    except Exception as e:
+        result = {
+            "ok": False,
+            "provider": "fastembed",
+            "model": model or "BAAI/bge-small-en-v1.5",
+            "dim": None,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "installed": bool(avail.get("installed")),
+            "cached": bool(cache_root.get("cached")),
+            "cache_root": cache_root.get("cache_root"),
+            "error": str(e),
+        }
+    with _warm_embed_probe_lock:
+        _warm_embed_probe_cache[key] = result
+    return result
+
+
+def last_known_embed_provider_ok() -> Optional[bool]:
+    """Return cached embed-provider ok-status without firing a new probe.
+
+    Returns ``None`` when the probe hasn't run yet (no global status
+    poll has happened this process); ``True`` / ``False`` once it has.
+    Used by the per-app ``RAG index`` card to cross-reference global
+    embed-provider liveness — a "ready" on-disk index is functionally
+    broken if the embed provider can't serve queries, so the card is
+    downgraded from green to red+hint in that case.
+
+    Single configured (provider, model) tuple in normal operation, so
+    "most recently inserted" matches "currently configured" in practice.
+    """
+    with _warm_embed_probe_lock:
+        if not _warm_embed_probe_cache:
+            return None
+        # ``dict`` preserves insertion order in CPython 3.7+; last insertion
+        # is the most recently probed (provider, model) tuple.
+        return list(_warm_embed_probe_cache.values())[-1].get("ok")
+
+
+def _reset_warm_embed_probe_cache_for_tests() -> None:
+    """Test-only hook to flush the module-level singleton cache.
+
+    Production code never calls this — operators restart the server to
+    re-probe after swapping models. Tests need it because pytest runs
+    multiple test cases in one process and the cache would leak state.
+    """
+    with _warm_embed_probe_lock:
+        _warm_embed_probe_cache.clear()
+
+
 async def probe_embed_provider(provider_name: str, model: str, ollama_base_url: str) -> dict[str, Any]:
     """High-level embed-provider availability probe.
 
-    For ``fastembed``: import + model cache check (no model load).
+    For ``fastembed``: functional probe via ``FastEmbedProvider``
+    instantiation (which itself runs ONNX model load + dim probe).
+    Result cached in a module-level warm singleton so the Settings tab
+    poll cost is sub-µs on the warm path; cold-start is 0-5s but pays
+    off because the next poll is free. See :func:`_probe_fastembed_warm`
+    for the cache contract.
+
     For ``ollama``: re-uses :func:`probe_ollama_tags` and looks for the
     model.
+
     For ``hash``: always available (test fallback).
     """
     name = (provider_name or "").lower()
     if name == "fastembed":
-        avail = probe_fastembed_available()
-        cache = probe_fastembed_model_cache(model or "BAAI/bge-small-en-v1.5")
-        return {
-            "ok": bool(avail.get("ok")),
-            "provider": "fastembed",
-            "model": model or "BAAI/bge-small-en-v1.5",
-            "installed": bool(avail.get("installed")),
-            "cached": bool(cache.get("cached")),
-            "cache_root": cache.get("cache_root"),
-            "error": avail.get("error") or cache.get("error"),
-        }
+        # ``asyncio.to_thread`` keeps the cold-start ONNX load off the
+        # event loop so the other concurrent probes in ``_gather_global``'s
+        # ``asyncio.gather`` aren't blocked. Warm path is a dict lookup;
+        # the thread overhead (microseconds) is dominated by other
+        # probes' wall-clock anyway.
+        return await asyncio.to_thread(_probe_fastembed_warm, model)
     if name == "ollama":
         tags = await probe_ollama_tags(ollama_base_url)
         wanted = model or "nomic-embed-text"
